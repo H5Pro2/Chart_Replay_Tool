@@ -19,6 +19,8 @@ URL: http://127.0.0.1:8788/
 
 Port `8787` wird bewusst nicht benutzt.
 
+Alternativ kann unter Windows die Datei `start.bat` ausgeführt werden.
+
 ## CSV-Format
 
 Die vorhandene Datei nutzt diese Struktur:
@@ -48,3 +50,17 @@ Auch `date`, `datetime`, `timestamp` oder `timestamp_ms` für Zeit sowie `o,h,l,
 - Orderbook mit Clear-Button
 - Replay-Reset inklusive Orderbook
 - Trade-Historie
+
+## Bilder
+
+### Übersicht Order-Erstellung und Historie
+
+![Übersicht Order-Erstellung und Historie](files/bilder/übersicht_order_erstellung_historie.PNG)
+
+### Rechtsklick Order-Menü
+
+![Rechtsklick Order-Menü](files/bilder/bild_mouse_order_menu.bmp)
+
+### Setup-Menü
+
+![Setup-Menü](files/bilder/setup_menu.PNG)
