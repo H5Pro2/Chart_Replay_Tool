@@ -154,6 +154,26 @@ const isProtectionPriceValid = (order: TradeOrder, field: "takeProfit" | "stopLo
   return field === "takeProfit" ? price < order.entry : price > order.entry;
 };
 
+const isProtectionDockedAtEntry = (order: TradeOrder, price: number) => {
+  return Math.abs(price - order.entry) <= Math.max(order.entry * 0.001, 0.01);
+};
+
+const normalizeProtectionAfterEntryMove = (order: TradeOrder, nextEntry: number): TradeOrder => {
+  const tpValid =
+    order.takeProfit === undefined ||
+    (order.side === "buy" ? order.takeProfit > nextEntry : order.takeProfit < nextEntry);
+  const slValid =
+    order.stopLoss === undefined ||
+    (order.side === "buy" ? order.stopLoss < nextEntry : order.stopLoss > nextEntry);
+
+  return {
+    ...order,
+    entry: nextEntry,
+    takeProfit: tpValid ? order.takeProfit : undefined,
+    stopLoss: slValid ? order.stopLoss : undefined
+  };
+};
+
 type ChartMenu = {
   x: number;
   y: number;
@@ -186,17 +206,18 @@ type ChartTheme = {
 };
 
 type Language = "de" | "en";
+type SettingsTab = "colors" | "chart" | "orders" | "language";
 
 const defaultTheme: ChartTheme = {
-  upColor: "#22c55e",
-  downColor: "#ef4444",
-  upWickColor: "#22c55e",
-  downWickColor: "#ef4444",
-  upBorderColor: "#22c55e",
-  downBorderColor: "#ef4444",
-  backgroundColor: "#11151c",
-  gridColor: "#222936",
-  textColor: "#c7d0df",
+  upColor: "#2fbf71",
+  downColor: "#e05252",
+  upWickColor: "#45d089",
+  downWickColor: "#eb6b6b",
+  upBorderColor: "#2fbf71",
+  downBorderColor: "#e05252",
+  backgroundColor: "#0f151d",
+  gridColor: "#243040",
+  textColor: "#d5deea",
   showGrid: true,
   showLastPriceLine: true,
   showCrosshair: true,
@@ -220,6 +241,9 @@ const translations = {
     autoFocusTitle: "Chart automatisch auf sichtbare Kerzen fokussieren",
     chartOptionsTitle: "Chart-Design einstellen",
     chartDesign: "Chart-Design",
+    colors: "Farben",
+    chart: "Chart",
+    orders: "Orders",
     candlesSection: "Kerzen",
     chartArea: "Chart-Fläche",
     behavior: "Verhalten",
@@ -298,6 +322,9 @@ const translations = {
     autoFocusTitle: "Automatically focus visible candles",
     chartOptionsTitle: "Configure chart design",
     chartDesign: "Chart Design",
+    colors: "Colors",
+    chart: "Chart",
+    orders: "Orders",
     candlesSection: "Candles",
     chartArea: "Chart Area",
     behavior: "Behavior",
@@ -376,6 +403,9 @@ function TradingApp() {
   const draggedChipRef = useRef<{ orderId: string; field: "takeProfit" | "stopLoss" } | null>(null);
   const chipDragFinishedRef = useRef(false);
   const [lineControls, setLineControls] = useState<Array<{ order: TradeOrder; y: number }>>([]);
+  const [orderLineLabels, setOrderLineLabels] = useState<
+    Array<{ order: TradeOrder; field: DraggableOrderField; y: number; price: number }>
+  >([]);
 
   const [allCandles, setAllCandles] = useState<Candle[]>(defaultCandles);
   const [visibleCount, setVisibleCount] = useState(4);
@@ -391,6 +421,7 @@ function TradingApp() {
   const [autoScalePrice, setAutoScalePrice] = useState(false);
   const [autoFocusChart, setAutoFocusChart] = useState(false);
   const [showChartOptions, setShowChartOptions] = useState(false);
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>("colors");
   const [chartTheme, setChartTheme] = useState<ChartTheme>(defaultTheme);
   const [language, setLanguage] = useState<Language>("de");
   const t = translations[language];
@@ -585,11 +616,11 @@ function TradingApp() {
         lineSeriesRef.current.push(series);
       };
 
-      const entryColor = order.status === "active" ? "#facc15" : order.side === "buy" ? "#38bdf8" : "#f97316";
+      const entryColor = order.status === "active" ? "#facc15" : order.side === "buy" ? "#38bdf8" : "#fb923c";
       const entryTitle = order.status === "active" ? `${order.id} ACTIVE Entry` : `${order.id} Pending Entry`;
       addLine(order.entry, entryColor, entryTitle, order.status === "active" ? LineStyle.LargeDashed : LineStyle.Solid);
-      if (order.takeProfit !== undefined) addLine(order.takeProfit, "#22c55e", `${order.id} TP`, LineStyle.Dashed);
-      if (order.stopLoss !== undefined) addLine(order.stopLoss, "#ef4444", `${order.id} SL`, LineStyle.Dashed);
+      if (order.takeProfit !== undefined) addLine(order.takeProfit, "#2fbf71", `${order.id} TP`, LineStyle.Dashed);
+      if (order.stopLoss !== undefined) addLine(order.stopLoss, "#e05252", `${order.id} SL`, LineStyle.Dashed);
     });
   }, [openOrders, visibleCandles]);
 
@@ -605,6 +636,22 @@ function TradingApp() {
         })
         .filter(Boolean) as Array<{ order: TradeOrder; y: number }>;
       setLineControls(controls);
+
+      const labels = openOrders.flatMap((order) => {
+        const rows: Array<{ order: TradeOrder; field: DraggableOrderField; y: number; price: number }> = [];
+        const candidates: Array<[DraggableOrderField, number | undefined]> = [
+          ["entry", order.entry],
+          ["takeProfit", order.takeProfit],
+          ["stopLoss", order.stopLoss]
+        ];
+        candidates.forEach(([field, price]) => {
+          if (price === undefined) return;
+          const y = series.priceToCoordinate(price);
+          if (y !== null) rows.push({ order, field, y, price });
+        });
+        return rows;
+      });
+      setOrderLineLabels(labels);
     };
 
     updateLineControls();
@@ -720,13 +767,16 @@ function TradingApp() {
         current.map((order) =>
           order.id === target.orderId && (order.status === "pending" || order.status === "active")
             ? {
-                ...order,
-                [target.field]:
-                  target.field === "entry"
-                    ? Number(price.toFixed(4))
-                    : activeChip && !isProtectionPriceValid(order, target.field, price)
-                      ? order[target.field]
-                      : Number(clampProtectionPrice(order, target.field, price).toFixed(4))
+                ...(target.field === "entry"
+                  ? normalizeProtectionAfterEntryMove(order, Number(price.toFixed(4)))
+                  : {
+                      ...order,
+                      [target.field]: isProtectionDockedAtEntry(order, price)
+                        ? undefined
+                        : activeChip && !isProtectionPriceValid(order, target.field, price)
+                          ? order[target.field]
+                          : Number(clampProtectionPrice(order, target.field, price).toFixed(4))
+                    })
               }
             : order
         )
@@ -1100,6 +1150,14 @@ function TradingApp() {
                 <span className="line-order-label">{order.side === "buy" ? "Buy Limit" : "Sell Limit"}</span>
               </div>
             ))}
+            {orderLineLabels.map(({ order, field, y, price }) => (
+              <div className={`order-line-label ${field}`} style={{ top: y }} key={`${order.id}-${field}`}>
+                <span>
+                  {field === "entry" ? "ENTRY" : field === "takeProfit" ? "TP" : "SL"}
+                </span>
+                <strong>{formatPrice(price)}</strong>
+              </div>
+            ))}
             {showChartOptions && (
               <div className="chart-style-panel">
                 <div className="style-panel-title">
@@ -1107,90 +1165,69 @@ function TradingApp() {
                   {t.chartDesign}
                 </div>
 
-                <div className="style-section">
-                  <div className="style-section-title">{t.candlesSection}</div>
-                  <div className="style-grid">
-                    <label>
-                      {t.bodyUp}
-                      <input type="color" value={chartTheme.upColor} onChange={(event) => updateTheme("upColor", event.target.value)} />
-                    </label>
-                    <label>
-                      {t.bodyDown}
-                      <input type="color" value={chartTheme.downColor} onChange={(event) => updateTheme("downColor", event.target.value)} />
-                    </label>
-                    <label>
-                      {t.wickUp}
-                      <input type="color" value={chartTheme.upWickColor} onChange={(event) => updateTheme("upWickColor", event.target.value)} />
-                    </label>
-                    <label>
-                      {t.wickDown}
-                      <input type="color" value={chartTheme.downWickColor} onChange={(event) => updateTheme("downWickColor", event.target.value)} />
-                    </label>
-                    <label>
-                      {t.borderUp}
-                      <input type="color" value={chartTheme.upBorderColor} onChange={(event) => updateTheme("upBorderColor", event.target.value)} />
-                    </label>
-                    <label>
-                      {t.borderDown}
-                      <input type="color" value={chartTheme.downBorderColor} onChange={(event) => updateTheme("downBorderColor", event.target.value)} />
-                    </label>
-                  </div>
+                <div className="settings-tabs">
+                  <button className={settingsTab === "colors" ? "tab active" : "tab"} onClick={() => setSettingsTab("colors")}>{t.colors}</button>
+                  <button className={settingsTab === "chart" ? "tab active" : "tab"} onClick={() => setSettingsTab("chart")}>{t.chart}</button>
+                  <button className={settingsTab === "orders" ? "tab active" : "tab"} onClick={() => setSettingsTab("orders")}>{t.orders}</button>
+                  <button className={settingsTab === "language" ? "tab active" : "tab"} onClick={() => setSettingsTab("language")}>{t.language}</button>
                 </div>
 
-                <div className="style-section">
-                  <div className="style-section-title">{t.chartArea}</div>
-                  <div className="style-grid">
-                    <label>
-                      {t.background}
-                      <input type="color" value={chartTheme.backgroundColor} onChange={(event) => updateTheme("backgroundColor", event.target.value)} />
-                    </label>
-                    <label>
-                      {t.grid}
-                      <input type="color" value={chartTheme.gridColor} onChange={(event) => updateTheme("gridColor", event.target.value)} />
-                    </label>
-                    <label>
-                      {t.text}
-                      <input type="color" value={chartTheme.textColor} onChange={(event) => updateTheme("textColor", event.target.value)} />
-                    </label>
-                  </div>
-                </div>
+                {settingsTab === "colors" && (
+                  <>
+                    <div className="style-section">
+                      <div className="style-section-title">{t.candlesSection}</div>
+                      <div className="style-grid">
+                        <label>{t.bodyUp}<input type="color" value={chartTheme.upColor} onChange={(event) => updateTheme("upColor", event.target.value)} /></label>
+                        <label>{t.bodyDown}<input type="color" value={chartTheme.downColor} onChange={(event) => updateTheme("downColor", event.target.value)} /></label>
+                        <label>{t.wickUp}<input type="color" value={chartTheme.upWickColor} onChange={(event) => updateTheme("upWickColor", event.target.value)} /></label>
+                        <label>{t.wickDown}<input type="color" value={chartTheme.downWickColor} onChange={(event) => updateTheme("downWickColor", event.target.value)} /></label>
+                        <label>{t.borderUp}<input type="color" value={chartTheme.upBorderColor} onChange={(event) => updateTheme("upBorderColor", event.target.value)} /></label>
+                        <label>{t.borderDown}<input type="color" value={chartTheme.downBorderColor} onChange={(event) => updateTheme("downBorderColor", event.target.value)} /></label>
+                      </div>
+                    </div>
+                    <div className="style-section">
+                      <div className="style-section-title">{t.chartArea}</div>
+                      <div className="style-grid">
+                        <label>{t.background}<input type="color" value={chartTheme.backgroundColor} onChange={(event) => updateTheme("backgroundColor", event.target.value)} /></label>
+                        <label>{t.grid}<input type="color" value={chartTheme.gridColor} onChange={(event) => updateTheme("gridColor", event.target.value)} /></label>
+                        <label>{t.text}<input type="color" value={chartTheme.textColor} onChange={(event) => updateTheme("textColor", event.target.value)} /></label>
+                      </div>
+                    </div>
+                  </>
+                )}
 
-                <div className="style-section">
-                  <div className="style-section-title">{t.behavior}</div>
-                  <div className="style-switches">
-                    <button className={chartTheme.showGrid ? "switch active" : "switch"} onClick={() => toggleTheme("showGrid")}>{t.grid}</button>
-                    <button className={chartTheme.showLastPriceLine ? "switch active" : "switch"} onClick={() => toggleTheme("showLastPriceLine")}>{t.priceLine}</button>
-                    <button className={chartTheme.showCrosshair ? "switch active" : "switch"} onClick={() => toggleTheme("showCrosshair")}>{t.crosshair}</button>
-                    <button className={chartTheme.allowMouseWheel ? "switch active" : "switch"} onClick={() => toggleTheme("allowMouseWheel")}>{t.mouseWheel}</button>
-                    <button className={chartTheme.allowDrag ? "switch active" : "switch"} onClick={() => toggleTheme("allowDrag")}>{t.drag}</button>
+                {settingsTab === "chart" && (
+                  <div className="style-section">
+                    <div className="style-section-title">{t.behavior}</div>
+                    <div className="style-switches">
+                      <button className={chartTheme.showGrid ? "switch active" : "switch"} onClick={() => toggleTheme("showGrid")}>{t.grid}</button>
+                      <button className={chartTheme.showLastPriceLine ? "switch active" : "switch"} onClick={() => toggleTheme("showLastPriceLine")}>{t.priceLine}</button>
+                      <button className={chartTheme.showCrosshair ? "switch active" : "switch"} onClick={() => toggleTheme("showCrosshair")}>{t.crosshair}</button>
+                      <button className={chartTheme.allowMouseWheel ? "switch active" : "switch"} onClick={() => toggleTheme("allowMouseWheel")}>{t.mouseWheel}</button>
+                      <button className={chartTheme.allowDrag ? "switch active" : "switch"} onClick={() => toggleTheme("allowDrag")}>{t.drag}</button>
+                    </div>
                   </div>
-                </div>
+                )}
 
-                <div className="style-section">
-                  <div className="style-section-title">{t.orderDisplay}</div>
-                  <div className="style-switches">
-                    <button
-                      className={chartTheme.orderControlsSide === "right" ? "switch active" : "switch"}
-                      onClick={() => setChartTheme((current) => ({ ...current, orderControlsSide: "right" }))}
-                    >
-                      {t.orderControlsRight}
-                    </button>
-                    <button
-                      className={chartTheme.orderControlsSide === "left" ? "switch active" : "switch"}
-                      onClick={() => setChartTheme((current) => ({ ...current, orderControlsSide: "left" }))}
-                    >
-                      {t.orderControlsLeft}
-                    </button>
+                {settingsTab === "orders" && (
+                  <div className="style-section">
+                    <div className="style-section-title">{t.orderDisplay}</div>
+                    <div className="style-switches">
+                      <button className={chartTheme.orderControlsSide === "right" ? "switch active" : "switch"} onClick={() => setChartTheme((current) => ({ ...current, orderControlsSide: "right" }))}>{t.orderControlsRight}</button>
+                      <button className={chartTheme.orderControlsSide === "left" ? "switch active" : "switch"} onClick={() => setChartTheme((current) => ({ ...current, orderControlsSide: "left" }))}>{t.orderControlsLeft}</button>
+                    </div>
                   </div>
-                </div>
+                )}
 
-                <div className="style-section">
-                  <div className="style-section-title">{t.language}</div>
-                  <div className="style-switches">
-                    <button className={language === "de" ? "switch active" : "switch"} onClick={() => setLanguage("de")}>{t.german}</button>
-                    <button className={language === "en" ? "switch active" : "switch"} onClick={() => setLanguage("en")}>{t.english}</button>
+                {settingsTab === "language" && (
+                  <div className="style-section">
+                    <div className="style-section-title">{t.language}</div>
+                    <div className="style-switches">
+                      <button className={language === "de" ? "switch active" : "switch"} onClick={() => setLanguage("de")}>{t.german}</button>
+                      <button className={language === "en" ? "switch active" : "switch"} onClick={() => setLanguage("en")}>{t.english}</button>
+                    </div>
                   </div>
-                </div>
+                )}
 
                 <button className="small" onClick={resetTheme}>{t.resetDefault}</button>
               </div>
@@ -1292,11 +1329,11 @@ function TradingApp() {
             <div className="book-list">
               {openOrders.length === 0 && <span className="empty">{t.noOpenOrders}</span>}
               {openOrders.map((order) => (
-                <div className={order.status === "active" ? "book-row active-order" : "book-row"} key={order.id}>
+                <div className={`book-row ${order.status}-order`} key={order.id}>
                   <span className={order.side}>{order.side.toUpperCase()}</span>
                   <strong>{order.id}</strong>
                   <span>{formatPrice(order.entry)}</span>
-                  <small className={order.status === "active" ? "status-active" : "status-pending"}>
+                  <small className={`status-badge ${order.status}`}>
                     {order.status === "active" ? t.active : t.pending}
                   </small>
                   <small>TP {formatPrice(order.takeProfit)} / SL {formatPrice(order.stopLoss)}</small>
@@ -1313,7 +1350,7 @@ function TradingApp() {
           <span>ID</span><span>Side</span><span>Qty</span><span>Entry</span><span>TP</span><span>SL</span><span>Status</span><span>Result</span><span>{t.action}</span>
         </div>
         {[...openOrders, ...closedOrders, ...canceledOrders].map((order) => (
-          <div className={order.status === "active" ? "table-grid active-order" : "table-grid"} key={`${order.id}-${order.status}`}>
+          <div className={`table-grid ${order.status}-order`} key={`${order.id}-${order.status}`}>
             <span>{order.id}</span>
             <span className={order.side}>{order.side.toUpperCase()}</span>
             <span>{order.quantity}</span>
@@ -1344,7 +1381,7 @@ function TradingApp() {
                 formatPrice(order.stopLoss)
               )}
             </span>
-            <span className={order.status === "active" ? "status-active" : "status-pending"}>
+            <span className={`status-badge ${order.status}`}>
               {order.status === "active" ? t.active : order.status === "pending" ? t.pending : order.status}
             </span>
             <span>{order.result ?? "-"}</span>
