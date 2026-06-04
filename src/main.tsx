@@ -8,13 +8,18 @@ import {
   ISeriesApi,
   LineSeries,
   LineStyle,
+  Logical,
   Time
 } from "lightweight-charts";
 import Papa from "papaparse";
 import {
   BookOpen,
   Clipboard,
+  Lock,
+  LockOpen,
   Save,
+  Minus,
+  MoveHorizontal,
   MousePointer2,
   Focus,
   FileUp,
@@ -24,6 +29,7 @@ import {
   RotateCcw,
   Send,
   SkipForward,
+  Square,
   Trash2
 } from "lucide-react";
 import "./styles.css";
@@ -187,6 +193,42 @@ type DraggedOrderLine = {
   field: DraggableOrderField;
 };
 
+type DrawingTool = "cursor" | "line" | "horizontal" | "ray" | "rect" | "zigzag";
+
+type DrawingPoint = {
+  logical: number;
+  price: number;
+};
+
+type DrawingShape = {
+  id: string;
+  tool: Exclude<DrawingTool, "cursor">;
+  start: DrawingPoint;
+  end: DrawingPoint;
+  points?: DrawingPoint[];
+  strokeColor: string;
+  fillColor: string;
+  lineWidth: number;
+  borderWidth: number;
+  locked?: boolean;
+};
+
+type DraggedDrawing = {
+  id: string;
+  startPoint: DrawingPoint;
+  original: DrawingShape;
+  handle?: "move" | "start" | "end" | "topLeft" | "topRight" | "bottomRight" | "bottomLeft";
+  pointIndex?: number;
+};
+
+type DrawingMenu = {
+  id: string;
+  x: number;
+  y: number;
+};
+
+type OrderLineField = "entry" | "takeProfit" | "stopLoss";
+
 type ChartTheme = {
   upColor: string;
   downColor: string;
@@ -203,10 +245,11 @@ type ChartTheme = {
   allowMouseWheel: boolean;
   allowDrag: boolean;
   orderControlsSide: "left" | "right";
+  drawingSize: number;
 };
 
 type Language = "de" | "en";
-type SettingsTab = "colors" | "chart" | "orders" | "language";
+type SettingsTab = "colors" | "chart" | "orders" | "drawings" | "language";
 
 const defaultTheme: ChartTheme = {
   upColor: "#2fbf71",
@@ -223,7 +266,72 @@ const defaultTheme: ChartTheme = {
   showCrosshair: true,
   allowMouseWheel: true,
   allowDrag: true,
-  orderControlsSide: "right"
+  orderControlsSide: "right",
+  drawingSize: 1.4
+};
+
+const drawingsStorageKey = "chart-replay-tool-drawings";
+const pendingOrdersStorageKey = "chart-replay-tool-pending-orders";
+const defaultDrawingStrokeColor = "#7db8ff";
+const defaultDrawingFillColor = "#7db8ff";
+const rightPriceScaleOffset = 64;
+
+const loadStoredDrawings = (): DrawingShape[] => {
+  try {
+    const raw = window.localStorage.getItem(drawingsStorageKey);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((item) =>
+        item &&
+      ["line", "horizontal", "ray", "rect", "zigzag"].includes(item.tool) &&
+        Number.isFinite(item.start?.logical) &&
+        Number.isFinite(item.start?.price) &&
+        Number.isFinite(item.end?.logical) &&
+        Number.isFinite(item.end?.price)
+      )
+      .map((item) => ({
+        ...item,
+        strokeColor:
+          typeof item.strokeColor === "string"
+            ? item.strokeColor
+            : typeof item.color === "string"
+              ? item.color
+              : defaultDrawingStrokeColor,
+        fillColor:
+          typeof item.fillColor === "string"
+            ? item.fillColor
+            : typeof item.color === "string"
+              ? item.color
+              : defaultDrawingFillColor,
+        lineWidth: Number.isFinite(item.lineWidth) ? item.lineWidth : 1.4,
+        borderWidth: Number.isFinite(item.borderWidth) ? item.borderWidth : 1.4,
+        points: Array.isArray(item.points) ? item.points : undefined,
+        locked: Boolean(item.locked)
+      }));
+  } catch {
+    return [];
+  }
+};
+
+const loadStoredPendingOrders = (): TradeOrder[] => {
+  try {
+    const raw = window.localStorage.getItem(pendingOrdersStorageKey);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((item) =>
+      item &&
+      item.status === "pending" &&
+      (item.side === "buy" || item.side === "sell") &&
+      typeof item.id === "string" &&
+      Number.isFinite(item.quantity) &&
+      Number.isFinite(item.entry)
+    );
+  } catch {
+    return [];
+  }
 };
 
 const translations = {
@@ -240,14 +348,24 @@ const translations = {
     priceScaleTitle: "Preisachse automatisch skalieren",
     autoFocusTitle: "Chart automatisch auf sichtbare Kerzen fokussieren",
     chartOptionsTitle: "Chart-Design einstellen",
+    cursorTool: "Cursor",
+    lineTool: "Linie",
+    horizontalTool: "Horizontale Linie",
+    rayTool: "Halbe Linie",
+    rectTool: "Rechteck",
+    zigzagTool: "Zig Zag",
+    clearDrawings: "Zeichnungen löschen",
     chartDesign: "Chart-Design",
     colors: "Farben",
     chart: "Chart",
     orders: "Orders",
+    drawings: "Zeichnungen",
     candlesSection: "Kerzen",
     chartArea: "Chart-Fläche",
     behavior: "Verhalten",
     orderDisplay: "Order-Anzeige",
+    drawingDisplay: "Zeichenwerkzeuge",
+    drawingSize: "Größe",
     language: "Sprache",
     german: "Deutsch",
     english: "English",
@@ -321,14 +439,24 @@ const translations = {
     priceScaleTitle: "Automatically scale price axis",
     autoFocusTitle: "Automatically focus visible candles",
     chartOptionsTitle: "Configure chart design",
+    cursorTool: "Cursor",
+    lineTool: "Line",
+    horizontalTool: "Horizontal Line",
+    rayTool: "Ray",
+    rectTool: "Rectangle",
+    zigzagTool: "Zig Zag",
+    clearDrawings: "Clear drawings",
     chartDesign: "Chart Design",
     colors: "Colors",
     chart: "Chart",
     orders: "Orders",
+    drawings: "Drawings",
     candlesSection: "Candles",
     chartArea: "Chart Area",
     behavior: "Behavior",
     orderDisplay: "Order Display",
+    drawingDisplay: "Drawing Tools",
+    drawingSize: "Size",
     language: "Language",
     german: "Deutsch",
     english: "English",
@@ -395,23 +523,30 @@ function TradingApp() {
   const chartElement = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const candleSeriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
-  const lineSeriesRef = useRef<ISeriesApi<"Line">[]>([]);
+  const lineSeriesRef = useRef<Map<string, ISeriesApi<"Line">>>(new Map());
   const shouldFitContentRef = useRef(true);
   const shouldFitPriceRef = useRef(true);
+  const previousVisibleCountRef = useRef(0);
+  const previousCandleSetRef = useRef<Candle[] | null>(null);
+  const overlayRefreshFrameRef = useRef(0);
+  const overlayRefreshFollowUpFrameRef = useRef(0);
+  const hasChartOverlaysRef = useRef(false);
   const ordersRef = useRef<TradeOrder[]>([]);
   const draggedLineRef = useRef<DraggedOrderLine | null>(null);
   const draggedChipRef = useRef<{ orderId: string; field: "takeProfit" | "stopLoss" } | null>(null);
+  const drawingDraftRef = useRef<DrawingShape | null>(null);
+  const draggedDrawingRef = useRef<DraggedDrawing | null>(null);
   const chipDragFinishedRef = useRef(false);
-  const [lineControls, setLineControls] = useState<Array<{ order: TradeOrder; y: number }>>([]);
+  const [lineControls, setLineControls] = useState<Array<{ order: TradeOrder; y: number; x: number; controlsX: number }>>([]);
   const [orderLineLabels, setOrderLineLabels] = useState<
-    Array<{ order: TradeOrder; field: DraggableOrderField; y: number; price: number }>
+    Array<{ order: TradeOrder; field: DraggableOrderField; y: number; price: number; x?: number }>
   >([]);
 
   const [allCandles, setAllCandles] = useState<Candle[]>(defaultCandles);
   const [visibleCount, setVisibleCount] = useState(4);
   const [isPlaying, setIsPlaying] = useState(false);
   const [speedMs, setSpeedMs] = useState(800);
-  const [orders, setOrders] = useState<TradeOrder[]>([]);
+  const [orders, setOrders] = useState<TradeOrder[]>(() => loadStoredPendingOrders());
   const [side, setSide] = useState<Side>("buy");
   const [quantity, setQuantity] = useState(1);
   const [entry, setEntry] = useState("");
@@ -423,6 +558,13 @@ function TradingApp() {
   const [showChartOptions, setShowChartOptions] = useState(false);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>("colors");
   const [chartTheme, setChartTheme] = useState<ChartTheme>(defaultTheme);
+  const [drawingTool, setDrawingTool] = useState<DrawingTool>("cursor");
+  const [drawings, setDrawings] = useState<DrawingShape[]>(() => loadStoredDrawings());
+  const [drawingDraft, setDrawingDraft] = useState<DrawingShape | null>(null);
+  const [zigZagDraftPoints, setZigZagDraftPoints] = useState<DrawingPoint[]>([]);
+  const [selectedDrawingId, setSelectedDrawingId] = useState<string | null>(null);
+  const [drawingMenu, setDrawingMenu] = useState<DrawingMenu | null>(null);
+  const [chartViewVersion, setChartViewVersion] = useState(0);
   const [language, setLanguage] = useState<Language>("de");
   const t = translations[language];
   const [message, setMessage] = useState(translations.de.demoLoaded);
@@ -430,12 +572,129 @@ function TradingApp() {
 
   const visibleCandles = useMemo(() => allCandles.slice(0, visibleCount), [allCandles, visibleCount]);
   const lastCandle = visibleCandles.at(-1);
-  const openOrders = orders.filter((order) => order.status === "pending" || order.status === "active");
-  const closedOrders = orders.filter((order) => order.status === "closed");
-  const canceledOrders = orders.filter((order) => order.status === "canceled");
+  const openOrders = useMemo(
+    () => orders.filter((order) => order.status === "pending" || order.status === "active"),
+    [orders]
+  );
+  const closedOrders = useMemo(() => orders.filter((order) => order.status === "closed"), [orders]);
+  const canceledOrders = useMemo(() => orders.filter((order) => order.status === "canceled"), [orders]);
+
+  const screenToDrawingPoint = useCallback((x: number, y: number, snapToCandle = false): DrawingPoint | null => {
+    const chart = chartRef.current;
+    const series = candleSeriesRef.current;
+    const logical = chart?.timeScale().coordinateToLogical(x);
+    const price = series?.coordinateToPrice(y);
+    if (logical === null || logical === undefined || price === null || price === undefined) return null;
+
+    if (snapToCandle && visibleCandles.length) {
+      const candleIndex = Math.max(0, Math.min(visibleCandles.length - 1, Math.round(Number(logical))));
+      const candle = visibleCandles[candleIndex];
+      const highY = series?.priceToCoordinate(candle.high);
+      const lowY = series?.priceToCoordinate(candle.low);
+      const snappedPrice =
+        highY !== null &&
+        highY !== undefined &&
+        lowY !== null &&
+        lowY !== undefined &&
+        Math.abs(y - highY) <= Math.abs(y - lowY)
+          ? candle.high
+          : candle.low;
+      return { logical: candleIndex, price: snappedPrice };
+    }
+
+    return { logical: Number(logical), price };
+  }, [visibleCandles]);
+
+  const drawingPointToScreen = useCallback((point: DrawingPoint) => {
+    const chart = chartRef.current;
+    const series = candleSeriesRef.current;
+    const x = chart?.timeScale().logicalToCoordinate(point.logical as Logical);
+    const y = series?.priceToCoordinate(point.price);
+    if (x === null || x === undefined || y === null || y === undefined) return null;
+    return { x, y };
+  }, []);
+
+  const projectedDrawings = useMemo(() => {
+    void chartViewVersion;
+    const chartWidth = chartElement.current?.clientWidth ?? 0;
+    const drawingPaneWidth = Math.max(0, chartWidth - rightPriceScaleOffset);
+    const zigZagDraft =
+      zigZagDraftPoints.length >= 2
+        ? {
+            id: "ZIGZAG-DRAFT",
+            tool: "zigzag" as const,
+            start: zigZagDraftPoints[0],
+            end: zigZagDraftPoints.at(-1) ?? zigZagDraftPoints[0],
+            points: zigZagDraftPoints,
+            strokeColor: defaultDrawingStrokeColor,
+            fillColor: defaultDrawingFillColor,
+            lineWidth: chartTheme.drawingSize,
+            borderWidth: chartTheme.drawingSize
+          }
+        : null;
+    return [...drawings, ...(drawingDraft ? [drawingDraft] : []), ...(zigZagDraft ? [zigZagDraft] : [])]
+      .map((drawing) => {
+        const points = drawing.points
+          ?.map((point) => drawingPointToScreen(point))
+          .filter(Boolean) as Array<{ x: number; y: number }> | undefined;
+        const start = drawingPointToScreen(drawing.start);
+        const end = drawingPointToScreen(drawing.end);
+        if (!start || !end) return undefined;
+        if (drawing.tool === "zigzag") return { drawing, start, end, points };
+        if (drawing.tool === "horizontal") {
+          return {
+            drawing,
+            start: { x: 0, y: start.y },
+            end: { x: drawingPaneWidth, y: start.y }
+          };
+        }
+        if (drawing.tool === "ray") {
+          const dx = end.x - start.x;
+          const dy = end.y - start.y;
+          const rayEndX = drawingPaneWidth;
+          const rayEndY = dx === 0 ? end.y : start.y + (dy / dx) * (rayEndX - start.x);
+          return { drawing, start, end: { x: rayEndX, y: rayEndY } };
+        }
+        return { drawing, start, end };
+      })
+      .filter(Boolean) as Array<{ drawing: DrawingShape; start: { x: number; y: number }; end: { x: number; y: number }; points?: Array<{ x: number; y: number }> }>;
+  }, [chartTheme.drawingSize, chartViewVersion, drawingDraft, drawingPointToScreen, drawings, zigZagDraftPoints]);
+
+  const scheduleOverlayRefresh = useCallback((withFollowUp = false) => {
+    window.cancelAnimationFrame(overlayRefreshFrameRef.current);
+    if (withFollowUp) window.cancelAnimationFrame(overlayRefreshFollowUpFrameRef.current);
+    overlayRefreshFrameRef.current = window.requestAnimationFrame(() => {
+      setChartViewVersion((version) => version + 1);
+      if (withFollowUp) {
+        overlayRefreshFollowUpFrameRef.current = window.requestAnimationFrame(() => {
+          setChartViewVersion((version) => version + 1);
+        });
+      }
+    });
+  }, []);
 
   useEffect(() => {
     ordersRef.current = orders;
+  }, [orders]);
+
+  useEffect(() => {
+    hasChartOverlaysRef.current = drawings.length > 0 || openOrders.length > 0;
+  }, [drawings.length, openOrders.length]);
+
+  useEffect(() => {
+    return () => {
+      window.cancelAnimationFrame(overlayRefreshFrameRef.current);
+      window.cancelAnimationFrame(overlayRefreshFollowUpFrameRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    window.localStorage.setItem(drawingsStorageKey, JSON.stringify(drawings));
+  }, [drawings]);
+
+  useEffect(() => {
+    const pendingOrders = orders.filter((order) => order.status === "pending");
+    window.localStorage.setItem(pendingOrdersStorageKey, JSON.stringify(pendingOrders));
   }, [orders]);
 
   useEffect(() => {
@@ -483,15 +742,22 @@ function TradingApp() {
     const observer = new ResizeObserver(() => {
       if (chartElement.current) {
         chart.resize(chartElement.current.clientWidth, chartElement.current.clientHeight);
+        scheduleOverlayRefresh(true);
       }
     });
     observer.observe(chartElement.current);
+    const handleVisibleRangeChange = () => {
+      scheduleOverlayRefresh();
+    };
+    chart.timeScale().subscribeVisibleLogicalRangeChange(handleVisibleRangeChange);
 
     return () => {
       observer.disconnect();
+      chart.timeScale().unsubscribeVisibleLogicalRangeChange(handleVisibleRangeChange);
+      lineSeriesRef.current.clear();
       chart.remove();
     };
-  }, []);
+  }, [scheduleOverlayRefresh]);
 
   useEffect(() => {
     chartRef.current?.applyOptions({
@@ -550,7 +816,6 @@ function TradingApp() {
         setVisibleCount(Math.min(60, candles.length));
         shouldFitContentRef.current = true;
         shouldFitPriceRef.current = true;
-        setOrders([]);
         setIsPlaying(false);
         setMessage(t.chartCsvLoaded(candles.length));
         setMessageKind("chartCsv");
@@ -571,7 +836,21 @@ function TradingApp() {
   }, [allCandles.length, messageKind, t]);
 
   useEffect(() => {
-    candleSeriesRef.current?.setData(visibleCandles);
+    const candleSeries = candleSeriesRef.current;
+    const candleSetChanged = previousCandleSetRef.current !== allCandles;
+    const canAppendSingleCandle = !candleSetChanged && visibleCount === previousVisibleCountRef.current + 1;
+
+    if (candleSeries) {
+      if (canAppendSingleCandle) {
+        const nextCandle = allCandles[visibleCount - 1];
+        if (nextCandle) candleSeries.update(nextCandle);
+      } else if (candleSetChanged || visibleCount !== previousVisibleCountRef.current) {
+        candleSeries.setData(visibleCandles);
+      }
+      previousCandleSetRef.current = allCandles;
+      previousVisibleCountRef.current = visibleCount;
+    }
+
     if (autoFocusChart || shouldFitContentRef.current) {
       chartRef.current?.timeScale().fitContent();
       if (shouldFitPriceRef.current) {
@@ -595,50 +874,75 @@ function TradingApp() {
     const chart = chartRef.current;
     if (!chart || !visibleCandles.length) return;
 
-    lineSeriesRef.current.forEach((series) => chart.removeSeries(series));
-    lineSeriesRef.current = [];
+    const activeKeys = new Set<string>();
+    const start = visibleCandles[0].time;
+    const end = visibleCandles.at(-1)?.time ?? start;
 
-    openOrders.forEach((order) => {
-      const start = visibleCandles[0].time;
-      const end = visibleCandles.at(-1)?.time ?? start;
-      const addLine = (price: number, color: string, title: string, style = LineStyle.Solid) => {
-        const series = chart.addSeries(LineSeries, {
+    const upsertLine = (
+      order: TradeOrder,
+      field: OrderLineField,
+      price: number,
+      color: string,
+      style = LineStyle.Solid
+    ) => {
+      const key = `${order.id}-${field}`;
+      activeKeys.add(key);
+      let series = lineSeriesRef.current.get(key);
+      if (!series) {
+        series = chart.addSeries(LineSeries, {
           color,
           lineWidth: 2,
           lineStyle: style,
           priceLineVisible: false,
           title: ""
         });
-        series.setData([
-          { time: start, value: price },
-          { time: end, value: price }
-        ]);
-        lineSeriesRef.current.push(series);
-      };
+        lineSeriesRef.current.set(key, series);
+      } else {
+        series.applyOptions({ color, lineStyle: style, lineWidth: 2 });
+      }
+      series.setData([
+        { time: start, value: price },
+        { time: end, value: price }
+      ]);
+    };
 
+    openOrders.forEach((order) => {
       const entryColor = order.status === "active" ? "#facc15" : order.side === "buy" ? "#38bdf8" : "#fb923c";
-      const entryTitle = order.status === "active" ? `${order.id} ACTIVE Entry` : `${order.id} Pending Entry`;
-      addLine(order.entry, entryColor, entryTitle, order.status === "active" ? LineStyle.LargeDashed : LineStyle.Solid);
-      if (order.takeProfit !== undefined) addLine(order.takeProfit, "#2fbf71", `${order.id} TP`, LineStyle.Dashed);
-      if (order.stopLoss !== undefined) addLine(order.stopLoss, "#e05252", `${order.id} SL`, LineStyle.Dashed);
+      upsertLine(order, "entry", order.entry, entryColor, order.status === "active" ? LineStyle.LargeDashed : LineStyle.Solid);
+      if (order.takeProfit !== undefined) upsertLine(order, "takeProfit", order.takeProfit, "#2fbf71", LineStyle.Dashed);
+      if (order.stopLoss !== undefined) upsertLine(order, "stopLoss", order.stopLoss, "#e05252", LineStyle.Dashed);
     });
-  }, [openOrders, visibleCandles]);
+
+    lineSeriesRef.current.forEach((series, key) => {
+      if (activeKeys.has(key)) return;
+      chart.removeSeries(series);
+      lineSeriesRef.current.delete(key);
+    });
+  }, [chartViewVersion, openOrders, visibleCandles]);
 
   useEffect(() => {
     const updateLineControls = () => {
       const series = candleSeriesRef.current;
       if (!series) return;
+      const chartWidth = chartElement.current?.clientWidth ?? 0;
       const controls = openOrders
         .filter((order) => order.status === "pending" && (order.takeProfit === undefined || order.stopLoss === undefined))
         .map((order) => {
           const y = series.priceToCoordinate(order.entry);
-          return y === null ? undefined : { order, y };
+          const orderIndex = allCandles.findIndex((candle) => candle.time === order.openedAt);
+          const logical = (orderIndex >= 0 ? orderIndex : visibleCandles.length - 1) as Logical;
+          const coordinate = chartRef.current?.timeScale().logicalToCoordinate(logical);
+          const x = coordinate === null || coordinate === undefined ? chartWidth * 0.58 : coordinate;
+          const paneWidth = Math.max(0, chartWidth - rightPriceScaleOffset);
+          const controlWidth = 286;
+          const controlsX = Math.max(12, paneWidth - controlWidth + 66);
+          return y === null ? undefined : { order, y, x, controlsX };
         })
-        .filter(Boolean) as Array<{ order: TradeOrder; y: number }>;
+        .filter(Boolean) as Array<{ order: TradeOrder; y: number; x: number; controlsX: number }>;
       setLineControls(controls);
 
       const labels = openOrders.flatMap((order) => {
-        const rows: Array<{ order: TradeOrder; field: DraggableOrderField; y: number; price: number }> = [];
+        const rows: Array<{ order: TradeOrder; field: DraggableOrderField; y: number; price: number; x?: number }> = [];
         const candidates: Array<[DraggableOrderField, number | undefined]> = [
           ["entry", order.entry],
           ["takeProfit", order.takeProfit],
@@ -647,7 +951,14 @@ function TradingApp() {
         candidates.forEach(([field, price]) => {
           if (price === undefined) return;
           const y = series.priceToCoordinate(price);
-          if (y !== null) rows.push({ order, field, y, price });
+          if (y !== null) {
+            const matchingControl = controls.find((control) => control.order.id === order.id);
+            const labelX =
+              field === "entry" && matchingControl
+                ? Math.max(8, matchingControl.controlsX - 104)
+                : undefined;
+            rows.push({ order, field, y, price, x: labelX });
+          }
         });
         return rows;
       });
@@ -657,7 +968,7 @@ function TradingApp() {
     updateLineControls();
     const frame = window.requestAnimationFrame(updateLineControls);
     return () => window.cancelAnimationFrame(frame);
-  }, [openOrders, visibleCandles]);
+  }, [allCandles, chartTheme.orderControlsSide, chartViewVersion, openOrders, visibleCandles]);
 
   useEffect(() => {
     if (!isPlaying) return;
@@ -669,6 +980,111 @@ function TradingApp() {
     const timer = window.setTimeout(() => stepForward(), speedMs);
     return () => window.clearTimeout(timer);
   }, [isPlaying, visibleCount, allCandles.length, speedMs]);
+
+  useEffect(() => {
+    const handleMouseMove = (event: MouseEvent) => {
+      const drag = draggedDrawingRef.current;
+      const chartNode = chartElement.current;
+      if (!drag || !chartNode) return;
+      const rect = chartNode.getBoundingClientRect();
+      const point = screenToDrawingPoint(event.clientX - rect.left, event.clientY - rect.top, event.ctrlKey);
+      if (!point) return;
+      const logicalDelta = point.logical - drag.startPoint.logical;
+      const priceDelta = point.price - drag.startPoint.price;
+      setDrawings((current) =>
+        current.map((drawing) => {
+          if (drawing.id !== drag.id) return drawing;
+          if (drawing.locked) return drawing;
+          if (drawing.tool === "zigzag" && drag.pointIndex !== undefined) {
+            const points = drawing.points?.map((existingPoint, index) =>
+              index === drag.pointIndex ? point : existingPoint
+            );
+            if (!points?.length) return drawing;
+            return {
+              ...drawing,
+              points,
+              start: points[0],
+              end: points.at(-1) ?? points[0]
+            };
+          }
+          if (drawing.tool === "rect") {
+            if (drag.handle === "topLeft") return { ...drawing, start: point };
+            if (drag.handle === "bottomRight") return { ...drawing, end: point };
+            if (drag.handle === "topRight") {
+              return {
+                ...drawing,
+                start: { ...drawing.start, price: point.price },
+                end: { ...drawing.end, logical: point.logical }
+              };
+            }
+            if (drag.handle === "bottomLeft") {
+              return {
+                ...drawing,
+                start: { ...drawing.start, logical: point.logical },
+                end: { ...drawing.end, price: point.price }
+              };
+            }
+          }
+          if (drag.handle === "start") {
+            if (drawing.tool === "ray" || drawing.tool === "horizontal") {
+              return {
+                ...drawing,
+                start: point,
+                end: { ...drawing.end, price: point.price }
+              };
+            }
+            return { ...drawing, start: point };
+          }
+          if (drag.handle === "end") {
+            if (drawing.tool === "ray" || drawing.tool === "horizontal") {
+              return {
+                ...drawing,
+                end: { logical: point.logical, price: drawing.start.price }
+              };
+            }
+            return { ...drawing, end: point };
+          }
+          return {
+            ...drag.original,
+            start: {
+              logical: drag.original.start.logical + logicalDelta,
+              price: drag.original.start.price + priceDelta
+            },
+            end: {
+              logical: drag.original.end.logical + logicalDelta,
+              price: drag.original.end.price + priceDelta
+            },
+            points: drag.original.points?.map((point) => ({
+              logical: point.logical + logicalDelta,
+              price: point.price + priceDelta
+            }))
+          };
+        })
+      );
+    };
+
+    const handleMouseUp = () => {
+      draggedDrawingRef.current = null;
+    };
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if ((event.key !== "Delete" && event.key !== "Backspace") || !selectedDrawingId) return;
+      const selectedDrawing = drawings.find((drawing) => drawing.id === selectedDrawingId);
+      if (selectedDrawing?.locked) return;
+      setDrawings((current) => current.filter((drawing) => drawing.id !== selectedDrawingId));
+      setSelectedDrawingId(null);
+      setDrawingMenu(null);
+    };
+
+    window.addEventListener("mousemove", handleMouseMove);
+    window.addEventListener("mouseup", handleMouseUp);
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("mouseup", handleMouseUp);
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [drawings, screenToDrawingPoint, selectedDrawingId]);
 
   useEffect(() => {
     const chartNode = chartElement.current;
@@ -748,8 +1164,15 @@ function TradingApp() {
     const handleMouseMove = (event: MouseEvent) => {
       const rect = chartNode.getBoundingClientRect();
       const mouseY = event.clientY - rect.top;
+      const mouseX = event.clientX - rect.left;
       const activeLine = draggedLineRef.current;
       const activeChip = draggedChipRef.current;
+      const isPriceScaleInteraction = mouseX > rect.width - 74 && event.buttons === 1;
+      const isDrawingInteraction = draggedDrawingRef.current !== null || drawingDraftRef.current !== null;
+
+      if (hasChartOverlaysRef.current && (isPriceScaleInteraction || isDrawingInteraction || activeLine || activeChip)) {
+        scheduleOverlayRefresh();
+      }
 
       if (!activeLine && !activeChip) {
         chartNode.classList.toggle("line-hover", findOrderLineAt(mouseY) !== null);
@@ -784,6 +1207,7 @@ function TradingApp() {
     };
 
     const handleMouseUp = () => {
+      scheduleOverlayRefresh(true);
       if (!draggedLineRef.current && !draggedChipRef.current) return;
       const orderId = draggedLineRef.current?.orderId ?? draggedChipRef.current?.orderId;
       if (draggedChipRef.current) {
@@ -815,11 +1239,19 @@ function TradingApp() {
       if (orderId) setMessage(t.protectionUpdated(orderId));
     };
 
-    const closeMenu = () => setChartMenu(null);
+    const handleWheel = () => {
+      scheduleOverlayRefresh(true);
+    };
+
+    const closeMenu = () => {
+      setChartMenu(null);
+      setDrawingMenu(null);
+    };
 
     chartNode.addEventListener("contextmenu", handleContextMenu);
     chartNode.addEventListener("mousedown", handleMouseDown);
     chartNode.addEventListener("mousemove", handleMouseMove);
+    chartNode.addEventListener("wheel", handleWheel);
     window.addEventListener("mouseup", handleMouseUp);
     window.addEventListener("click", closeMenu);
     window.addEventListener("keydown", closeMenu);
@@ -828,11 +1260,12 @@ function TradingApp() {
       chartNode.removeEventListener("contextmenu", handleContextMenu);
       chartNode.removeEventListener("mousedown", handleMouseDown);
       chartNode.removeEventListener("mousemove", handleMouseMove);
+      chartNode.removeEventListener("wheel", handleWheel);
       window.removeEventListener("mouseup", handleMouseUp);
       window.removeEventListener("click", closeMenu);
       window.removeEventListener("keydown", closeMenu);
     };
-  }, [t]);
+  }, [scheduleOverlayRefresh, t]);
 
   const evaluateOrders = useCallback((candle: Candle) => {
     setOrders((current) =>
@@ -1011,6 +1444,230 @@ function TradingApp() {
     addOrderProtection(orderId, field);
   };
 
+  const startDrawing = (event: React.MouseEvent<SVGSVGElement>) => {
+    if (drawingTool === "cursor" || event.button !== 0) return;
+    const rect = event.currentTarget.getBoundingClientRect();
+    const point = screenToDrawingPoint(event.clientX - rect.left, event.clientY - rect.top, event.ctrlKey);
+    if (!point) return;
+    event.preventDefault();
+    if (drawingTool === "zigzag") {
+      setZigZagDraftPoints((current) => (current.length ? [...current.slice(0, -1), point, point] : [point, point]));
+      setDrawingMenu(null);
+      setChartMenu(null);
+      return;
+    }
+    const shape: DrawingShape = {
+      id: `DRAW-${Date.now()}`,
+      tool: drawingTool,
+      start: point,
+      end: point,
+      strokeColor: defaultDrawingStrokeColor,
+      fillColor: defaultDrawingFillColor,
+      lineWidth: chartTheme.drawingSize,
+      borderWidth: chartTheme.drawingSize,
+      locked: false
+    };
+    drawingDraftRef.current = shape;
+    setDrawingDraft(shape);
+    setDrawingMenu(null);
+    setChartMenu(null);
+  };
+
+  const startDrawingMove = (event: React.MouseEvent<SVGElement>, drawing: DrawingShape) => {
+    if (drawingTool !== "cursor" || event.button !== 0) return;
+    if (drawing.locked) {
+      setSelectedDrawingId(drawing.id);
+      return;
+    }
+    const chartNode = chartElement.current;
+    if (!chartNode) return;
+    const rect = chartNode.getBoundingClientRect();
+    const point = screenToDrawingPoint(event.clientX - rect.left, event.clientY - rect.top, event.ctrlKey);
+    if (!point) return;
+    event.preventDefault();
+    event.stopPropagation();
+    setSelectedDrawingId(drawing.id);
+    draggedDrawingRef.current = {
+      id: drawing.id,
+      startPoint: point,
+      original: drawing,
+      handle: "move"
+    };
+    setDrawingMenu(null);
+    setChartMenu(null);
+  };
+
+  const startDrawingResize = (
+    event: React.MouseEvent<SVGElement>,
+    drawing: DrawingShape,
+    handle: NonNullable<DraggedDrawing["handle"]>
+  ) => {
+    if (drawingTool !== "cursor" || event.button !== 0) return;
+    if (drawing.locked) return;
+    const chartNode = chartElement.current;
+    if (!chartNode) return;
+    const rect = chartNode.getBoundingClientRect();
+    const point = screenToDrawingPoint(event.clientX - rect.left, event.clientY - rect.top, event.ctrlKey);
+    if (!point) return;
+    event.preventDefault();
+    event.stopPropagation();
+    setSelectedDrawingId(drawing.id);
+    draggedDrawingRef.current = {
+      id: drawing.id,
+      startPoint: point,
+      original: drawing,
+      handle
+    };
+    setDrawingMenu(null);
+    setChartMenu(null);
+  };
+
+  const startZigZagPointMove = (
+    event: React.MouseEvent<SVGElement>,
+    drawing: DrawingShape,
+    pointIndex: number
+  ) => {
+    if (drawingTool !== "cursor" || event.button !== 0 || drawing.locked) return;
+    const chartNode = chartElement.current;
+    if (!chartNode) return;
+    const rect = chartNode.getBoundingClientRect();
+    const point = screenToDrawingPoint(event.clientX - rect.left, event.clientY - rect.top, event.ctrlKey);
+    if (!point) return;
+    event.preventDefault();
+    event.stopPropagation();
+    setSelectedDrawingId(drawing.id);
+    draggedDrawingRef.current = {
+      id: drawing.id,
+      startPoint: point,
+      original: drawing,
+      pointIndex
+    };
+    setDrawingMenu(null);
+    setChartMenu(null);
+  };
+
+  const openDrawingContextMenu = (event: React.MouseEvent<SVGElement>, drawing: DrawingShape) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const chartNode = chartElement.current;
+    if (!chartNode) return;
+    const rect = chartNode.getBoundingClientRect();
+    setSelectedDrawingId(drawing.id);
+    setDrawingMenu({
+      id: drawing.id,
+      x: event.clientX - rect.left,
+      y: event.clientY - rect.top
+    });
+    setChartMenu(null);
+  };
+
+  const deleteDrawing = (drawingId: string) => {
+    setDrawings((current) => current.filter((drawing) => drawing.id !== drawingId || drawing.locked));
+    setSelectedDrawingId((current) => (current === drawingId ? null : current));
+    setDrawingMenu(null);
+  };
+
+  const toggleDrawingLock = (drawingId: string) => {
+    setDrawings((current) =>
+      current.map((drawing) =>
+        drawing.id === drawingId ? { ...drawing, locked: !drawing.locked } : drawing
+      )
+    );
+    setDrawingMenu(null);
+  };
+
+  const updateDrawingColor = (drawingId: string, field: "strokeColor" | "fillColor", color: string) => {
+    setDrawings((current) =>
+      current.map((drawing) => (drawing.id === drawingId ? { ...drawing, [field]: color } : drawing))
+    );
+  };
+
+  const updateDrawingNumber = (drawingId: string, field: "lineWidth" | "borderWidth", value: number) => {
+    setDrawings((current) =>
+      current.map((drawing) => (drawing.id === drawingId ? { ...drawing, [field]: value } : drawing))
+    );
+  };
+
+  const updateDrawing = (event: React.MouseEvent<SVGSVGElement>) => {
+    if (drawingTool === "zigzag" && zigZagDraftPoints.length) {
+      const rect = event.currentTarget.getBoundingClientRect();
+      const point = screenToDrawingPoint(event.clientX - rect.left, event.clientY - rect.top, event.ctrlKey);
+      if (!point) return;
+      setZigZagDraftPoints((current) => [...current.slice(0, -1), point]);
+      return;
+    }
+    const draft = drawingDraftRef.current;
+    if (!draft) return;
+    const rect = event.currentTarget.getBoundingClientRect();
+    const point = screenToDrawingPoint(event.clientX - rect.left, event.clientY - rect.top, event.ctrlKey);
+    if (!point) return;
+    const next = {
+      ...draft,
+      end:
+        draft.tool === "ray" || draft.tool === "horizontal"
+          ? { logical: point.logical, price: draft.start.price }
+          : point
+    };
+    drawingDraftRef.current = next;
+    setDrawingDraft(next);
+  };
+
+  const finishDrawing = () => {
+    if (drawingTool === "zigzag") return;
+    const draft = drawingDraftRef.current;
+    if (!draft) return;
+    drawingDraftRef.current = null;
+    setDrawingDraft(null);
+    setDrawingTool("cursor");
+    const start = drawingPointToScreen(draft.start);
+    const end = drawingPointToScreen(draft.end);
+    if (!start || !end || Math.hypot(end.x - start.x, end.y - start.y) < 6) return;
+    setDrawings((current) => [...current, draft]);
+    setSelectedDrawingId(draft.id);
+  };
+
+  const finishZigZagDrawing = useCallback(() => {
+    if (zigZagDraftPoints.length < 3) {
+      setZigZagDraftPoints([]);
+      setDrawingTool("cursor");
+      return;
+    }
+    const points = zigZagDraftPoints.slice(0, -1);
+    const shape: DrawingShape = {
+      id: `DRAW-${Date.now()}`,
+      tool: "zigzag",
+      start: points[0],
+      end: points.at(-1) ?? points[0],
+      points,
+      strokeColor: defaultDrawingStrokeColor,
+      fillColor: defaultDrawingFillColor,
+      lineWidth: chartTheme.drawingSize,
+      borderWidth: chartTheme.drawingSize,
+      locked: false
+    };
+    setDrawings((current) => [...current, shape]);
+    setSelectedDrawingId(shape.id);
+    setZigZagDraftPoints([]);
+    setDrawingTool("cursor");
+  }, [chartTheme.drawingSize, zigZagDraftPoints]);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (drawingTool !== "zigzag") return;
+      if (event.key === "Enter") {
+        event.preventDefault();
+        finishZigZagDrawing();
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setZigZagDraftPoints([]);
+        setDrawingTool("cursor");
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [drawingTool, finishZigZagDrawing]);
+
   const useChartPrice = (target: "entry" | "tp" | "sl") => {
     if (!chartMenu) return;
     const value = chartMenu.price.toFixed(2);
@@ -1072,6 +1729,8 @@ function TradingApp() {
     setMessage(t.replayReset);
   };
 
+  const menuDrawing = drawingMenu ? drawings.find((drawing) => drawing.id === drawingMenu.id) : undefined;
+
   return (
     <main className="app-shell">
       <section className="topbar">
@@ -1122,11 +1781,212 @@ function TradingApp() {
           </div>
           <div className="chart-wrap">
             <div className="chart" ref={chartElement} />
-            {lineControls.map(({ order, y }) => (
+            <div className="drawing-toolbar" aria-label="Chart tools">
+              <button
+                className={drawingTool === "cursor" ? "active" : ""}
+                onClick={() => setDrawingTool("cursor")}
+                title={t.cursorTool}
+              >
+                <MousePointer2 size={16} />
+              </button>
+              <button
+                className={drawingTool === "line" ? "active" : ""}
+                onClick={() => setDrawingTool("line")}
+                title={t.lineTool}
+              >
+                <Minus size={17} />
+              </button>
+              <button
+                className={drawingTool === "horizontal" ? "active" : ""}
+                onClick={() => setDrawingTool("horizontal")}
+                title={t.horizontalTool}
+              >
+                <MoveHorizontal size={17} />
+              </button>
+              <button
+                className={drawingTool === "ray" ? "active" : ""}
+                onClick={() => setDrawingTool("ray")}
+                title={t.rayTool}
+              >
+                <span className="ray-icon" />
+              </button>
+              <button
+                className={drawingTool === "rect" ? "active" : ""}
+                onClick={() => setDrawingTool("rect")}
+                title={t.rectTool}
+              >
+                <Square size={16} />
+              </button>
+              <button
+                className={drawingTool === "zigzag" ? "active" : ""}
+                onClick={() => {
+                  setZigZagDraftPoints([]);
+                  setDrawingTool("zigzag");
+                }}
+                title={t.zigzagTool}
+              >
+                <span className="zigzag-icon" />
+              </button>
+              <button
+                onClick={() => setDrawings([])}
+                title={t.clearDrawings}
+                disabled={!drawings.length}
+              >
+                <Trash2 size={16} />
+              </button>
+            </div>
+            <svg
+              className={drawingTool === "cursor" ? "drawing-layer" : "drawing-layer active"}
+              onMouseDown={startDrawing}
+              onMouseMove={updateDrawing}
+              onMouseUp={finishDrawing}
+              onMouseLeave={finishDrawing}
+              onDoubleClick={(event) => {
+                event.preventDefault();
+                finishZigZagDrawing();
+              }}
+            >
+              {projectedDrawings.map(({ drawing, start, end }) => {
+                const isSelected = selectedDrawingId === drawing.id;
+                if (drawing.tool === "zigzag" && drawing.points?.length) {
+                  const pointString = drawing.points
+                    .map((point) => drawingPointToScreen(point))
+                    .filter(Boolean)
+                    .map((point) => `${point?.x},${point?.y}`)
+                    .join(" ");
+                  if (!pointString) return null;
+                  return (
+                    <React.Fragment key={drawing.id}>
+                      <polyline
+                        className="drawing-hit-area"
+                        points={pointString}
+                        onMouseDown={(event) => startDrawingMove(event, drawing)}
+                        onContextMenu={(event) => openDrawingContextMenu(event, drawing)}
+                      />
+                      <polyline
+                        className={[
+                          drawing.id === "ZIGZAG-DRAFT" ? "drawing-shape draft" : "drawing-shape zigzag",
+                          isSelected ? "selected" : "",
+                          drawing.locked ? "locked" : ""
+                        ].join(" ")}
+                        points={pointString}
+                        style={{ stroke: drawing.strokeColor, strokeWidth: drawing.lineWidth }}
+                        onMouseDown={(event) => startDrawingMove(event, drawing)}
+                        onContextMenu={(event) => openDrawingContextMenu(event, drawing)}
+                      />
+                      {isSelected && !drawing.locked && drawing.id !== "ZIGZAG-DRAFT" && drawing.points.map((point, index) => {
+                        const screenPoint = drawingPointToScreen(point);
+                        if (!screenPoint) return null;
+                        return (
+                          <circle
+                            key={`${drawing.id}-point-${index}`}
+                            className="drawing-handle"
+                            cx={screenPoint.x}
+                            cy={screenPoint.y}
+                            r={5}
+                            onMouseDown={(event) => startZigZagPointMove(event, drawing, index)}
+                            onContextMenu={(event) => openDrawingContextMenu(event, drawing)}
+                          />
+                        );
+                      })}
+                    </React.Fragment>
+                  );
+                }
+                if (drawing.tool === "rect") {
+                  const x = Math.min(start.x, end.x);
+                  const y = Math.min(start.y, end.y);
+                  const topLeft = { x, y };
+                  const topRight = { x: x + Math.abs(end.x - start.x), y };
+                  const bottomRight = { x: topRight.x, y: y + Math.abs(end.y - start.y) };
+                  const bottomLeft = { x, y: bottomRight.y };
+                  return (
+                    <React.Fragment key={drawing.id}>
+                      <rect
+                        className="drawing-hit-area rect-hit"
+                        onMouseDown={(event) => startDrawingMove(event, drawing)}
+                        onContextMenu={(event) => openDrawingContextMenu(event, drawing)}
+                        x={x}
+                        y={y}
+                        width={Math.abs(end.x - start.x)}
+                        height={Math.abs(end.y - start.y)}
+                      />
+                      <rect
+                        className={[
+                          drawingDraft?.id === drawing.id ? "drawing-shape draft" : "drawing-shape rect",
+                        isSelected ? "selected" : "",
+                        drawing.locked ? "locked" : ""
+                        ].join(" ")}
+                        style={{
+                          fill: `${drawing.fillColor}22`,
+                          stroke: drawing.strokeColor,
+                          strokeWidth: drawing.borderWidth
+                        }}
+                        onMouseDown={(event) => startDrawingMove(event, drawing)}
+                        onContextMenu={(event) => openDrawingContextMenu(event, drawing)}
+                        x={x}
+                        y={y}
+                        width={Math.abs(end.x - start.x)}
+                        height={Math.abs(end.y - start.y)}
+                      />
+                      {isSelected && !drawing.locked && (
+                        <>
+                          <circle className="drawing-handle" cx={topLeft.x} cy={topLeft.y} r={5} onMouseDown={(event) => startDrawingResize(event, drawing, "topLeft")} onContextMenu={(event) => openDrawingContextMenu(event, drawing)} />
+                          <circle className="drawing-handle" cx={topRight.x} cy={topRight.y} r={5} onMouseDown={(event) => startDrawingResize(event, drawing, "topRight")} onContextMenu={(event) => openDrawingContextMenu(event, drawing)} />
+                          <circle className="drawing-handle" cx={bottomRight.x} cy={bottomRight.y} r={5} onMouseDown={(event) => startDrawingResize(event, drawing, "bottomRight")} onContextMenu={(event) => openDrawingContextMenu(event, drawing)} />
+                          <circle className="drawing-handle" cx={bottomLeft.x} cy={bottomLeft.y} r={5} onMouseDown={(event) => startDrawingResize(event, drawing, "bottomLeft")} onContextMenu={(event) => openDrawingContextMenu(event, drawing)} />
+                        </>
+                      )}
+                    </React.Fragment>
+                  );
+                }
+                return (
+                  <React.Fragment key={drawing.id}>
+                    <line
+                      className="drawing-hit-area"
+                      onMouseDown={(event) => startDrawingMove(event, drawing)}
+                      onContextMenu={(event) => openDrawingContextMenu(event, drawing)}
+                      x1={start.x}
+                      y1={start.y}
+                      x2={end.x}
+                      y2={end.y}
+                    />
+                    <line
+                      className={[
+                        drawingDraft?.id === drawing.id ? "drawing-shape draft" : `drawing-shape ${drawing.tool}`,
+                      isSelected ? "selected" : "",
+                      drawing.locked ? "locked" : ""
+                      ].join(" ")}
+                      style={{ stroke: drawing.strokeColor, strokeWidth: drawing.lineWidth }}
+                      onMouseDown={(event) => startDrawingMove(event, drawing)}
+                      onContextMenu={(event) => openDrawingContextMenu(event, drawing)}
+                      x1={start.x}
+                      y1={start.y}
+                      x2={end.x}
+                      y2={end.y}
+                    />
+                    {isSelected && !drawing.locked && (
+                      <>
+                        <circle className="drawing-handle" cx={start.x} cy={start.y} r={5} onMouseDown={(event) => startDrawingResize(event, drawing, "start")} onContextMenu={(event) => openDrawingContextMenu(event, drawing)} />
+                        <circle className="drawing-handle" cx={end.x} cy={end.y} r={5} onMouseDown={(event) => startDrawingResize(event, drawing, "end")} onContextMenu={(event) => openDrawingContextMenu(event, drawing)} />
+                      </>
+                    )}
+                  </React.Fragment>
+                );
+              })}
+            </svg>
+            {lineControls.map(({ order, y, x, controlsX }) => (
+              <React.Fragment key={order.id}>
+                <div
+                  className={`entry-line-connector ${order.side}`}
+                  style={{
+                    top: y,
+                    left: Math.min(x, controlsX),
+                    width: Math.abs(controlsX - x)
+                  }}
+                />
               <div
-                className={`entry-line-controls ${chartTheme.orderControlsSide}`}
-                style={{ top: y }}
-                key={order.id}
+                className="entry-line-controls"
+                style={{ top: y, left: controlsX }}
               >
                 {order.takeProfit === undefined && (
                   <button
@@ -1149,15 +2009,81 @@ function TradingApp() {
                 <span className="line-order-size">{order.quantity}</span>
                 <span className="line-order-label">{order.side === "buy" ? "Buy Limit" : "Sell Limit"}</span>
               </div>
+              </React.Fragment>
             ))}
-            {orderLineLabels.map(({ order, field, y, price }) => (
-              <div className={`order-line-label ${field}`} style={{ top: y }} key={`${order.id}-${field}`}>
-                <span>
-                  {field === "entry" ? "ENTRY" : field === "takeProfit" ? "TP" : "SL"}
-                </span>
-                <strong>{formatPrice(price)}</strong>
+            {orderLineLabels.map(({ order, field, y, price, x }) => (
+              <React.Fragment key={`${order.id}-${field}`}>
+                {x === undefined && <div className={`order-label-connector ${field}`} style={{ top: y }} />}
+                <div className={`order-line-label ${field}`} style={{ top: y, left: x, right: x === undefined ? undefined : "auto" }}>
+                  <span>
+                    {field === "entry" ? "ENTRY" : field === "takeProfit" ? "TP" : "SL"}
+                  </span>
+                  <strong>{formatPrice(price)}</strong>
+                </div>
+              </React.Fragment>
+            ))}
+            {drawingMenu && menuDrawing && (
+              <div
+                className="drawing-context-menu"
+                style={{ left: drawingMenu.x, top: drawingMenu.y }}
+                onClick={(event) => event.stopPropagation()}
+              >
+                <button onClick={() => toggleDrawingLock(drawingMenu.id)}>
+                  {menuDrawing.locked ? <LockOpen size={15} /> : <Lock size={15} />}
+                  {menuDrawing.locked ? "Entsperren" : "Fixieren"}
+                </button>
+                <label className="drawing-color-control">
+                  <span>{menuDrawing.tool === "rect" ? "Rahmen" : "Farbe"}</span>
+                  <input
+                    type="color"
+                    value={menuDrawing.strokeColor}
+                    onChange={(event) => updateDrawingColor(drawingMenu.id, "strokeColor", event.target.value)}
+                  />
+                </label>
+                {menuDrawing.tool === "rect" && (
+                  <label className="drawing-color-control">
+                    <span>Körper</span>
+                    <input
+                      type="color"
+                      value={menuDrawing.fillColor}
+                      onChange={(event) => updateDrawingColor(drawingMenu.id, "fillColor", event.target.value)}
+                    />
+                  </label>
+                )}
+                {menuDrawing.tool !== "rect" && (
+                  <label className="drawing-range-control">
+                    <span>Linienstärke</span>
+                    <input
+                      type="range"
+                      min="1"
+                      max="8"
+                      step="0.2"
+                      value={menuDrawing.lineWidth}
+                      onChange={(event) => updateDrawingNumber(drawingMenu.id, "lineWidth", Number(event.target.value))}
+                    />
+                    <strong>{menuDrawing.lineWidth.toFixed(1)}</strong>
+                  </label>
+                )}
+                {menuDrawing.tool === "rect" && (
+                  <label className="drawing-range-control">
+                    <span>Rahmenstärke</span>
+                    <input
+                      type="range"
+                      min="1"
+                      max="8"
+                      step="0.2"
+                      value={menuDrawing.borderWidth}
+                      onChange={(event) => updateDrawingNumber(drawingMenu.id, "borderWidth", Number(event.target.value))}
+                    />
+                    <strong>{menuDrawing.borderWidth.toFixed(1)}</strong>
+                  </label>
+                )}
+                <button onClick={() => deleteDrawing(drawingMenu.id)} disabled={menuDrawing.locked}>
+                  <Trash2 size={15} />
+                  Löschen
+                </button>
               </div>
-            ))}
+            )}
             {showChartOptions && (
               <div className="chart-style-panel">
                 <div className="style-panel-title">
@@ -1169,6 +2095,7 @@ function TradingApp() {
                   <button className={settingsTab === "colors" ? "tab active" : "tab"} onClick={() => setSettingsTab("colors")}>{t.colors}</button>
                   <button className={settingsTab === "chart" ? "tab active" : "tab"} onClick={() => setSettingsTab("chart")}>{t.chart}</button>
                   <button className={settingsTab === "orders" ? "tab active" : "tab"} onClick={() => setSettingsTab("orders")}>{t.orders}</button>
+                  <button className={settingsTab === "drawings" ? "tab active" : "tab"} onClick={() => setSettingsTab("drawings")}>{t.drawings}</button>
                   <button className={settingsTab === "language" ? "tab active" : "tab"} onClick={() => setSettingsTab("language")}>{t.language}</button>
                 </div>
 
@@ -1216,6 +2143,24 @@ function TradingApp() {
                       <button className={chartTheme.orderControlsSide === "right" ? "switch active" : "switch"} onClick={() => setChartTheme((current) => ({ ...current, orderControlsSide: "right" }))}>{t.orderControlsRight}</button>
                       <button className={chartTheme.orderControlsSide === "left" ? "switch active" : "switch"} onClick={() => setChartTheme((current) => ({ ...current, orderControlsSide: "left" }))}>{t.orderControlsLeft}</button>
                     </div>
+                  </div>
+                )}
+
+                {settingsTab === "drawings" && (
+                  <div className="style-section">
+                    <div className="style-section-title">{t.drawingDisplay}</div>
+                    <label className="range-setting">
+                      <span>{t.drawingSize}</span>
+                      <input
+                        type="range"
+                        min="1"
+                        max="5"
+                        step="0.2"
+                        value={chartTheme.drawingSize}
+                        onChange={(event) => setChartTheme((current) => ({ ...current, drawingSize: Number(event.target.value) }))}
+                      />
+                      <strong>{chartTheme.drawingSize.toFixed(1)}</strong>
+                    </label>
                   </div>
                 )}
 
