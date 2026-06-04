@@ -1,0 +1,26 @@
+{
+  "name": "mcm-tradingview",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 8788",
+    "build": "tsc && vite build",
+    "preview": "vite preview --host 127.0.0.1 --port 8788"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "latest",
+    "lightweight-charts": "latest",
+    "lucide-react": "latest",
+    "papaparse": "latest",
+    "vite": "latest",
+    "react": "latest",
+    "react-dom": "latest"
+  },
+  "devDependencies": {
+    "@types/papaparse": "latest",
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "typescript": "latest"
+  }
+}
