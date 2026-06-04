@@ -837,11 +837,14 @@ function TradingApp() {
 
   useEffect(() => {
     const candleSeries = candleSeriesRef.current;
+    const chart = chartRef.current;
     const candleSetChanged = previousCandleSetRef.current !== allCandles;
     const canAppendSingleCandle = !candleSetChanged && visibleCount === previousVisibleCountRef.current + 1;
+    const keepManualRange = !autoFocusChart && !shouldFitContentRef.current;
+    const visibleRange = keepManualRange ? chart?.timeScale().getVisibleLogicalRange() : null;
 
     if (candleSeries) {
-      if (canAppendSingleCandle) {
+      if (canAppendSingleCandle && autoFocusChart) {
         const nextCandle = allCandles[visibleCount - 1];
         if (nextCandle) candleSeries.update(nextCandle);
       } else if (candleSetChanged || visibleCount !== previousVisibleCountRef.current) {
@@ -849,6 +852,13 @@ function TradingApp() {
       }
       previousCandleSetRef.current = allCandles;
       previousVisibleCountRef.current = visibleCount;
+    }
+
+    if (visibleRange && keepManualRange) {
+      chart?.timeScale().setVisibleLogicalRange(visibleRange);
+      window.requestAnimationFrame(() => {
+        chart?.timeScale().setVisibleLogicalRange(visibleRange);
+      });
     }
 
     if (autoFocusChart || shouldFitContentRef.current) {
