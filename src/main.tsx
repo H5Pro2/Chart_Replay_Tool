@@ -575,8 +575,8 @@ function TradingApp() {
           color,
           lineWidth: 2,
           lineStyle: style,
-          priceLineVisible: true,
-          title
+          priceLineVisible: false,
+          title: ""
         });
         series.setData([
           { time: start, value: price },
