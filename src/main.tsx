@@ -370,6 +370,7 @@ function TradingApp() {
   const candleSeriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
   const lineSeriesRef = useRef<ISeriesApi<"Line">[]>([]);
   const shouldFitContentRef = useRef(true);
+  const shouldFitPriceRef = useRef(true);
   const ordersRef = useRef<TradeOrder[]>([]);
   const draggedLineRef = useRef<DraggedOrderLine | null>(null);
   const draggedChipRef = useRef<{ orderId: string; field: "takeProfit" | "stopLoss" } | null>(null);
@@ -517,6 +518,7 @@ function TradingApp() {
         setAllCandles(candles);
         setVisibleCount(Math.min(60, candles.length));
         shouldFitContentRef.current = true;
+        shouldFitPriceRef.current = true;
         setOrders([]);
         setIsPlaying(false);
         setMessage(t.chartCsvLoaded(candles.length));
@@ -541,7 +543,15 @@ function TradingApp() {
     candleSeriesRef.current?.setData(visibleCandles);
     if (autoFocusChart || shouldFitContentRef.current) {
       chartRef.current?.timeScale().fitContent();
-      chartRef.current?.priceScale("right").setAutoScale(autoScalePrice);
+      if (shouldFitPriceRef.current) {
+        chartRef.current?.priceScale("right").setAutoScale(true);
+        window.requestAnimationFrame(() => {
+          chartRef.current?.priceScale("right").setAutoScale(autoScalePrice);
+        });
+        shouldFitPriceRef.current = false;
+      } else {
+        chartRef.current?.priceScale("right").setAutoScale(autoScalePrice);
+      }
       shouldFitContentRef.current = false;
     }
   }, [autoFocusChart, autoScalePrice, visibleCandles]);
@@ -994,6 +1004,7 @@ function TradingApp() {
         setAllCandles(candles);
         setVisibleCount(Math.min(60, candles.length));
         shouldFitContentRef.current = true;
+        shouldFitPriceRef.current = true;
         setOrders([]);
         setIsPlaying(false);
         setMessage(t.candlesLoaded(candles.length));
@@ -1005,6 +1016,7 @@ function TradingApp() {
   const resetReplay = () => {
     setVisibleCount(Math.min(4, allCandles.length));
     shouldFitContentRef.current = true;
+    shouldFitPriceRef.current = true;
     setIsPlaying(false);
     setOrders([]);
     setMessage(t.replayReset);
