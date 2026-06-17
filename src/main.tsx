@@ -197,8 +197,27 @@ const chartTimeToNumber = (time: Time | undefined) => {
   return Date.UTC(time.year, time.month - 1, time.day) / 1000;
 };
 
+const candleTimeStep = (candles: Candle[]) => {
+  if (candles.length < 2) return 60;
+  for (let index = candles.length - 2; index >= 0; index -= 1) {
+    const current = chartTimeToNumber(candles[index]?.time);
+    const next = chartTimeToNumber(candles[index + 1]?.time);
+    if (current !== undefined && next !== undefined && next > current) return next - current;
+  }
+  return 60;
+};
+
 const logicalToChartTime = (candles: Candle[], logical: number): Time | undefined => {
   if (!candles.length || !Number.isFinite(logical)) return undefined;
+  const step = candleTimeStep(candles);
+  if (logical <= 0) {
+    const firstTime = chartTimeToNumber(candles[0]?.time);
+    return firstTime === undefined ? candles[0]?.time : Math.round(firstTime + logical * step) as Time;
+  }
+  if (logical >= candles.length - 1) {
+    const lastTime = chartTimeToNumber(candles.at(-1)?.time);
+    return lastTime === undefined ? candles.at(-1)?.time : Math.round(lastTime + (logical - (candles.length - 1)) * step) as Time;
+  }
   const lowerIndex = Math.max(0, Math.min(candles.length - 1, Math.floor(logical)));
   const upperIndex = Math.max(0, Math.min(candles.length - 1, Math.ceil(logical)));
   const lowerTime = chartTimeToNumber(candles[lowerIndex]?.time);
@@ -226,8 +245,9 @@ const chartTimeToLogical = (candles: Candle[], time: Time | undefined) => {
   }
   const first = times[0];
   const last = times.at(-1);
-  if (first !== undefined && target < first) return 0;
-  if (last !== undefined && target > last) return candles.length - 1;
+  const step = candleTimeStep(candles);
+  if (first !== undefined && target < first) return (target - first) / step;
+  if (last !== undefined && target > last) return candles.length - 1 + (target - last) / step;
   return undefined;
 };
 
