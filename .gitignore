@@ -2,6 +2,8 @@ node_modules/
 dist/
 .env
 .env.*
+chart_data/phemex_chart/*.csv
+!chart_data/phemex_chart/.gitkeep
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*

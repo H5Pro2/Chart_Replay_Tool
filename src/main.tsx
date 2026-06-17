@@ -48,6 +48,10 @@ type OrderStatus = "pending" | "active" | "closed" | "canceled";
 
 type TradeOrder = {
   id: string;
+  phemexOrderId?: string;
+  phemexClOrdId?: string;
+  phemexTakeProfitOrderId?: string;
+  phemexStopLossOrderId?: string;
   side: Side;
   quantity: number;
   entry: number;
@@ -61,6 +65,7 @@ type TradeOrder = {
 };
 
 type CsvRow = Record<string, string | number | undefined>;
+type PhemexOpenOrderRow = Record<string, string | number | boolean | undefined>;
 
 const defaultCandles: Candle[] = [
   { time: "2026-01-01" as Time, open: 102, high: 106, low: 100, close: 104, volume: 1200 },
@@ -143,6 +148,45 @@ const parseCsvTextCandles = (text: string) => {
   return rowsToCandles(result.data);
 };
 
+const upsertLiveCandle = (candles: Candle[], price: number, timestampMs: number, resolutionSeconds: number) => {
+  const bucketTime = Math.floor(timestampMs / 1000 / resolutionSeconds) * resolutionSeconds;
+  const last = candles.at(-1);
+  if (last && Number(last.time) === bucketTime) {
+    return [
+      ...candles.slice(0, -1),
+      {
+        ...last,
+        high: Math.max(last.high, price),
+        low: Math.min(last.low, price),
+        close: price
+      }
+    ];
+  }
+  return [
+    ...candles,
+    {
+      time: bucketTime as Time,
+      open: last?.close ?? price,
+      high: Math.max(last?.close ?? price, price),
+      low: Math.min(last?.close ?? price, price),
+      close: price,
+      volume: 0
+    }
+  ];
+};
+
+const timeframeFromResolution = (resolution: string | number) => {
+  const seconds = Number(resolution || 300);
+  if (seconds % 86400 === 0) return `${seconds / 86400}d`;
+  if (seconds % 3600 === 0) return `${seconds / 3600}h`;
+  return `${seconds / 60}m`;
+};
+
+const pollMsFromSettings = (settings: Pick<PhemexSettings, "pollSeconds">) => {
+  const seconds = Number(settings.pollSeconds || 10);
+  return Math.max(1, Number.isFinite(seconds) ? seconds : 10) * 1000;
+};
+
 const formatPrice = (value?: number) => (value === undefined ? "-" : value.toFixed(2));
 
 const clampProtectionPrice = (order: TradeOrder, field: "takeProfit" | "stopLoss", price: number) => {
@@ -164,6 +208,8 @@ const isProtectionDockedAtEntry = (order: TradeOrder, price: number) => {
   return Math.abs(price - order.entry) <= Math.max(order.entry * 0.001, 0.01);
 };
 
+const delay = (ms: number) => new Promise((resolveDelay) => window.setTimeout(resolveDelay, ms));
+
 const normalizeProtectionAfterEntryMove = (order: TradeOrder, nextEntry: number): TradeOrder => {
   const tpValid =
     order.takeProfit === undefined ||
@@ -180,6 +226,43 @@ const normalizeProtectionAfterEntryMove = (order: TradeOrder, nextEntry: number)
   };
 };
 
+const phemexOrderToTradeOrder = (row: PhemexOpenOrderRow, fallbackTime: Time): TradeOrder | undefined => {
+  const entry = numberFrom(row.priceRp ?? row.price);
+  const quantity = numberFrom(row.orderQtyRq ?? row.orderQty ?? row.qty);
+  const side = String(row.side || "").toLowerCase() === "sell" ? "sell" : "buy";
+  const phemexOrderId = String(row.orderID || "").trim();
+  const phemexClOrdId = String(row.clOrdID || "").trim();
+  const id = phemexOrderId || phemexClOrdId;
+  if (!id || entry === undefined || quantity === undefined) return undefined;
+  const importedTakeProfit = numberFrom(row.takeProfitRp ?? row.tpPxRp);
+  const importedStopLoss = numberFrom(row.stopLossRp ?? row.slPxRp);
+  const takeProfit = importedTakeProfit !== undefined && importedTakeProfit > 0 ? importedTakeProfit : undefined;
+  const stopLoss = importedStopLoss !== undefined && importedStopLoss > 0 ? importedStopLoss : undefined;
+  return {
+    id,
+    phemexOrderId: phemexOrderId || undefined,
+    phemexClOrdId: phemexClOrdId || undefined,
+    side,
+    quantity,
+    entry,
+    takeProfit,
+    stopLoss,
+    status: "pending",
+    openedAt: fallbackTime
+  };
+};
+
+const phemexPositionSize = (row: Record<string, unknown>) => {
+  const size =
+    numberFrom(row.sizeRq) ??
+    numberFrom(row.size) ??
+    numberFrom(row.posSizeRq) ??
+    numberFrom(row.positionSizeRq) ??
+    numberFrom(row.positionQtyRq) ??
+    numberFrom(row.qty);
+  return size ?? 0;
+};
+
 type ChartMenu = {
   x: number;
   y: number;
@@ -191,6 +274,12 @@ type DraggableOrderField = "entry" | "takeProfit" | "stopLoss";
 type DraggedOrderLine = {
   orderId: string;
   field: DraggableOrderField;
+};
+
+type PendingOrderMove = {
+  target: DraggedOrderLine | { orderId: string; field: "takeProfit" | "stopLoss" };
+  price: number;
+  fromChip: boolean;
 };
 
 type DrawingTool = "cursor" | "line" | "horizontal" | "ray" | "rect" | "zigzag";
@@ -227,6 +316,26 @@ type DrawingMenu = {
   y: number;
 };
 
+type ProtectionConfirm = {
+  orderId: string;
+  x: number;
+  y: number;
+  originalEntry: number;
+  originalTakeProfit?: number;
+  originalStopLoss?: number;
+};
+
+type ExchangeDebugPopup = {
+  title: string;
+  message: string;
+  details?: string;
+};
+
+type OrderbookConfirm = {
+  title: string;
+  message: string;
+};
+
 type OrderLineField = "entry" | "takeProfit" | "stopLoss";
 
 type ChartTheme = {
@@ -249,7 +358,22 @@ type ChartTheme = {
 };
 
 type Language = "de" | "en";
-type SettingsTab = "colors" | "chart" | "orders" | "drawings" | "language";
+type SettingsTab = "colors" | "chart" | "orders" | "drawings" | "phemex" | "language";
+
+type PhemexSettings = {
+  apiKey: string;
+  apiSecret: string;
+  testnet: boolean;
+  symbol: string;
+  pollSeconds: string;
+  resolution: string;
+  limit: string;
+  mode: "replay" | "live";
+  liveOrdersEnabled: boolean;
+  allowMainnetOrders: boolean;
+  marginMode: "cross" | "isolated";
+  leverage: string;
+};
 
 const defaultTheme: ChartTheme = {
   upColor: "#2fbf71",
@@ -272,9 +396,61 @@ const defaultTheme: ChartTheme = {
 
 const drawingsStorageKey = "chart-replay-tool-drawings";
 const pendingOrdersStorageKey = "chart-replay-tool-pending-orders";
+const chartThemeStorageKey = "chart-replay-tool-chart-theme";
+const appOptionsStorageKey = "chart-replay-tool-options";
+const exchangeOptionsStorageKey = "chart-replay-tool-exchange-options";
+const coinFavoritesStorageKey = "chart-replay-tool-coin-favorites";
 const defaultDrawingStrokeColor = "#7db8ff";
 const defaultDrawingFillColor = "#7db8ff";
 const rightPriceScaleOffset = 64;
+const phemexOrderIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+const loadStoredChartTheme = (): ChartTheme => {
+  try {
+    const raw = window.localStorage.getItem(chartThemeStorageKey);
+    if (!raw) return defaultTheme;
+    return { ...defaultTheme, ...JSON.parse(raw) };
+  } catch {
+    return defaultTheme;
+  }
+};
+
+const loadStoredAppOptions = () => {
+  try {
+    const raw = window.localStorage.getItem(appOptionsStorageKey);
+    const parsed = raw ? JSON.parse(raw) : {};
+    return {
+      language: parsed.language === "en" ? "en" as Language : "de" as Language,
+      autoScalePrice: Boolean(parsed.autoScalePrice),
+      autoFocusChart: Boolean(parsed.autoFocusChart)
+    };
+  } catch {
+    return {
+      language: "de" as Language,
+      autoScalePrice: false,
+      autoFocusChart: false
+    };
+  }
+};
+
+const loadStoredExchangeOptions = () => {
+  try {
+    const raw = window.localStorage.getItem(exchangeOptionsStorageKey);
+    return raw ? JSON.parse(raw) as Partial<PhemexSettings> : {};
+  } catch {
+    return {};
+  }
+};
+
+const loadStoredCoinFavorites = () => {
+  try {
+    const raw = window.localStorage.getItem(coinFavoritesStorageKey);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed.filter((value) => typeof value === "string") : [];
+  } catch {
+    return [];
+  }
+};
 
 const loadStoredDrawings = (): DrawingShape[] => {
   try {
@@ -321,14 +497,20 @@ const loadStoredPendingOrders = (): TradeOrder[] => {
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
-    return parsed.filter((item) =>
+    const localPendingOrders = parsed.filter((item) =>
       item &&
       item.status === "pending" &&
       (item.side === "buy" || item.side === "sell") &&
       typeof item.id === "string" &&
+      !item.phemexOrderId &&
+      !item.phemexClOrdId &&
       Number.isFinite(item.quantity) &&
       Number.isFinite(item.entry)
     );
+    if (localPendingOrders.length !== parsed.length) {
+      window.localStorage.setItem(pendingOrdersStorageKey, JSON.stringify(localPendingOrders));
+    }
+    return localPendingOrders;
   } catch {
     return [];
   }
@@ -342,6 +524,11 @@ const translations = {
     last: "Last",
     high: "High",
     low: "Low",
+    futuresBalance: "Futures USDT",
+    liveModeLabel: "Live Mode",
+    accountBalance: "Account Balance",
+    timeCounter: "Time Counter",
+    chartLoaded: "Chart",
     autoScale: "Auto-Skala",
     autoFocus: "Auto-Fokus",
     options: "Optionen",
@@ -360,12 +547,76 @@ const translations = {
     chart: "Chart",
     orders: "Orders",
     drawings: "Zeichnungen",
+    exchange: "Exchange",
     candlesSection: "Kerzen",
     chartArea: "Chart-Fläche",
     behavior: "Verhalten",
     orderDisplay: "Order-Anzeige",
     drawingDisplay: "Zeichenwerkzeuge",
     drawingSize: "Größe",
+    phemexConnection: "Phemex-Anbindung",
+    connectionSection: "Verbindung",
+    dataModeSection: "Datenmodus",
+    apiKey: "API Key",
+    apiSecret: "API Secret",
+    testnet: "Testnet",
+    mainnet: "Mainnet",
+    allowMainnetOrders: "Mainnet-Orders erlauben",
+    allowMainnetOrdersHint: "Erlaubt echte Live-Orders auf Mainnet.",
+    symbol: "Symbol",
+    timeframe: "Timeframe",
+    candleLimit: "Kerzenanzahl",
+    exchangeMode: "Modus",
+    replayMode: "Replay",
+    liveMode: "Live",
+    pollSeconds: "Preisabruf in Sekunden",
+    liveStatus: "Live-Status",
+    liveInactive: "Live aus",
+    liveRunning: "Live läuft",
+    liveWaiting: "Wartet",
+    exchangeLoading: "Lädt",
+    exchangeError: "Fehler",
+    lastFetch: "Letzter Abruf",
+    nextFetch: "Nächster Abruf",
+    saveApiSettings: "API speichern",
+    applySettings: "Übernehmen",
+    testConnection: "Verbindung testen",
+    loadReplayData: "Replay-Daten laden",
+    startLive: "Live starten",
+    stopLive: "Live stoppen",
+    syncExchange: "Abgleich",
+    syncExchangeDone: "Phemex-Abgleich abgeschlossen.",
+    syncExchangeFailed: "Phemex-Abgleich fehlgeschlagen.",
+    liveOrders: "Phemex Live-Order",
+    marginMode: "Margin-Modus",
+    cross: "Cross",
+    isolated: "Isoliert",
+    leverage: "Hebel",
+    limitPrice: "Limitpreis",
+    lastPrice: "Letzter",
+    size: "Größe",
+    available: "Available",
+    cost: "Kosten",
+    estimatedLiquidation: "Geschätz. Liq. Preis",
+    openLong: "Long",
+    openShort: "Short",
+    useLastPrice: "Letzten Preis übernehmen",
+    apiSaved: "Phemex API-Einstellungen in .env.local gespeichert.",
+    settingsApplied: (symbol: string, timeframe: string) => `Exchange-Einstellungen übernommen: ${symbol} ${timeframe}.`,
+    apiSaveFailed: "Phemex API-Einstellungen konnten nicht gespeichert werden.",
+    connectionOk: (symbol: string, price: string) => `Phemex-Verbindung ok: ${symbol} bei ${price}.`,
+    connectionFailed: "Phemex-Verbindung konnte nicht geprüft werden.",
+    phemexChartLoaded: (count: number, path: string) => `${count} Phemex-Kerzen geladen und in ${path} gespeichert.`,
+    phemexChartFailed: "Phemex-Chart konnte nicht geladen werden.",
+    phemexOrderPlaced: (id: string) => `Phemex Live-Order gesendet: ${id}.`,
+    phemexOrderFailed: (reason?: string) => `Phemex Live-Order konnte nicht gesendet werden${reason ? `: ${reason}` : "."}`,
+    phemexLiveOrdersDisabled: "Phemex Live-Order ist aus. Aktiviere den Schalter, bevor du eine echte Order sendest.",
+    phemexOrdersSynced: (count: number) => `${count} offene Phemex-Orders übernommen.`,
+    phemexOrderAmended: (id: string) => `Phemex Order ${id} aktualisiert.`,
+    phemexOrderAmendFailed: (reason?: string) => `Phemex Order konnte nicht aktualisiert werden${reason ? `: ${reason}` : "."}`,
+    phemexOrderCanceled: (id: string) => `Phemex Order ${id} storniert.`,
+    phemexOrderCancelFailed: (reason?: string) => `Phemex Order konnte nicht storniert werden${reason ? `: ${reason}` : "."}`,
+    livePriceUpdated: (price: string) => `Live-Preis aktualisiert: ${price}`,
     language: "Sprache",
     german: "Deutsch",
     english: "English",
@@ -389,8 +640,6 @@ const translations = {
     useEntry: "Als Entry übernehmen",
     useTp: "Als TP übernehmen",
     useSl: "Als SL übernehmen",
-    buyHere: "Buy Order hier",
-    sellHere: "Sell Order hier",
     play: "Play",
     pause: "Pause",
     step: "Step",
@@ -409,6 +658,7 @@ const translations = {
     tradesHistory: "Trades / Historie",
     action: "Aktion",
     cancel: "Cancel",
+    close: "Schließen",
     saveProtection: "TP/SL speichern",
     demoLoaded: "Demo-Daten geladen. CSV kann oben importiert werden.",
     csvInvalid: "CSV braucht Spalten wie timestamp_ms/time/date, open, high, low, close.",
@@ -433,6 +683,11 @@ const translations = {
     last: "Last",
     high: "High",
     low: "Low",
+    futuresBalance: "Futures USDT",
+    liveModeLabel: "Live Mode",
+    accountBalance: "Account Balance",
+    timeCounter: "Time Counter",
+    chartLoaded: "Chart",
     autoScale: "Auto Scale",
     autoFocus: "Auto Focus",
     options: "Options",
@@ -451,12 +706,76 @@ const translations = {
     chart: "Chart",
     orders: "Orders",
     drawings: "Drawings",
+    exchange: "Exchange",
     candlesSection: "Candles",
     chartArea: "Chart Area",
     behavior: "Behavior",
     orderDisplay: "Order Display",
     drawingDisplay: "Drawing Tools",
     drawingSize: "Size",
+    phemexConnection: "Phemex Connection",
+    connectionSection: "Connection",
+    dataModeSection: "Data Mode",
+    apiKey: "API Key",
+    apiSecret: "API Secret",
+    testnet: "Testnet",
+    mainnet: "Mainnet",
+    allowMainnetOrders: "Allow Mainnet Orders",
+    allowMainnetOrdersHint: "Allows real live orders on Mainnet.",
+    symbol: "Symbol",
+    timeframe: "Timeframe",
+    candleLimit: "Candle Limit",
+    exchangeMode: "Mode",
+    replayMode: "Replay",
+    liveMode: "Live",
+    pollSeconds: "Price Poll Seconds",
+    liveStatus: "Live Status",
+    liveInactive: "Live off",
+    liveRunning: "Live running",
+    liveWaiting: "Waiting",
+    exchangeLoading: "Loading",
+    exchangeError: "Error",
+    lastFetch: "Last Fetch",
+    nextFetch: "Next Fetch",
+    saveApiSettings: "Save API",
+    applySettings: "Apply",
+    testConnection: "Test Connection",
+    loadReplayData: "Load Replay Data",
+    startLive: "Start Live",
+    stopLive: "Stop Live",
+    syncExchange: "Sync",
+    syncExchangeDone: "Phemex sync complete.",
+    syncExchangeFailed: "Phemex sync failed.",
+    liveOrders: "Phemex Live Order",
+    marginMode: "Margin Mode",
+    cross: "Cross",
+    isolated: "Isolated",
+    leverage: "Leverage",
+    limitPrice: "Limit Price",
+    lastPrice: "Last",
+    size: "Size",
+    available: "Available",
+    cost: "Cost",
+    estimatedLiquidation: "Estimated Liq. Price",
+    openLong: "Long",
+    openShort: "Short",
+    useLastPrice: "Use last price",
+    apiSaved: "Phemex API settings saved to .env.local.",
+    settingsApplied: (symbol: string, timeframe: string) => `Exchange settings applied: ${symbol} ${timeframe}.`,
+    apiSaveFailed: "Phemex API settings could not be saved.",
+    connectionOk: (symbol: string, price: string) => `Phemex connection ok: ${symbol} at ${price}.`,
+    connectionFailed: "Phemex connection could not be checked.",
+    phemexChartLoaded: (count: number, path: string) => `${count} Phemex candles loaded and saved to ${path}.`,
+    phemexChartFailed: "Phemex chart could not be loaded.",
+    phemexOrderPlaced: (id: string) => `Phemex live order sent: ${id}.`,
+    phemexOrderFailed: (reason?: string) => `Phemex live order could not be sent${reason ? `: ${reason}` : "."}`,
+    phemexLiveOrdersDisabled: "Phemex live order is off. Enable the switch before sending a real order.",
+    phemexOrdersSynced: (count: number) => `${count} open Phemex orders imported.`,
+    phemexOrderAmended: (id: string) => `Phemex order ${id} updated.`,
+    phemexOrderAmendFailed: (reason?: string) => `Phemex order could not be updated${reason ? `: ${reason}` : "."}`,
+    phemexOrderCanceled: (id: string) => `Phemex order ${id} canceled.`,
+    phemexOrderCancelFailed: (reason?: string) => `Phemex order could not be canceled${reason ? `: ${reason}` : "."}`,
+    livePriceUpdated: (price: string) => `Live price updated: ${price}`,
     language: "Language",
     german: "Deutsch",
     english: "English",
@@ -480,8 +799,6 @@ const translations = {
     useEntry: "Use as Entry",
     useTp: "Use as TP",
     useSl: "Use as SL",
-    buyHere: "Buy Order Here",
-    sellHere: "Sell Order Here",
     play: "Play",
     pause: "Pause",
     step: "Step",
@@ -500,6 +817,7 @@ const translations = {
     tradesHistory: "Trades / History",
     action: "Action",
     cancel: "Cancel",
+    close: "Close",
     saveProtection: "Save TP/SL",
     demoLoaded: "Demo data loaded. CSV can be imported above.",
     csvInvalid: "CSV needs columns like timestamp_ms/time/date, open, high, low, close.",
@@ -520,20 +838,42 @@ const translations = {
 };
 
 function TradingApp() {
+  const storedAppOptions = useMemo(() => loadStoredAppOptions(), []);
+  const storedExchangeOptions = useMemo(() => loadStoredExchangeOptions(), []);
   const chartElement = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const candleSeriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
   const lineSeriesRef = useRef<Map<string, ISeriesApi<"Line">>>(new Map());
   const shouldFitContentRef = useRef(true);
   const shouldFitPriceRef = useRef(true);
+  const shouldJumpToLatestRef = useRef(false);
   const previousVisibleCountRef = useRef(0);
   const previousCandleSetRef = useRef<Candle[] | null>(null);
   const overlayRefreshFrameRef = useRef(0);
   const overlayRefreshFollowUpFrameRef = useRef(0);
+  const storageWriteTimersRef = useRef<Record<string, number>>({});
+  const drawingDragFrameRef = useRef(0);
+  const orderDragFrameRef = useRef(0);
+  const pendingDrawingMoveRef = useRef<{
+    drag: DraggedDrawing;
+    point: DrawingPoint;
+    logicalDelta: number;
+    priceDelta: number;
+  } | null>(null);
+  const pendingOrderMoveRef = useRef<PendingOrderMove | null>(null);
   const hasChartOverlaysRef = useRef(false);
   const ordersRef = useRef<TradeOrder[]>([]);
+  const canceledPhemexOrderKeysRef = useRef<Set<string>>(new Set());
+  const openPhemexOrderKeysRef = useRef<Set<string>>(new Set());
+  const lastPhemexOrderStatusSyncAtRef = useRef(0);
+  const lastLivePriceErrorPopupAtRef = useRef(0);
+  const livePriceBackoffUntilRef = useRef(0);
+  const refreshLivePhemexPriceRef = useRef<(settingsOverride?: PhemexSettings) => Promise<void>>(async () => undefined);
   const draggedLineRef = useRef<DraggedOrderLine | null>(null);
   const draggedChipRef = useRef<{ orderId: string; field: "takeProfit" | "stopLoss" } | null>(null);
+  const draggedProtectionOriginalRef = useRef<{ orderId: string; entry: number; takeProfit?: number; stopLoss?: number } | null>(null);
+  const blockedProtectionDragRef = useRef(false);
+  const protectionEditOriginalsRef = useRef<Record<string, { entry: number; takeProfit?: number; stopLoss?: number }>>({});
   const drawingDraftRef = useRef<DrawingShape | null>(null);
   const draggedDrawingRef = useRef<DraggedDrawing | null>(null);
   const chipDragFinishedRef = useRef(false);
@@ -548,16 +888,17 @@ function TradingApp() {
   const [speedMs, setSpeedMs] = useState(800);
   const [orders, setOrders] = useState<TradeOrder[]>(() => loadStoredPendingOrders());
   const [side, setSide] = useState<Side>("buy");
-  const [quantity, setQuantity] = useState(1);
+  const [quantity, setQuantity] = useState(0);
   const [entry, setEntry] = useState("");
   const [takeProfit, setTakeProfit] = useState("");
   const [stopLoss, setStopLoss] = useState("");
+  const [liveCapitalPercent, setLiveCapitalPercent] = useState(0);
   const [chartMenu, setChartMenu] = useState<ChartMenu | null>(null);
-  const [autoScalePrice, setAutoScalePrice] = useState(false);
-  const [autoFocusChart, setAutoFocusChart] = useState(false);
+  const [autoScalePrice, setAutoScalePrice] = useState(storedAppOptions.autoScalePrice);
+  const [autoFocusChart, setAutoFocusChart] = useState(storedAppOptions.autoFocusChart);
   const [showChartOptions, setShowChartOptions] = useState(false);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>("colors");
-  const [chartTheme, setChartTheme] = useState<ChartTheme>(defaultTheme);
+  const [chartTheme, setChartTheme] = useState<ChartTheme>(() => loadStoredChartTheme());
   const [drawingTool, setDrawingTool] = useState<DrawingTool>("cursor");
   const [drawings, setDrawings] = useState<DrawingShape[]>(() => loadStoredDrawings());
   const [drawingDraft, setDrawingDraft] = useState<DrawingShape | null>(null);
@@ -565,10 +906,66 @@ function TradingApp() {
   const [selectedDrawingId, setSelectedDrawingId] = useState<string | null>(null);
   const [drawingMenu, setDrawingMenu] = useState<DrawingMenu | null>(null);
   const [chartViewVersion, setChartViewVersion] = useState(0);
-  const [language, setLanguage] = useState<Language>("de");
+  const [language, setLanguage] = useState<Language>(storedAppOptions.language);
+  const [liveLastPrice, setLiveLastPrice] = useState<number | null>(null);
+  const [liveLastFetchAt, setLiveLastFetchAt] = useState<number | null>(null);
+  const [liveNextFetchAt, setLiveNextFetchAt] = useState<number | null>(null);
+  const [liveCountdownSeconds, setLiveCountdownSeconds] = useState<number | null>(null);
+  const [futuresBalance, setFuturesBalance] = useState<number | null>(null);
+  const [isLiveRunning, setIsLiveRunning] = useState(false);
+  const [liveSettingsVersion, setLiveSettingsVersion] = useState(0);
+  const [exchangeRequestState, setExchangeRequestState] = useState<"idle" | "loading" | "error">("idle");
+  const [coinOptions, setCoinOptions] = useState<string[]>(["BTCUSDT", "ETHUSDT", "SOLUSDT"]);
+  const [coinFavorites, setCoinFavorites] = useState<string[]>(() => loadStoredCoinFavorites());
+  const [isCoinDropdownOpen, setIsCoinDropdownOpen] = useState(false);
+  const [isMarketFavoritesOpen, setIsMarketFavoritesOpen] = useState(false);
+  const [pendingProtectionSyncIds, setPendingProtectionSyncIds] = useState<string[]>([]);
+  const [protectionConfirm, setProtectionConfirm] = useState<ProtectionConfirm | null>(null);
+  const [exchangeDebugPopup, setExchangeDebugPopup] = useState<ExchangeDebugPopup | null>(null);
+  const [orderbookConfirm, setOrderbookConfirm] = useState<OrderbookConfirm | null>(null);
+  const [phemexSettings, setPhemexSettings] = useState<PhemexSettings>({
+    apiKey: "",
+    apiSecret: "",
+    testnet: storedExchangeOptions.testnet ?? true,
+    symbol: storedExchangeOptions.symbol || "SOLUSDT",
+    pollSeconds: storedExchangeOptions.pollSeconds || "10",
+    resolution: storedExchangeOptions.resolution || "300",
+    limit: storedExchangeOptions.limit || "500",
+    mode: storedExchangeOptions.mode === "live" ? "live" : "replay",
+    liveOrdersEnabled: Boolean(storedExchangeOptions.liveOrdersEnabled),
+    allowMainnetOrders: Boolean(storedExchangeOptions.allowMainnetOrders),
+    marginMode: storedExchangeOptions.marginMode === "isolated" ? "isolated" : "cross",
+    leverage: storedExchangeOptions.leverage || "10"
+  });
+  const [activePhemexSettings, setActivePhemexSettings] = useState<PhemexSettings>(() => ({
+    apiKey: "",
+    apiSecret: "",
+    testnet: storedExchangeOptions.testnet ?? true,
+    symbol: storedExchangeOptions.symbol || "SOLUSDT",
+    pollSeconds: storedExchangeOptions.pollSeconds || "10",
+    resolution: storedExchangeOptions.resolution || "300",
+    limit: storedExchangeOptions.limit || "500",
+    mode: storedExchangeOptions.mode === "live" ? "live" : "replay",
+    liveOrdersEnabled: Boolean(storedExchangeOptions.liveOrdersEnabled),
+    allowMainnetOrders: Boolean(storedExchangeOptions.allowMainnetOrders),
+    marginMode: storedExchangeOptions.marginMode === "isolated" ? "isolated" : "cross",
+    leverage: storedExchangeOptions.leverage || "10"
+  }));
   const t = translations[language];
   const [message, setMessage] = useState(translations.de.demoLoaded);
   const [messageKind, setMessageKind] = useState<"demo" | "chartCsv" | "custom">("demo");
+  const isExchangeLive = activePhemexSettings.mode === "live";
+  const showLiveStatus = isExchangeLive && isLiveRunning;
+  const showPhemexConnected = showLiveStatus && futuresBalance !== null;
+  const isExchangeBusy = exchangeRequestState === "loading";
+  const exchangeStatusText =
+    exchangeRequestState === "loading"
+      ? t.exchangeLoading
+      : exchangeRequestState === "error"
+        ? t.exchangeError
+        : showLiveStatus
+          ? t.liveRunning
+          : t.liveInactive;
 
   const visibleCandles = useMemo(() => allCandles.slice(0, visibleCount), [allCandles, visibleCount]);
   const lastCandle = visibleCandles.at(-1);
@@ -578,6 +975,24 @@ function TradingApp() {
   );
   const closedOrders = useMemo(() => orders.filter((order) => order.status === "closed"), [orders]);
   const canceledOrders = useMemo(() => orders.filter((order) => order.status === "canceled"), [orders]);
+  const liveOrderPrice = entry ? Number(entry) : liveLastPrice ?? lastCandle?.close;
+  const liveOrderNotional = Number.isFinite(liveOrderPrice) ? Number(quantity || 0) * Number(liveOrderPrice) : undefined;
+  const leverageValue = Math.max(1, Number(phemexSettings.leverage || 1));
+  const liveOrderMargin = liveOrderNotional === undefined ? undefined : liveOrderNotional / leverageValue;
+  const baseAsset = activePhemexSettings.symbol.replace(/USDT$/i, "") || activePhemexSettings.symbol;
+  const sortedCoinOptions = useMemo(() => {
+    const uniqueCoins = Array.from(new Set(coinOptions));
+    return uniqueCoins.sort((left, right) => {
+      const leftFavorite = coinFavorites.includes(left);
+      const rightFavorite = coinFavorites.includes(right);
+      if (leftFavorite !== rightFavorite) return leftFavorite ? -1 : 1;
+      return left.localeCompare(right);
+    });
+  }, [coinFavorites, coinOptions]);
+  const favoriteCoinOptions = useMemo(
+    () => sortedCoinOptions.filter((symbol) => coinFavorites.includes(symbol)),
+    [coinFavorites, sortedCoinOptions]
+  );
 
   const screenToDrawingPoint = useCallback((x: number, y: number, snapToCandle = false): DrawingPoint | null => {
     const chart = chartRef.current;
@@ -685,17 +1100,138 @@ function TradingApp() {
     return () => {
       window.cancelAnimationFrame(overlayRefreshFrameRef.current);
       window.cancelAnimationFrame(overlayRefreshFollowUpFrameRef.current);
+      window.cancelAnimationFrame(drawingDragFrameRef.current);
+      window.cancelAnimationFrame(orderDragFrameRef.current);
+      Object.values(storageWriteTimersRef.current).forEach((timer) => window.clearTimeout(timer));
     };
   }, []);
 
-  useEffect(() => {
-    window.localStorage.setItem(drawingsStorageKey, JSON.stringify(drawings));
-  }, [drawings]);
+  const scheduleStorageWrite = useCallback((key: string, value: unknown) => {
+    window.clearTimeout(storageWriteTimersRef.current[key]);
+    storageWriteTimersRef.current[key] = window.setTimeout(() => {
+      window.localStorage.setItem(key, JSON.stringify(value));
+      delete storageWriteTimersRef.current[key];
+    }, 180);
+  }, []);
+
+  const applyPendingOrderMove = useCallback((pending: PendingOrderMove) => {
+    blockedProtectionDragRef.current = false;
+    setOrders((current) =>
+      current.map((order) =>
+        order.id === pending.target.orderId && (order.status === "pending" || order.status === "active")
+          ? {
+              ...(pending.target.field === "entry"
+                ? normalizeProtectionAfterEntryMove(order, Number(pending.price.toFixed(4)))
+                : (() => {
+                    const docked = isProtectionDockedAtEntry(order, pending.price);
+                    const invalidChipMove =
+                      pending.fromChip && !docked && !isProtectionPriceValid(order, pending.target.field, pending.price);
+                    if (invalidChipMove) {
+                      blockedProtectionDragRef.current = true;
+                    }
+                    return {
+                      ...order,
+                      [pending.target.field]: docked
+                        ? undefined
+                        : invalidChipMove
+                          ? order[pending.target.field]
+                          : Number(clampProtectionPrice(order, pending.target.field, pending.price).toFixed(4))
+                    };
+                  })())
+            }
+          : order
+      )
+    );
+  }, []);
 
   useEffect(() => {
-    const pendingOrders = orders.filter((order) => order.status === "pending");
-    window.localStorage.setItem(pendingOrdersStorageKey, JSON.stringify(pendingOrders));
-  }, [orders]);
+    scheduleStorageWrite(drawingsStorageKey, drawings);
+  }, [drawings, scheduleStorageWrite]);
+
+  useEffect(() => {
+    scheduleStorageWrite(chartThemeStorageKey, chartTheme);
+  }, [chartTheme, scheduleStorageWrite]);
+
+  useEffect(() => {
+    scheduleStorageWrite(appOptionsStorageKey, {
+      language,
+      autoScalePrice,
+      autoFocusChart
+    });
+  }, [autoFocusChart, autoScalePrice, language, scheduleStorageWrite]);
+
+  useEffect(() => {
+    scheduleStorageWrite(exchangeOptionsStorageKey, {
+      testnet: phemexSettings.testnet,
+      symbol: phemexSettings.symbol,
+      pollSeconds: phemexSettings.pollSeconds,
+      resolution: phemexSettings.resolution,
+      limit: phemexSettings.limit,
+      mode: phemexSettings.mode,
+      liveOrdersEnabled: phemexSettings.liveOrdersEnabled,
+      allowMainnetOrders: phemexSettings.allowMainnetOrders,
+      marginMode: phemexSettings.marginMode,
+      leverage: phemexSettings.leverage
+    });
+  }, [
+    phemexSettings.limit,
+    phemexSettings.mode,
+    phemexSettings.liveOrdersEnabled,
+    phemexSettings.allowMainnetOrders,
+    phemexSettings.marginMode,
+    phemexSettings.leverage,
+    phemexSettings.pollSeconds,
+    phemexSettings.resolution,
+    phemexSettings.symbol,
+    phemexSettings.testnet,
+    scheduleStorageWrite
+  ]);
+
+  useEffect(() => {
+    scheduleStorageWrite(coinFavoritesStorageKey, coinFavorites);
+  }, [coinFavorites, scheduleStorageWrite]);
+
+  useEffect(() => {
+    fetch("/api/coin-list")
+      .then((response) => response.ok ? response.json() : undefined)
+      .then((result) => {
+        if (Array.isArray(result?.symbols) && result.symbols.length) {
+          setCoinOptions(result.symbols);
+        }
+      })
+      .catch(() => undefined);
+  }, []);
+
+  useEffect(() => {
+    fetch("/api/phemex-settings")
+      .then((response) => response.ok ? response.json() : undefined)
+      .then((settings) => {
+        if (!settings) return;
+        const mergeSettings = (current: PhemexSettings) => ({
+          ...current,
+          apiKey: settings.apiKey || "",
+          apiSecret: settings.hasSecret ? "********" : "",
+          testnet: storedExchangeOptions.testnet !== undefined ? current.testnet : settings.testnet !== false,
+          symbol: storedExchangeOptions.symbol ? current.symbol : settings.symbol || "SOLUSDT",
+          pollSeconds: storedExchangeOptions.pollSeconds ? current.pollSeconds : settings.pollSeconds || "10",
+          resolution: storedExchangeOptions.resolution ? current.resolution : settings.resolution || "300",
+          limit: storedExchangeOptions.limit ? current.limit : settings.limit || "500",
+          mode: storedExchangeOptions.mode ? current.mode : settings.mode === "live" ? "live" : "replay",
+          liveOrdersEnabled: current.liveOrdersEnabled,
+          allowMainnetOrders: storedExchangeOptions.allowMainnetOrders !== undefined ? current.allowMainnetOrders : Boolean(settings.allowMainnetOrders),
+          marginMode: current.marginMode,
+          leverage: current.leverage
+        });
+        setPhemexSettings(mergeSettings);
+        setActivePhemexSettings(mergeSettings);
+      })
+      .catch(() => undefined);
+  }, [storedExchangeOptions]);
+
+  useEffect(() => {
+    const pendingOrders = orders.filter((order) => order.status === "pending" && !order.phemexOrderId && !order.phemexClOrdId);
+    scheduleStorageWrite(pendingOrdersStorageKey, pendingOrders);
+  }, [orders, scheduleStorageWrite]);
 
   useEffect(() => {
     if (!chartElement.current) return;
@@ -839,13 +1375,23 @@ function TradingApp() {
     const candleSeries = candleSeriesRef.current;
     const chart = chartRef.current;
     const candleSetChanged = previousCandleSetRef.current !== allCandles;
+    const previousCandles = previousCandleSetRef.current;
     const canAppendSingleCandle = !candleSetChanged && visibleCount === previousVisibleCountRef.current + 1;
+    const canUpdateLastLiveCandle =
+      candleSetChanged &&
+      previousCandles !== null &&
+      previousCandles.length === allCandles.length &&
+      visibleCount === previousVisibleCountRef.current &&
+      previousCandles.at(-1)?.time === allCandles.at(-1)?.time;
     const keepManualRange = !autoFocusChart && !shouldFitContentRef.current;
     const visibleRange = keepManualRange ? chart?.timeScale().getVisibleLogicalRange() : null;
 
     if (candleSeries) {
       if (canAppendSingleCandle && autoFocusChart) {
         const nextCandle = allCandles[visibleCount - 1];
+        if (nextCandle) candleSeries.update(nextCandle);
+      } else if (canUpdateLastLiveCandle) {
+        const nextCandle = allCandles.at(-1);
         if (nextCandle) candleSeries.update(nextCandle);
       } else if (candleSetChanged || visibleCount !== previousVisibleCountRef.current) {
         candleSeries.setData(visibleCandles);
@@ -861,7 +1407,22 @@ function TradingApp() {
       });
     }
 
-    if (autoFocusChart || shouldFitContentRef.current) {
+    if (shouldJumpToLatestRef.current) {
+      const lastLogical = Math.max(0, visibleCandles.length - 1);
+      chartRef.current?.timeScale().setVisibleLogicalRange({
+        from: Math.max(0, lastLogical - 60) as Logical,
+        to: (lastLogical + 4) as Logical
+      });
+      shouldJumpToLatestRef.current = false;
+      shouldFitContentRef.current = false;
+      if (shouldFitPriceRef.current) {
+        chartRef.current?.priceScale("right").setAutoScale(true);
+        window.requestAnimationFrame(() => {
+          chartRef.current?.priceScale("right").setAutoScale(autoScalePrice);
+        });
+        shouldFitPriceRef.current = false;
+      }
+    } else if (autoFocusChart || shouldFitContentRef.current) {
       chartRef.current?.timeScale().fitContent();
       if (shouldFitPriceRef.current) {
         chartRef.current?.priceScale("right").setAutoScale(true);
@@ -935,10 +1496,13 @@ function TradingApp() {
       const series = candleSeriesRef.current;
       if (!series) return;
       const chartWidth = chartElement.current?.clientWidth ?? 0;
+      const chartHeight = chartElement.current?.clientHeight ?? 0;
+      const isVisibleY = (value: number) => value >= 0 && value <= chartHeight;
       const controls = openOrders
         .filter((order) => order.status === "pending" && (order.takeProfit === undefined || order.stopLoss === undefined))
         .map((order) => {
           const y = series.priceToCoordinate(order.entry);
+          if (y === null || !isVisibleY(y)) return undefined;
           const orderIndex = allCandles.findIndex((candle) => candle.time === order.openedAt);
           const logical = (orderIndex >= 0 ? orderIndex : visibleCandles.length - 1) as Logical;
           const coordinate = chartRef.current?.timeScale().logicalToCoordinate(logical);
@@ -946,7 +1510,7 @@ function TradingApp() {
           const paneWidth = Math.max(0, chartWidth - rightPriceScaleOffset);
           const controlWidth = 286;
           const controlsX = Math.max(12, paneWidth - controlWidth + 66);
-          return y === null ? undefined : { order, y, x, controlsX };
+          return { order, y, x, controlsX };
         })
         .filter(Boolean) as Array<{ order: TradeOrder; y: number; x: number; controlsX: number }>;
       setLineControls(controls);
@@ -961,7 +1525,7 @@ function TradingApp() {
         candidates.forEach(([field, price]) => {
           if (price === undefined) return;
           const y = series.priceToCoordinate(price);
-          if (y !== null) {
+          if (y !== null && isVisibleY(y)) {
             const matchingControl = controls.find((control) => control.order.id === order.id);
             const labelX =
               field === "entry" && matchingControl
@@ -1001,79 +1565,87 @@ function TradingApp() {
       if (!point) return;
       const logicalDelta = point.logical - drag.startPoint.logical;
       const priceDelta = point.price - drag.startPoint.price;
-      setDrawings((current) =>
-        current.map((drawing) => {
-          if (drawing.id !== drag.id) return drawing;
-          if (drawing.locked) return drawing;
-          if (drawing.tool === "zigzag" && drag.pointIndex !== undefined) {
-            const points = drawing.points?.map((existingPoint, index) =>
-              index === drag.pointIndex ? point : existingPoint
-            );
-            if (!points?.length) return drawing;
+      pendingDrawingMoveRef.current = { drag, point, logicalDelta, priceDelta };
+      if (drawingDragFrameRef.current) return;
+      drawingDragFrameRef.current = window.requestAnimationFrame(() => {
+        drawingDragFrameRef.current = 0;
+        const pending = pendingDrawingMoveRef.current;
+        if (!pending) return;
+        pendingDrawingMoveRef.current = null;
+        setDrawings((current) =>
+          current.map((drawing) => {
+            if (drawing.id !== pending.drag.id) return drawing;
+            if (drawing.locked) return drawing;
+            if (drawing.tool === "zigzag" && pending.drag.pointIndex !== undefined) {
+              const points = drawing.points?.map((existingPoint, index) =>
+                index === pending.drag.pointIndex ? pending.point : existingPoint
+              );
+              if (!points?.length) return drawing;
+              return {
+                ...drawing,
+                points,
+                start: points[0],
+                end: points.at(-1) ?? points[0]
+              };
+            }
+            if (drawing.tool === "rect") {
+              if (pending.drag.handle === "topLeft") return { ...drawing, start: pending.point };
+              if (pending.drag.handle === "bottomRight") return { ...drawing, end: pending.point };
+              if (pending.drag.handle === "topRight") {
+                return {
+                  ...drawing,
+                  start: { ...drawing.start, price: pending.point.price },
+                  end: { ...drawing.end, logical: pending.point.logical }
+                };
+              }
+              if (pending.drag.handle === "bottomLeft") {
+                return {
+                  ...drawing,
+                  start: { ...drawing.start, logical: pending.point.logical },
+                  end: { ...drawing.end, price: pending.point.price }
+                };
+              }
+            }
+            if (pending.drag.handle === "start") {
+              if (drawing.tool === "ray" || drawing.tool === "horizontal") {
+                return {
+                  ...drawing,
+                  start: pending.point,
+                  end: { ...drawing.end, price: pending.point.price }
+                };
+              }
+              return { ...drawing, start: pending.point };
+            }
+            if (pending.drag.handle === "end") {
+              if (drawing.tool === "ray" || drawing.tool === "horizontal") {
+                return {
+                  ...drawing,
+                  end: { logical: pending.point.logical, price: drawing.start.price }
+                };
+              }
+              return { ...drawing, end: pending.point };
+            }
             return {
-              ...drawing,
-              points,
-              start: points[0],
-              end: points.at(-1) ?? points[0]
+              ...pending.drag.original,
+              start: {
+                logical: pending.drag.original.start.logical + pending.logicalDelta,
+                price: pending.drag.original.start.price + pending.priceDelta
+              },
+              end: {
+                logical: pending.drag.original.end.logical + pending.logicalDelta,
+                price: pending.drag.original.end.price + pending.priceDelta
+              },
+              points: pending.drag.original.points?.map((point) => ({
+                logical: point.logical + pending.logicalDelta,
+                price: point.price + pending.priceDelta
+              }))
             };
-          }
-          if (drawing.tool === "rect") {
-            if (drag.handle === "topLeft") return { ...drawing, start: point };
-            if (drag.handle === "bottomRight") return { ...drawing, end: point };
-            if (drag.handle === "topRight") {
-              return {
-                ...drawing,
-                start: { ...drawing.start, price: point.price },
-                end: { ...drawing.end, logical: point.logical }
-              };
-            }
-            if (drag.handle === "bottomLeft") {
-              return {
-                ...drawing,
-                start: { ...drawing.start, logical: point.logical },
-                end: { ...drawing.end, price: point.price }
-              };
-            }
-          }
-          if (drag.handle === "start") {
-            if (drawing.tool === "ray" || drawing.tool === "horizontal") {
-              return {
-                ...drawing,
-                start: point,
-                end: { ...drawing.end, price: point.price }
-              };
-            }
-            return { ...drawing, start: point };
-          }
-          if (drag.handle === "end") {
-            if (drawing.tool === "ray" || drawing.tool === "horizontal") {
-              return {
-                ...drawing,
-                end: { logical: point.logical, price: drawing.start.price }
-              };
-            }
-            return { ...drawing, end: point };
-          }
-          return {
-            ...drag.original,
-            start: {
-              logical: drag.original.start.logical + logicalDelta,
-              price: drag.original.start.price + priceDelta
-            },
-            end: {
-              logical: drag.original.end.logical + logicalDelta,
-              price: drag.original.end.price + priceDelta
-            },
-            points: drag.original.points?.map((point) => ({
-              logical: point.logical + logicalDelta,
-              price: point.price + priceDelta
-            }))
-          };
-        })
-      );
+          })
+        );
+      });
     };
 
-    const handleMouseUp = () => {
+    const handleMouseUp = (event: MouseEvent) => {
       draggedDrawingRef.current = null;
     };
 
@@ -1151,6 +1723,7 @@ function TradingApp() {
       event.preventDefault();
       event.stopPropagation();
       draggedLineRef.current = line;
+      rememberProtectionBeforeDrag(line.orderId, line.field);
       chartRef.current?.applyOptions({
         handleScale: {
           axisPressedMouseMove: {
@@ -1185,7 +1758,11 @@ function TradingApp() {
       }
 
       if (!activeLine && !activeChip) {
-        chartNode.classList.toggle("line-hover", findOrderLineAt(mouseY) !== null);
+        if (hasChartOverlaysRef.current) {
+          chartNode.classList.toggle("line-hover", findOrderLineAt(mouseY) !== null);
+        } else {
+          chartNode.classList.remove("line-hover");
+        }
         return;
       }
 
@@ -1196,29 +1773,28 @@ function TradingApp() {
       const target = activeLine ?? activeChip;
       if (!target) return;
 
-      setOrders((current) =>
-        current.map((order) =>
-          order.id === target.orderId && (order.status === "pending" || order.status === "active")
-            ? {
-                ...(target.field === "entry"
-                  ? normalizeProtectionAfterEntryMove(order, Number(price.toFixed(4)))
-                  : {
-                      ...order,
-                      [target.field]: isProtectionDockedAtEntry(order, price)
-                        ? undefined
-                        : activeChip && !isProtectionPriceValid(order, target.field, price)
-                          ? order[target.field]
-                          : Number(clampProtectionPrice(order, target.field, price).toFixed(4))
-                    })
-              }
-            : order
-        )
-      );
+      pendingOrderMoveRef.current = { target, price, fromChip: Boolean(activeChip) };
+      if (orderDragFrameRef.current) return;
+      orderDragFrameRef.current = window.requestAnimationFrame(() => {
+        orderDragFrameRef.current = 0;
+        const pending = pendingOrderMoveRef.current;
+        if (!pending) return;
+        pendingOrderMoveRef.current = null;
+        applyPendingOrderMove(pending);
+      });
     };
 
-    const handleMouseUp = () => {
+    const handleMouseUp = (event: MouseEvent) => {
       scheduleOverlayRefresh(true);
+      if (pendingOrderMoveRef.current) {
+        const pending = pendingOrderMoveRef.current;
+        pendingOrderMoveRef.current = null;
+        window.cancelAnimationFrame(orderDragFrameRef.current);
+        orderDragFrameRef.current = 0;
+        applyPendingOrderMove(pending);
+      }
       if (!draggedLineRef.current && !draggedChipRef.current) return;
+      const draggedField = draggedLineRef.current?.field ?? draggedChipRef.current?.field;
       const orderId = draggedLineRef.current?.orderId ?? draggedChipRef.current?.orderId;
       if (draggedChipRef.current) {
         chipDragFinishedRef.current = true;
@@ -1246,7 +1822,45 @@ function TradingApp() {
       });
       chartNode.classList.remove("dragging-line");
       chartNode.classList.remove("line-hover");
-      if (orderId) setMessage(t.protectionUpdated(orderId));
+      if (orderId) {
+        setMessage(t.protectionUpdated(orderId));
+        if (draggedField === "entry" || draggedField === "takeProfit" || draggedField === "stopLoss") {
+          const original = draggedProtectionOriginalRef.current;
+          const wasBlockedProtectionDrag = blockedProtectionDragRef.current;
+          blockedProtectionDragRef.current = false;
+          const changedOrder = ordersRef.current.find((order) => order.id === orderId);
+          const invalidProtectionMove =
+            changedOrder &&
+            (draggedField === "takeProfit" || draggedField === "stopLoss") &&
+            changedOrder[draggedField] !== undefined &&
+            !isProtectionPriceValid(changedOrder, draggedField, changedOrder[draggedField]);
+          if ((wasBlockedProtectionDrag || invalidProtectionMove) && original?.orderId === orderId) {
+            setOrders((current) =>
+              current.map((order) =>
+                order.id === orderId
+                  ? {
+                      ...order,
+                      entry: original.entry,
+                      takeProfit: original.takeProfit,
+                      stopLoss: original.stopLoss
+                    }
+                  : order
+              )
+            );
+          } else if (original?.orderId === orderId) {
+            const rect = chartNode.getBoundingClientRect();
+            setProtectionConfirm({
+              orderId,
+              x: Math.min(Math.max(12, event.clientX - rect.left), Math.max(12, rect.width - 260)),
+              y: Math.min(Math.max(12, event.clientY - rect.top), Math.max(12, rect.height - 116)),
+              originalEntry: original.entry,
+              originalTakeProfit: original.takeProfit,
+              originalStopLoss: original.stopLoss
+            });
+          }
+        }
+      }
+      draggedProtectionOriginalRef.current = null;
     };
 
     const handleWheel = () => {
@@ -1275,7 +1889,7 @@ function TradingApp() {
       window.removeEventListener("click", closeMenu);
       window.removeEventListener("keydown", closeMenu);
     };
-  }, [scheduleOverlayRefresh, t]);
+  }, [applyPendingOrderMove, scheduleOverlayRefresh, t]);
 
   const evaluateOrders = useCallback((candle: Candle) => {
     setOrders((current) =>
@@ -1322,8 +1936,18 @@ function TradingApp() {
     });
   }, [allCandles, evaluateOrders]);
 
-  const createOrder = (orderSide: Side, orderEntry: number, options?: { keepInputs?: boolean }) => {
+  const createOrder = (
+    orderSide: Side,
+    orderEntry: number,
+    options?: { keepInputs?: boolean; externalId?: string; phemexOrderId?: string; phemexClOrdId?: string }
+  ) => {
     if (!lastCandle) return;
+    if (!options?.externalId && ordersRef.current.some((order) => order.status === "pending" || order.status === "active")) {
+      const text = `Für ${activePhemexSettings.symbol} ist bereits eine offene Order vorhanden. Bitte erst Cancel oder Schließen verwenden.`;
+      setMessage(text);
+      setMessageKind("custom");
+      return;
+    }
     const parsedTp = takeProfit ? Number(takeProfit) : undefined;
     const parsedSl = stopLoss ? Number(stopLoss) : undefined;
 
@@ -1334,7 +1958,9 @@ function TradingApp() {
 
     const nextNumber = orders.length + 1;
     const order: TradeOrder = {
-      id: `ORD-${String(nextNumber).padStart(4, "0")}`,
+      id: options?.externalId || `ORD-${String(nextNumber).padStart(4, "0")}`,
+      phemexOrderId: options?.phemexOrderId,
+      phemexClOrdId: options?.phemexClOrdId,
       side: orderSide,
       quantity,
       entry: orderEntry,
@@ -1354,26 +1980,307 @@ function TradingApp() {
     setMessage(t.orderPlaced(order.id, orderSide, formatPrice(orderEntry)));
   };
 
-  const submitOrder = () => {
-    if (!lastCandle) return;
-    const parsedEntry = entry ? Number(entry) : lastCandle.close;
-    createOrder(side, parsedEntry);
+  const useLiveLastPrice = () => {
+    const price = liveLastPrice ?? lastCandle?.close;
+    if (price === undefined) return;
+    setEntry(price.toFixed(2));
+    setMessage(t.priceUsed(formatPrice(price)));
   };
 
-  const cancelOrder = (orderId: string) => {
+  const toggleCoinFavorite = (symbol: string) => {
+    setCoinFavorites((current) =>
+      current.includes(symbol)
+        ? current.filter((favorite) => favorite !== symbol)
+        : [symbol, ...current]
+    );
+  };
+
+  const rememberProtectionBeforeDrag = (orderId: string, field: DraggableOrderField) => {
+    if (field !== "entry" && field !== "takeProfit" && field !== "stopLoss") return;
+    const order = ordersRef.current.find((item) => item.id === orderId);
+    if (!order) return;
+    draggedProtectionOriginalRef.current = {
+      orderId,
+      entry: order.entry,
+      takeProfit: order.takeProfit,
+      stopLoss: order.stopLoss
+    };
+  };
+
+  const updateLiveCapitalPercent = (percent: number) => {
+    const nextPercent = Math.max(0, percent);
+    setLiveCapitalPercent(nextPercent);
+    const price = liveOrderPrice;
+    if (nextPercent <= 0) {
+      setQuantity(0);
+      return;
+    }
+    if (!futuresBalance || !Number.isFinite(price) || !price) {
+      setQuantity(0);
+      return;
+    }
+    const margin = futuresBalance * (nextPercent / 100);
+    const notional = margin * leverageValue;
+    const calculatedQuantity = notional / Number(price);
+    setQuantity(Number(calculatedQuantity.toFixed(4)));
+  };
+
+  const showExchangeDebug = (title: string, text: string, details?: unknown) => {
+    const detailText =
+      typeof details === "string"
+        ? details
+        : details
+          ? JSON.stringify(details, null, 2)
+          : undefined;
+    setExchangeDebugPopup({ title, message: text, details: detailText });
+    setMessage(text);
+    setMessageKind("custom");
+  };
+
+  const submitOrder = async (forcedSide?: Side) => {
+    if (!lastCandle) return;
+    const orderSide = forcedSide ?? side;
+    const parsedEntry = entry ? Number(entry) : lastCandle.close;
+    const existingOpenOrder = ordersRef.current.find((order) => order.status === "pending" || order.status === "active");
+    if (existingOpenOrder) {
+      const text = `Für ${activePhemexSettings.symbol} ist bereits eine offene Order vorhanden. Bitte erst Cancel oder Schließen verwenden.`;
+      showExchangeDebug("Eine Order pro Asset", text, {
+        symbol: activePhemexSettings.symbol,
+        existingOrderId: existingOpenOrder.id,
+        existingStatus: existingOpenOrder.status
+      });
+      return;
+    }
+    if (isLiveRunning) {
+      const parsedTp = takeProfit ? Number(takeProfit) : undefined;
+      const parsedSl = stopLoss ? Number(stopLoss) : undefined;
+      setExchangeRequestState("loading");
+      try {
+        const response = await fetch("/api/phemex-order", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            symbol: activePhemexSettings.symbol,
+            side: orderSide,
+            quantity,
+            price: parsedEntry,
+            takeProfit: Number.isFinite(parsedTp) ? parsedTp : undefined,
+            stopLoss: Number.isFinite(parsedSl) ? parsedSl : undefined,
+            testnet: activePhemexSettings.testnet
+          })
+        });
+        const result = await response.json();
+        if (!response.ok || !result.ok) throw new Error(result.message || "Phemex order failed");
+        createOrder(orderSide, parsedEntry, {
+          externalId: result.orderID || result.clOrdID,
+          phemexOrderId: result.orderID,
+          phemexClOrdId: result.clOrdID
+        });
+        setMessage(t.phemexOrderPlaced(result.orderID || result.clOrdID || "OK"));
+        setMessageKind("custom");
+        setExchangeRequestState("idle");
+        return;
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : undefined;
+        showExchangeDebug("Phemex Order", t.phemexOrderFailed(reason), {
+          reason,
+          symbol: activePhemexSettings.symbol,
+          side: orderSide,
+          quantity,
+          price: parsedEntry,
+          testnet: activePhemexSettings.testnet
+        });
+        setExchangeRequestState("error");
+        return;
+      }
+    }
+    createOrder(orderSide, parsedEntry);
+  };
+
+  const cancelOrder = async (orderId: string) => {
+    const order = ordersRef.current.find((item) => item.id === orderId);
+    if (!order) return;
+    const exchangeOrderId = order.phemexOrderId || (phemexOrderIdPattern.test(order.id) ? order.id : undefined);
+    if (isLiveRunning && (exchangeOrderId || order.phemexClOrdId)) {
+      setExchangeRequestState("loading");
+      try {
+        const response = await fetch("/api/phemex-cancel-order", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            symbol: activePhemexSettings.symbol,
+            orderID: exchangeOrderId,
+            clOrdID: order.phemexClOrdId,
+            testnet: activePhemexSettings.testnet
+          })
+        });
+        const result = await response.json();
+        if (!response.ok || !result.ok) throw new Error(result.message || "Phemex cancel failed");
+        [order.id, exchangeOrderId, order.phemexOrderId, order.phemexClOrdId, result.orderID, result.clOrdID]
+          .filter(Boolean)
+          .forEach((key) => canceledPhemexOrderKeysRef.current.add(String(key)));
+        setOrders((current) =>
+          order.status === "pending"
+            ? current.filter((item) => item.id !== orderId)
+            : current.map((item) =>
+                item.id === orderId
+                  ? { ...item, status: "closed" as OrderStatus, closedAt: lastCandle?.time, result: "CANCEL" as const, closePrice: lastCandle?.close }
+                  : item
+              )
+        );
+        setMessage(t.phemexOrderCanceled(orderId));
+        setMessageKind("custom");
+        setExchangeRequestState("idle");
+        window.setTimeout(() => {
+          syncPhemexOpenOrders(activePhemexSettings).catch(() => undefined);
+        }, 2500);
+        return;
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : undefined;
+        showExchangeDebug("Phemex Cancel", t.phemexOrderCancelFailed(reason), {
+          reason,
+          symbol: activePhemexSettings.symbol,
+          orderID: exchangeOrderId,
+          clOrdID: order.phemexClOrdId,
+          testnet: activePhemexSettings.testnet
+        });
+        setExchangeRequestState("error");
+        return;
+      }
+    }
     setOrders((current) =>
-      current.map((order) =>
-        (order.id === orderId && (order.status === "pending" || order.status === "active"))
-          ? { ...order, status: "canceled", closedAt: lastCandle?.time, result: "CANCEL" }
-          : order
-      )
+      order.status === "pending"
+        ? current.filter((item) => item.id !== orderId)
+        : current.map((item) =>
+            item.id === orderId && item.status === "active"
+              ? { ...item, status: "closed" as OrderStatus, closedAt: lastCandle?.time, result: "CANCEL" as const, closePrice: lastCandle?.close }
+              : item
+          )
     );
     setMessage(t.orderCanceled(orderId));
   };
 
+  const closeActiveOrder = (orderId: string) => {
+    const order = ordersRef.current.find((item) => item.id === orderId);
+    if (!order) return;
+    if (isLiveRunning && (order.phemexOrderId || order.phemexClOrdId)) {
+      setMessage("Aktive Position lokal geschlossen. Phemex Positions-Close folgt als eigener Schritt.");
+      setMessageKind("custom");
+    }
+    setOrders((current) =>
+      current.map((item) =>
+        item.id === orderId && item.status === "active"
+          ? { ...item, status: "closed" as OrderStatus, closedAt: lastCandle?.time, result: "CANCEL" as const, closePrice: lastCandle?.close }
+          : item
+      )
+    );
+  };
+
+  const recreatePendingPhemexOrder = async (order: TradeOrder) => {
+    const exchangeOrderId = order.phemexOrderId || (phemexOrderIdPattern.test(order.id) ? order.id : undefined);
+    if (!exchangeOrderId && !order.phemexClOrdId) {
+      throw new Error("Keine Phemex Order-ID für Recreate vorhanden.");
+    }
+
+    const cancelResponse = await fetch("/api/phemex-cancel-order", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        symbol: activePhemexSettings.symbol,
+        orderID: exchangeOrderId,
+        clOrdID: order.phemexClOrdId,
+        testnet: activePhemexSettings.testnet
+      })
+    });
+    const cancelResult = await cancelResponse.json();
+    if (!cancelResponse.ok || !cancelResult.ok) {
+      if (cancelResult.payload?.code === 10002 || cancelResult.message?.includes("OM_ORDER_NOT_FOUND")) {
+        setOrders((current) =>
+          current.map((item) =>
+            item.id === order.id
+              ? {
+                  ...item,
+                  status: "active" as OrderStatus
+                }
+              : item
+          )
+        );
+        return { becameActive: true, cancelResult, createResult: null };
+      }
+      throw new Error(cancelResult.message || "Phemex cancel before recreate failed");
+    }
+
+    [order.id, exchangeOrderId, order.phemexOrderId, order.phemexClOrdId, cancelResult.orderID, cancelResult.clOrdID]
+      .filter(Boolean)
+      .forEach((key) => canceledPhemexOrderKeysRef.current.add(String(key)));
+
+    const createResponse = await fetch("/api/phemex-order", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        symbol: activePhemexSettings.symbol,
+        side: order.side,
+        quantity: order.quantity,
+        price: order.entry,
+        takeProfit: order.takeProfit,
+        stopLoss: order.stopLoss,
+        testnet: activePhemexSettings.testnet
+      })
+    });
+    const createResult = await createResponse.json();
+    if (!createResponse.ok || !createResult.ok) {
+      throw new Error(createResult.message || "Phemex recreate order failed");
+    }
+
+    setOrders((current) =>
+      current.map((item) =>
+        item.id === order.id
+          ? {
+              ...item,
+              id: createResult.orderID || createResult.clOrdID || item.id,
+              phemexOrderId: createResult.orderID,
+              phemexClOrdId: createResult.clOrdID
+            }
+          : item
+      )
+    );
+
+    return { becameActive: false, cancelResult, createResult };
+  };
+
   const deleteOrder = (orderId: string) => {
+    const order = ordersRef.current.find((item) => item.id === orderId);
+    const exchangeOrderId = order ? order.phemexOrderId || (phemexOrderIdPattern.test(order.id) ? order.id : undefined) : undefined;
+    if (isLiveRunning && order && (order.status === "pending" || order.status === "active") && (exchangeOrderId || order.phemexClOrdId)) {
+      void cancelOrder(orderId);
+      return;
+    }
     setOrders((current) => current.filter((order) => order.id !== orderId));
     setMessage(t.orderDeleted(orderId));
+  };
+
+  const requestClearOrderbook = () => {
+    const livePendingCount = openOrders.filter((order) => order.status === "pending" && (order.phemexOrderId || phemexOrderIdPattern.test(order.id) || order.phemexClOrdId)).length;
+    setOrderbookConfirm({
+      title: "Orderbook leeren?",
+      message: livePendingCount > 0
+        ? `${livePendingCount} offene Phemex-Order(s) werden auf der Exchange storniert und aus dem Tool entfernt.`
+        : "Alle offenen lokalen Orders werden aus dem Tool entfernt."
+    });
+  };
+
+  const confirmClearOrderbook = async () => {
+    setOrderbookConfirm(null);
+    const pendingOrdersToCancel = ordersRef.current.filter((order) => order.status === "pending");
+    const livePendingOrders = pendingOrdersToCancel.filter((order) =>
+      isLiveRunning && (order.phemexOrderId || phemexOrderIdPattern.test(order.id) || order.phemexClOrdId)
+    );
+    for (const order of livePendingOrders) {
+      await cancelOrder(order.id);
+    }
+    setOrders((current) => current.filter((order) => order.status !== "pending" && order.status !== "active"));
+    setMessage(t.clearOrderbook);
+    setMessageKind("custom");
   };
 
   const updateOrderProtection = (orderId: string, field: "takeProfit" | "stopLoss", value: string) => {
@@ -1384,20 +2291,271 @@ function TradingApp() {
     }
 
     setOrders((current) =>
-      current.map((order) =>
-        order.id === orderId && (order.status === "pending" || order.status === "active")
-          ? {
-              ...order,
-              [field]: parsed === undefined ? undefined : Number(clampProtectionPrice(order, field, parsed).toFixed(4))
-            }
-          : order
-      )
+      current.map((order) => {
+        if (order.id !== orderId || (order.status !== "pending" && order.status !== "active")) return order;
+        if (!protectionEditOriginalsRef.current[orderId]) {
+          protectionEditOriginalsRef.current[orderId] = {
+            entry: order.entry,
+            takeProfit: order.takeProfit,
+            stopLoss: order.stopLoss
+          };
+        }
+        const nextValue =
+          parsed === undefined || isProtectionDockedAtEntry(order, parsed)
+            ? undefined
+            : Number(clampProtectionPrice(order, field, parsed).toFixed(4));
+        return {
+          ...order,
+          [field]: nextValue
+        };
+      })
     );
   };
 
-  const confirmOrderProtection = (orderId: string) => {
+  const confirmOrderProtection = async (orderId: string) => {
+    const order = ordersRef.current.find((item) => item.id === orderId);
+    if (!order) return;
+    if (isLiveRunning && order.status === "active") {
+      setExchangeRequestState("loading");
+      try {
+        const response = await fetch("/api/phemex-position-protection", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            symbol: activePhemexSettings.symbol,
+            side: order.side,
+            quantity: order.quantity,
+            takeProfit: order.takeProfit,
+            stopLoss: order.stopLoss,
+            testnet: activePhemexSettings.testnet
+          })
+        });
+        const result = await response.json();
+        if (!response.ok || !result.ok) {
+          showExchangeDebug("Phemex Positions-TP/SL", t.phemexOrderAmendFailed(result.message), {
+            reason: result.message,
+            symbol: activePhemexSettings.symbol,
+            side: order.side,
+            quantity: order.quantity,
+            sentTakeProfit: order.takeProfit,
+            sentStopLoss: order.stopLoss,
+            request: result.request,
+            phemexResponse: result.payload
+          });
+          setExchangeRequestState("error");
+          return;
+        }
+        setOrders((current) =>
+          current.map((item) =>
+            item.id === orderId
+              ? {
+                  ...item,
+                  phemexTakeProfitOrderId: result.takeProfit?.orderID || item.phemexTakeProfitOrderId,
+                  phemexStopLossOrderId: result.stopLoss?.orderID || item.phemexStopLossOrderId
+                }
+              : item
+          )
+        );
+        setMessage("Phemex Positions-TP/SL wurde gesetzt.");
+        setMessageKind("custom");
+        setExchangeRequestState("idle");
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : undefined;
+        showExchangeDebug("Phemex Positions-TP/SL", t.phemexOrderAmendFailed(reason), {
+          reason,
+          symbol: activePhemexSettings.symbol,
+          side: order.side,
+          quantity: order.quantity,
+          sentTakeProfit: order.takeProfit,
+          sentStopLoss: order.stopLoss,
+          testnet: activePhemexSettings.testnet
+        });
+        setExchangeRequestState("error");
+      }
+      return;
+    }
+    if (isLiveRunning && (order.phemexOrderId || order.phemexClOrdId)) {
+      setExchangeRequestState("loading");
+      if (order.status === "pending") {
+        try {
+          const result = await recreatePendingPhemexOrder(order);
+          if (result.becameActive) {
+            setMessage("Phemex Order ist nicht mehr offen. Sie wurde lokal als aktiv markiert.");
+            setMessageKind("custom");
+            setExchangeRequestState("idle");
+            return;
+          }
+          setMessage(`Phemex Order ${order.id} mit neuem TP/SL ersetzt.`);
+          setMessageKind("custom");
+          setExchangeRequestState("idle");
+          await delay(900);
+          await syncPhemexOpenOrders(activePhemexSettings).catch(() => undefined);
+          return;
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : undefined;
+          showExchangeDebug("Phemex Recreate", t.phemexOrderAmendFailed(reason), {
+            reason,
+            symbol: activePhemexSettings.symbol,
+            orderID: order.phemexOrderId,
+            clOrdID: order.phemexClOrdId,
+            quantity: order.quantity,
+            entry: order.entry,
+            sentTakeProfit: order.takeProfit,
+            sentStopLoss: order.stopLoss,
+            testnet: activePhemexSettings.testnet
+          });
+          setExchangeRequestState("error");
+          return;
+        }
+      }
+      try {
+        const response = await fetch("/api/phemex-amend-order", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            symbol: activePhemexSettings.symbol,
+            orderID: order.phemexOrderId,
+            origClOrdID: order.phemexClOrdId,
+            side: order.side,
+            quantity: order.quantity,
+            price: order.entry,
+            takeProfit: order.takeProfit,
+            stopLoss: order.stopLoss,
+            testnet: activePhemexSettings.testnet
+          })
+        });
+        const result = await response.json();
+        if (!response.ok || !result.ok) {
+          showExchangeDebug("Phemex Änderung", t.phemexOrderAmendFailed(result.message), {
+            reason: result.message,
+            symbol: activePhemexSettings.symbol,
+            orderID: order.phemexOrderId,
+            clOrdID: order.phemexClOrdId,
+            quantity: order.quantity,
+            entry: order.entry,
+            sentTakeProfit: order.takeProfit,
+            sentStopLoss: order.stopLoss,
+            testnet: activePhemexSettings.testnet,
+            request: result.request,
+            phemexResponse: result.payload
+          });
+          setExchangeRequestState("error");
+          return;
+        }
+        setOrders((current) =>
+          current.map((item) =>
+            item.id === orderId
+              ? {
+                  ...item,
+                  phemexOrderId: result.orderID || item.phemexOrderId,
+                  phemexClOrdId: result.clOrdID || item.phemexClOrdId
+                }
+              : item
+          )
+        );
+        setMessage(t.phemexOrderAmended(orderId));
+        setMessageKind("custom");
+        setExchangeRequestState("idle");
+        if (order.takeProfit !== undefined || order.stopLoss !== undefined) {
+          showExchangeDebug("Phemex TP/SL Debug", "Phemex Amend wurde gesendet. Prüfe unten, ob Phemex TP/SL in der Antwort bestätigt.", {
+            sent: {
+              orderID: order.phemexOrderId,
+              clOrdID: order.phemexClOrdId,
+              entry: order.entry,
+              takeProfit: order.takeProfit,
+              stopLoss: order.stopLoss
+            },
+            request: result.request,
+            phemexResponse: {
+              code: result.payload?.code,
+              msg: result.payload?.msg,
+              bizError: result.payload?.data?.bizError,
+              execStatus: result.payload?.data?.execStatus,
+              orderID: result.payload?.data?.orderID,
+              takeProfitRp: result.payload?.data?.takeProfitRp,
+              stopLossRp: result.payload?.data?.stopLossRp,
+              tpPxRp: result.payload?.data?.tpPxRp,
+              slPxRp: result.payload?.data?.slPxRp
+            }
+          });
+        }
+        await delay(900);
+        await syncPhemexOpenOrders(activePhemexSettings).catch(() => undefined);
+        return;
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : undefined;
+        showExchangeDebug("Phemex Änderung", t.phemexOrderAmendFailed(reason), {
+          reason,
+          symbol: activePhemexSettings.symbol,
+          orderID: order.phemexOrderId,
+          clOrdID: order.phemexClOrdId,
+          quantity: order.quantity,
+          entry: order.entry,
+          sentTakeProfit: order.takeProfit,
+          sentStopLoss: order.stopLoss,
+          testnet: activePhemexSettings.testnet
+        });
+        setExchangeRequestState("error");
+        return;
+      }
+    }
     setMessage(t.protectionUpdated(orderId));
   };
+
+  const requestProtectionConfirm = (orderId: string) => {
+    const order = ordersRef.current.find((item) => item.id === orderId);
+    if (!order) return;
+    const original = protectionEditOriginalsRef.current[orderId] ?? {
+      entry: order.entry,
+      takeProfit: order.takeProfit,
+      stopLoss: order.stopLoss
+    };
+    const chartRect = chartElement.current?.getBoundingClientRect();
+    setProtectionConfirm({
+      orderId,
+      x: chartRect ? Math.max(12, chartRect.width - 292) : 24,
+      y: chartRect ? Math.max(12, Math.min(120, chartRect.height - 116)) : 24,
+      originalEntry: original.entry,
+      originalTakeProfit: original.takeProfit,
+      originalStopLoss: original.stopLoss
+    });
+  };
+
+  const sendProtectionConfirm = () => {
+    if (!protectionConfirm) return;
+    const orderId = protectionConfirm.orderId;
+    setProtectionConfirm(null);
+    delete protectionEditOriginalsRef.current[orderId];
+    if (isLiveRunning) {
+      setPendingProtectionSyncIds((current) => current.includes(orderId) ? current : [...current, orderId]);
+      return;
+    }
+    void confirmOrderProtection(orderId);
+  };
+
+  const cancelProtectionConfirm = () => {
+    if (!protectionConfirm) return;
+    const confirm = protectionConfirm;
+    setProtectionConfirm(null);
+    setOrders((current) =>
+      current.map((order) =>
+        order.id === confirm.orderId
+          ? { ...order, entry: confirm.originalEntry, takeProfit: confirm.originalTakeProfit, stopLoss: confirm.originalStopLoss }
+          : order
+      )
+    );
+    delete protectionEditOriginalsRef.current[confirm.orderId];
+    setMessage(t.protectionUpdated(confirm.orderId));
+  };
+
+  useEffect(() => {
+    if (!pendingProtectionSyncIds.length || !isLiveRunning) return;
+    const ids = pendingProtectionSyncIds;
+    setPendingProtectionSyncIds([]);
+    ids.forEach((orderId) => {
+      void confirmOrderProtection(orderId);
+    });
+  }, [pendingProtectionSyncIds, isLiveRunning, orders]);
 
   const addOrderProtection = (orderId: string, field: "takeProfit" | "stopLoss") => {
     setOrders((current) =>
@@ -1430,6 +2588,7 @@ function TradingApp() {
     event.preventDefault();
     event.stopPropagation();
     draggedChipRef.current = { orderId, field };
+    rememberProtectionBeforeDrag(orderId, field);
     chartRef.current?.applyOptions({
       handleScale: {
         axisPressedMouseMove: {
@@ -1700,6 +2859,516 @@ function TradingApp() {
     setChartTheme((current) => ({ ...current, [key]: value }));
   };
 
+  const updatePhemexSetting = (key: keyof PhemexSettings, value: string | boolean) => {
+    setPhemexSettings((current) => ({ ...current, [key]: value }));
+    if (isLiveRunning && key === "liveOrdersEnabled") {
+      setActivePhemexSettings((current) => ({ ...current, liveOrdersEnabled: Boolean(value) }));
+    }
+  };
+
+  const jumpChartToLatest = useCallback((totalCandles?: number) => {
+    const setLatestRange = () => {
+      const timeScale = chartRef.current?.timeScale();
+      const lastLogical = Math.max(0, (totalCandles ?? visibleCount) - 1);
+      timeScale?.scrollToRealTime();
+      timeScale?.setVisibleLogicalRange({
+        from: Math.max(0, lastLogical - 60) as Logical,
+        to: (lastLogical + 4) as Logical
+      });
+      scheduleOverlayRefresh(true);
+    };
+    setLatestRange();
+    window.requestAnimationFrame(() => {
+      setLatestRange();
+      window.requestAnimationFrame(setLatestRange);
+    });
+    window.setTimeout(setLatestRange, 80);
+    window.setTimeout(setLatestRange, 180);
+    window.setTimeout(setLatestRange, 320);
+  }, [scheduleOverlayRefresh, visibleCount]);
+
+  const savePhemexSettings = async () => {
+    try {
+      const response = await fetch("/api/phemex-settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ...phemexSettings,
+          apiKey: phemexSettings.apiKey === "********" ? "" : phemexSettings.apiKey,
+          apiSecret: phemexSettings.apiSecret === "********" ? "" : phemexSettings.apiSecret
+        })
+      });
+      if (!response.ok) throw new Error("Save failed");
+      setMessage(t.apiSaved);
+    } catch {
+      setMessage(t.apiSaveFailed);
+    }
+  };
+
+  const loadPhemexBalance = useCallback(async (settingsOverride?: PhemexSettings) => {
+    const settings = settingsOverride ?? activePhemexSettings;
+    try {
+      const response = await fetch("/api/phemex-balance", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          symbol: settings.symbol,
+          testnet: settings.testnet
+        })
+      });
+      const result = await response.json();
+      const balance = Number(result.accountBalance);
+      if (!response.ok || !result.ok || !Number.isFinite(balance)) throw new Error("Phemex balance failed");
+      setFuturesBalance(balance);
+    } catch {
+      setFuturesBalance(null);
+    }
+  }, [activePhemexSettings.symbol, activePhemexSettings.testnet]);
+
+  useEffect(() => {
+    if (!activePhemexSettings.apiKey || !activePhemexSettings.apiSecret) return;
+    loadPhemexBalance();
+  }, [loadPhemexBalance, activePhemexSettings.apiKey, activePhemexSettings.apiSecret]);
+
+  const syncPhemexPositionStatus = useCallback(async (settingsOverride?: PhemexSettings) => {
+    const settings = settingsOverride ?? activePhemexSettings;
+    const response = await fetch("/api/phemex-balance", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        symbol: settings.symbol,
+        testnet: settings.testnet
+      })
+    });
+    const result = await response.json();
+    const balance = Number(result.accountBalance);
+    if (response.ok && result.ok && Number.isFinite(balance)) {
+      setFuturesBalance(balance);
+    }
+    if (!response.ok || !result.ok) {
+      throw new Error(result.message || "Phemex positions failed");
+    }
+
+    const positions = Array.isArray(result.payload?.data?.positions) ? result.payload.data.positions : [];
+    const livePosition = positions.find((position: Record<string, unknown>) => Math.abs(phemexPositionSize(position)) > 0) as Record<string, unknown> | undefined;
+    if (!livePosition) {
+      let removedCount = 0;
+      setOrders((current) =>
+        current.filter((order) => {
+          if (order.status !== "pending" || (!order.phemexOrderId && !order.phemexClOrdId)) return true;
+          const keys = [order.id, order.phemexOrderId, order.phemexClOrdId].filter(Boolean) as string[];
+          const isStillOpen = keys.some((key) => openPhemexOrderKeysRef.current.has(key));
+          if (!isStillOpen) removedCount += 1;
+          return isStillOpen;
+        })
+      );
+      if (removedCount > 0) {
+        setMessage(`${removedCount} extern gelöschte Phemex-Order entfernt.`);
+        setMessageKind("custom");
+      }
+      return false;
+    }
+    const positionSize = Math.abs(phemexPositionSize(livePosition));
+    const positionEntry = numberFrom(livePosition.avgEntryPriceRp ?? livePosition.avgEntryPrice);
+    const positionSide: Side = String(livePosition.side || "").toLowerCase() === "sell" ? "sell" : "buy";
+
+    setOrders((current) =>
+      current.map((order) => {
+        if (order.status !== "pending" || (!order.phemexOrderId && !order.phemexClOrdId)) return order;
+        const keys = [order.id, order.phemexOrderId, order.phemexClOrdId].filter(Boolean) as string[];
+        const isStillOpen = keys.some((key) => openPhemexOrderKeysRef.current.has(key));
+        return isStillOpen
+          ? order
+          : {
+              ...order,
+              status: "active" as OrderStatus,
+              side: positionSide,
+              quantity: positionSize || order.quantity,
+              entry: positionEntry ?? order.entry
+            };
+      })
+    );
+    return true;
+  }, [activePhemexSettings]);
+
+  const syncPhemexOpenOrders = useCallback(async (settingsOverride?: PhemexSettings, silent = false) => {
+    const settings = settingsOverride ?? activePhemexSettings;
+    const fallbackTime = lastCandle?.time ?? visibleCandles.at(-1)?.time;
+    if (!fallbackTime) return 0;
+    const response = await fetch("/api/phemex-open-orders", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        symbol: settings.symbol,
+        testnet: settings.testnet
+      })
+    });
+    const result = await response.json();
+    if (!response.ok || !result.ok || !Array.isArray(result.rows)) {
+      throw new Error(result.message || "Phemex open orders failed");
+    }
+    const importedOrders = result.rows
+      .map((row: PhemexOpenOrderRow) => phemexOrderToTradeOrder(row, fallbackTime))
+      .filter(Boolean)
+      .filter((order: TradeOrder) => {
+        const keys = [order.id, order.phemexOrderId, order.phemexClOrdId].filter(Boolean) as string[];
+        return !keys.some((key) => canceledPhemexOrderKeysRef.current.has(key));
+      }) as TradeOrder[];
+    openPhemexOrderKeysRef.current = new Set(
+      importedOrders.flatMap((order) =>
+        [order.id, order.phemexOrderId, order.phemexClOrdId].filter(Boolean) as string[]
+      )
+    );
+    setOrders((current) => {
+      const openLocal = current.filter((order) => order.status === "pending" || order.status === "active");
+      const closedLocal = current.filter((order) => order.status !== "pending" && order.status !== "active");
+      const importedKeys = new Set(
+        importedOrders.flatMap((order) =>
+          [order.id, order.phemexOrderId, order.phemexClOrdId].filter(Boolean) as string[]
+        )
+      );
+      const keptLocal = openLocal.filter((order) => {
+        const keys = [order.id, order.phemexOrderId, order.phemexClOrdId].filter(Boolean) as string[];
+        return !keys.some((key) => importedKeys.has(key));
+      });
+      return [...importedOrders, ...keptLocal, ...closedLocal];
+    });
+    if (!silent) {
+      setMessage(t.phemexOrdersSynced(importedOrders.length));
+      setMessageKind("custom");
+    }
+    return importedOrders.length;
+  }, [activePhemexSettings, lastCandle?.time, t, visibleCandles]);
+
+  const syncPhemexOrderStatusThrottled = useCallback(async (settingsOverride?: PhemexSettings, force = false) => {
+    const settings = settingsOverride ?? activePhemexSettings;
+    const now = Date.now();
+    const minIntervalMs = pollMsFromSettings(settings);
+    if (!force && now - lastPhemexOrderStatusSyncAtRef.current < minIntervalMs) return;
+    lastPhemexOrderStatusSyncAtRef.current = now;
+    await syncPhemexOpenOrders(settings, true);
+    await syncPhemexPositionStatus(settings);
+  }, [activePhemexSettings, syncPhemexOpenOrders, syncPhemexPositionStatus]);
+
+  const syncPhemexExchangeState = useCallback(async (settingsOverride?: PhemexSettings) => {
+    const settings = settingsOverride ?? (isLiveRunning ? activePhemexSettings : phemexSettings);
+    setExchangeRequestState("loading");
+    try {
+      lastPhemexOrderStatusSyncAtRef.current = Date.now();
+      await syncPhemexOpenOrders(settings, true);
+      await syncPhemexPositionStatus(settings);
+      setExchangeRequestState("idle");
+      setMessage(t.syncExchangeDone);
+      setMessageKind("custom");
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : t.syncExchangeFailed;
+      setExchangeRequestState("error");
+      showExchangeDebug("Phemex Abgleich", reason, {
+        symbol: settings.symbol,
+        testnet: settings.testnet
+      });
+    }
+  }, [
+    activePhemexSettings,
+    isLiveRunning,
+    phemexSettings,
+    syncPhemexOpenOrders,
+    syncPhemexPositionStatus,
+    t.syncExchangeDone,
+    t.syncExchangeFailed
+  ]);
+
+  const testPhemexConnection = async () => {
+    setExchangeRequestState("loading");
+    try {
+      const response = await fetch("/api/phemex-price", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          symbol: phemexSettings.symbol,
+          testnet: phemexSettings.testnet
+        })
+      });
+      const result = await response.json();
+      const price = Number(result.price);
+      if (!response.ok || !result.ok || !Number.isFinite(price)) throw new Error("Phemex test failed");
+
+      setLiveLastPrice(price);
+      setLiveLastFetchAt(Date.now());
+      loadPhemexBalance();
+      setExchangeRequestState("idle");
+      setMessage(t.connectionOk(result.symbol || phemexSettings.symbol, formatPrice(price)));
+      setMessageKind("custom");
+    } catch {
+      setExchangeRequestState("error");
+      showExchangeDebug("Phemex Verbindung", t.connectionFailed, {
+        symbol: phemexSettings.symbol,
+        testnet: phemexSettings.testnet
+      });
+    }
+  };
+
+  const loadPhemexChart = async (settingsOverride?: PhemexSettings) => {
+    setExchangeRequestState("loading");
+    const settings = settingsOverride ?? (isLiveRunning ? activePhemexSettings : phemexSettings);
+    try {
+      const response = await fetch("/api/phemex-chart", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          symbol: settings.symbol,
+          resolution: Number(settings.resolution || 300),
+          limit: Number(settings.limit || 500),
+          testnet: settings.testnet
+        })
+      });
+      const result = await response.json();
+      if (!response.ok || !result.ok || typeof result.csv !== "string") throw new Error("Phemex chart failed");
+
+      const candles = parseCsvTextCandles(result.csv);
+      if (!candles.length) throw new Error("Phemex CSV invalid");
+
+      setAllCandles(candles);
+      setVisibleCount(Math.min(60, candles.length));
+      shouldFitContentRef.current = !shouldJumpToLatestRef.current;
+      shouldFitPriceRef.current = true;
+      setOrders([]);
+      setIsPlaying(false);
+      setMessage(t.phemexChartLoaded(candles.length, result.path));
+      setMessageKind("custom");
+      setExchangeRequestState("idle");
+      return candles.length;
+    } catch {
+      showExchangeDebug("Phemex Chart", t.phemexChartFailed, {
+        symbol: settings.symbol,
+        resolution: settings.resolution,
+        limit: settings.limit,
+        testnet: settings.testnet
+      });
+      setExchangeRequestState("error");
+      return false;
+    }
+  };
+
+  const startLiveMode = async () => {
+    shouldJumpToLatestRef.current = true;
+    setActivePhemexSettings(phemexSettings);
+    const loadedCount = await loadPhemexChart(phemexSettings);
+    if (!loadedCount) {
+      shouldJumpToLatestRef.current = false;
+      return;
+    }
+    setIsPlaying(false);
+    setIsLiveRunning(true);
+    setVisibleCount(loadedCount);
+    setLiveLastPrice(null);
+    setLiveLastFetchAt(null);
+    loadPhemexBalance(phemexSettings);
+    syncPhemexOpenOrders(phemexSettings).catch((error) => {
+      const reason = error instanceof Error ? error.message : "Phemex open orders failed";
+      showExchangeDebug("Phemex Open Orders", reason, {
+        symbol: phemexSettings.symbol,
+        testnet: phemexSettings.testnet
+      });
+    });
+    syncPhemexPositionStatus(phemexSettings).catch(() => undefined);
+    lastPhemexOrderStatusSyncAtRef.current = Date.now();
+    const pollMs = pollMsFromSettings(phemexSettings);
+    setLiveNextFetchAt(Date.now() + pollMs);
+    jumpChartToLatest(loadedCount);
+    setShowChartOptions(false);
+  };
+
+  const stopLiveMode = () => {
+    setIsLiveRunning(false);
+    setLiveNextFetchAt(null);
+    setLiveCountdownSeconds(null);
+    setExchangeRequestState("idle");
+    setOrders((current) => current.filter((order) => !order.phemexOrderId && !order.phemexClOrdId));
+  };
+
+  const applyExchangeSettings = async () => {
+    setExchangeRequestState("loading");
+    setMessage(t.settingsApplied(phemexSettings.symbol, timeframeFromResolution(phemexSettings.resolution)));
+    setMessageKind("custom");
+    setActivePhemexSettings(phemexSettings);
+    if (isLiveRunning) {
+      const pollMs = pollMsFromSettings(phemexSettings);
+      setLiveNextFetchAt(Date.now() + pollMs);
+      shouldJumpToLatestRef.current = true;
+      const loadedCount = await loadPhemexChart(phemexSettings);
+      if (loadedCount) {
+        setVisibleCount(loadedCount);
+        jumpChartToLatest(loadedCount);
+      }
+      setLiveSettingsVersion((version) => version + 1);
+      await Promise.allSettled([loadPhemexBalance(phemexSettings), refreshLivePhemexPrice(phemexSettings)]);
+      await syncPhemexOpenOrders(phemexSettings).catch((error) => {
+        const reason = error instanceof Error ? error.message : "Phemex open orders failed";
+        showExchangeDebug("Phemex Open Orders", reason, {
+          symbol: phemexSettings.symbol,
+          testnet: phemexSettings.testnet
+        });
+      });
+      await syncPhemexPositionStatus(phemexSettings).catch(() => undefined);
+      lastPhemexOrderStatusSyncAtRef.current = Date.now();
+    } else {
+      await loadPhemexBalance(phemexSettings);
+    }
+    setExchangeRequestState("idle");
+  };
+
+  const changeMarketTimeframe = async (resolution: string) => {
+    const nextSettings = { ...phemexSettings, resolution };
+    setPhemexSettings(nextSettings);
+    setActivePhemexSettings(nextSettings);
+    setMessage(t.settingsApplied(nextSettings.symbol, timeframeFromResolution(nextSettings.resolution)));
+    setMessageKind("custom");
+
+    if (!isLiveRunning) return;
+
+    const pollMs = pollMsFromSettings(nextSettings);
+    setLiveNextFetchAt(Date.now() + pollMs);
+    shouldJumpToLatestRef.current = true;
+    const loadedCount = await loadPhemexChart(nextSettings);
+    if (loadedCount) {
+      setVisibleCount(loadedCount);
+      jumpChartToLatest(loadedCount);
+    }
+    setLiveSettingsVersion((version) => version + 1);
+    await Promise.allSettled([loadPhemexBalance(nextSettings), refreshLivePhemexPrice(nextSettings)]);
+    await syncPhemexOrderStatusThrottled(nextSettings, true).catch(() => undefined);
+  };
+
+  const changeMarketSymbol = async (symbol: string) => {
+    const nextSettings = { ...phemexSettings, symbol };
+    setPhemexSettings(nextSettings);
+    setActivePhemexSettings(nextSettings);
+    setMessage(t.settingsApplied(nextSettings.symbol, timeframeFromResolution(nextSettings.resolution)));
+    setMessageKind("custom");
+
+    if (!isLiveRunning) return;
+
+    const pollMs = pollMsFromSettings(nextSettings);
+    setLiveNextFetchAt(Date.now() + pollMs);
+    shouldJumpToLatestRef.current = true;
+    const loadedCount = await loadPhemexChart(nextSettings);
+    if (loadedCount) {
+      setVisibleCount(loadedCount);
+      jumpChartToLatest(loadedCount);
+    }
+    setLiveSettingsVersion((version) => version + 1);
+    await Promise.allSettled([loadPhemexBalance(nextSettings), refreshLivePhemexPrice(nextSettings)]);
+    await syncPhemexOrderStatusThrottled(nextSettings, true).catch(() => undefined);
+  };
+
+  const refreshLivePhemexPrice = useCallback(async (settingsOverride?: PhemexSettings) => {
+    const settings = settingsOverride ?? activePhemexSettings;
+    const now = Date.now();
+    if (livePriceBackoffUntilRef.current > now) {
+      setLiveNextFetchAt(livePriceBackoffUntilRef.current);
+      setLiveCountdownSeconds(Math.max(0, Math.ceil((livePriceBackoffUntilRef.current - now) / 1000)));
+      return;
+    }
+    let failureDetails: unknown = {
+      symbol: settings.symbol,
+      testnet: settings.testnet
+    };
+    let failureMessage = "Phemex Live-Preis konnte nicht geladen werden.";
+    try {
+      const response = await fetch("/api/phemex-price", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          symbol: settings.symbol,
+          testnet: settings.testnet
+        })
+      });
+      const result = await response.json();
+      const price = Number(result.price);
+      if (!response.ok || !result.ok || !Number.isFinite(price)) {
+        failureMessage = result.message || failureMessage;
+        failureDetails = {
+          symbol: settings.symbol,
+          testnet: settings.testnet,
+          status: result.status,
+          payload: result.payload
+        };
+        throw new Error(failureMessage);
+      }
+
+      const resolutionSeconds = Number(settings.resolution || 300);
+      const timestampMs = Number(result.timestampMs || Date.now());
+      const nextFetchAt = Date.now() + pollMsFromSettings(settings);
+      setAllCandles((current) => {
+        const next = upsertLiveCandle(current, price, timestampMs, resolutionSeconds);
+        setVisibleCount((count) => Math.max(count, next.length));
+        return next;
+      });
+      setLiveLastPrice(price);
+      setLiveLastFetchAt(Date.now());
+      setLiveNextFetchAt(nextFetchAt);
+      setLiveCountdownSeconds(Math.max(0, Math.ceil((nextFetchAt - Date.now()) / 1000)));
+      setMessage(t.livePriceUpdated(formatPrice(price)));
+      setMessageKind("custom");
+      livePriceBackoffUntilRef.current = 0;
+      await syncPhemexOrderStatusThrottled(settings).catch(() => undefined);
+      setExchangeRequestState("idle");
+    } catch {
+      const status = typeof failureDetails === "object" && failureDetails && "status" in failureDetails ? Number((failureDetails as { status?: unknown }).status) : undefined;
+      const isBlocked = status === 403 || status === 429;
+      const nextFetchAt = Date.now() + (isBlocked ? 60_000 : pollMsFromSettings(settings));
+      if (isBlocked) livePriceBackoffUntilRef.current = nextFetchAt;
+      setLiveNextFetchAt(nextFetchAt);
+      setLiveCountdownSeconds(Math.max(0, Math.ceil((nextFetchAt - Date.now()) / 1000)));
+      if (Date.now() - lastLivePriceErrorPopupAtRef.current > 60_000) {
+        lastLivePriceErrorPopupAtRef.current = Date.now();
+        showExchangeDebug("Phemex Live-Preis", failureMessage, failureDetails);
+      } else {
+        setMessage(`${failureMessage} Nächster Versuch läuft automatisch.`);
+        setMessageKind("custom");
+      }
+      setExchangeRequestState("error");
+    }
+  }, [
+    activePhemexSettings,
+    syncPhemexOrderStatusThrottled,
+    t
+  ]);
+
+  useEffect(() => {
+    refreshLivePhemexPriceRef.current = refreshLivePhemexPrice;
+  }, [refreshLivePhemexPrice]);
+
+  useEffect(() => {
+    if (activePhemexSettings.mode !== "live") stopLiveMode();
+  }, [activePhemexSettings.mode]);
+
+  useEffect(() => {
+    if (!isLiveRunning || activePhemexSettings.mode !== "live") return;
+    const pollMs = pollMsFromSettings(activePhemexSettings);
+    setLiveNextFetchAt(Date.now() + pollMs);
+    const runRefresh = () => {
+      void refreshLivePhemexPriceRef.current(activePhemexSettings);
+    };
+    runRefresh();
+    const timer = window.setInterval(runRefresh, pollMs);
+    return () => window.clearInterval(timer);
+  }, [activePhemexSettings, isLiveRunning, liveSettingsVersion]);
+
+  useEffect(() => {
+    if (!liveNextFetchAt || !showLiveStatus) {
+      setLiveCountdownSeconds(null);
+      return;
+    }
+    const updateCountdown = () => {
+      setLiveCountdownSeconds(Math.max(0, Math.ceil((liveNextFetchAt - Date.now()) / 1000)));
+    };
+    updateCountdown();
+    const timer = window.setInterval(updateCountdown, 1000);
+    return () => window.clearInterval(timer);
+  }, [showLiveStatus, liveNextFetchAt]);
+
   const toggleTheme = (key: keyof ChartTheme) => {
     setChartTheme((current) => {
       const value = current[key];
@@ -1744,25 +3413,137 @@ function TradingApp() {
   return (
     <main className="app-shell">
       <section className="topbar">
-        <div>
+        <div className="topbar-title">
           <h1>{t.appTitle}</h1>
           <p>{message}</p>
         </div>
-        <label className="file-button">
-          <FileUp size={18} />
-          {t.csvLoad}
-          <input type="file" accept=".csv,text/csv" onChange={(event) => handleCsv(event.target.files?.[0])} />
-        </label>
+        <div className="topbar-actions">
+          <button
+            type="button"
+            className="topbar-button"
+            onClick={() => {
+              setSettingsTab("phemex");
+              setShowChartOptions(true);
+            }}
+          >
+            <BookOpen size={18} />
+            {t.exchange}
+          </button>
+          <label className="file-button">
+            <FileUp size={18} />
+            {t.csvLoad}
+            <input type="file" accept=".csv,text/csv" onChange={(event) => handleCsv(event.target.files?.[0])} />
+          </label>
+        </div>
       </section>
+      {exchangeDebugPopup && (
+        <div className="exchange-debug-backdrop" onClick={() => setExchangeDebugPopup(null)}>
+          <div className="exchange-debug-popup" onClick={(event) => event.stopPropagation()}>
+            <div className="exchange-debug-title">
+              <strong>{exchangeDebugPopup.title}</strong>
+              <button className="small" onClick={() => setExchangeDebugPopup(null)}>×</button>
+            </div>
+            <p>{exchangeDebugPopup.message}</p>
+            {exchangeDebugPopup.details && <pre>{exchangeDebugPopup.details}</pre>}
+            <button className="small primary" onClick={() => setExchangeDebugPopup(null)}>OK</button>
+          </div>
+        </div>
+      )}
+      {orderbookConfirm && (
+        <div className="exchange-debug-backdrop" onClick={() => setOrderbookConfirm(null)}>
+          <div className="exchange-debug-popup" onClick={(event) => event.stopPropagation()}>
+            <div className="exchange-debug-title">
+              <strong>{orderbookConfirm.title}</strong>
+              <button className="small" onClick={() => setOrderbookConfirm(null)}>×</button>
+            </div>
+            <p>{orderbookConfirm.message}</p>
+            <div className="confirm-actions">
+              <button className="small" onClick={() => setOrderbookConfirm(null)}>Abbrechen</button>
+              <button className="small danger" onClick={confirmClearOrderbook}>Orderbook leeren</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showLiveStatus && (
+        <section className="live-status-bar">
+          {showPhemexConnected && (
+            <span className="phemex-status-mark" title="Phemex verbunden">
+              <i>PX</i>
+              <em>Phemex</em>
+            </span>
+          )}
+          <span><strong>{t.chartLoaded}</strong><em>{activePhemexSettings.symbol} {timeframeFromResolution(activePhemexSettings.resolution)}</em></span>
+          <span><strong>{t.liveModeLabel}</strong><em>Active</em></span>
+          <span><strong>{t.accountBalance}</strong><em>{futuresBalance === null ? "-" : `${futuresBalance.toFixed(2)} USDT`}</em></span>
+          <span><strong>{t.timeCounter}</strong><em>{liveCountdownSeconds !== null ? `${liveCountdownSeconds}s` : "-"}</em></span>
+          <button className="small sync-button" onClick={() => syncPhemexExchangeState()} disabled={isExchangeBusy}>
+            {t.syncExchange}
+          </button>
+        </section>
+      )}
 
       <section className="workspace">
-        <div className="chart-zone">
+        <div className={showLiveStatus ? "chart-zone live-mode" : "chart-zone"}>
           <div className="market-strip">
-            <span>{t.candles} {visibleCount}/{allCandles.length}</span>
-            <strong>{t.last} {formatPrice(lastCandle?.close)}</strong>
-            <span>{t.high} {formatPrice(lastCandle?.high)}</span>
-            <span>{t.low} {formatPrice(lastCandle?.low)}</span>
-            <div className="chart-options">
+          {showLiveStatus ? (
+            <div className="market-favorite-dropdown">
+              <button
+                className="market-favorite-trigger"
+                onClick={() => setIsMarketFavoritesOpen((value) => !value)}
+                type="button"
+              >
+                <span>★</span>
+                {activePhemexSettings.symbol}
+                <small>Favoriten</small>
+              </button>
+              {isMarketFavoritesOpen && (
+                <div className="market-favorite-menu">
+              {favoriteCoinOptions.length ? (
+                favoriteCoinOptions.map((symbol) => (
+                  <button
+                    key={symbol}
+                    className={symbol === activePhemexSettings.symbol ? "active" : ""}
+                    onClick={() => {
+                      setIsMarketFavoritesOpen(false);
+                      void changeMarketSymbol(symbol);
+                    }}
+                    type="button"
+                  >
+                    <span>★</span>
+                    {symbol}
+                  </button>
+                ))
+              ) : (
+                <div className="market-empty-favorites">Keine Token-Favoriten</div>
+              )}
+                </div>
+              )}
+            </div>
+          ) : (
+            <>
+              <span>{t.candles} {visibleCount}/{allCandles.length}</span>
+              <strong>{t.last} {formatPrice(lastCandle?.close)}</strong>
+              <span>{t.high} {formatPrice(lastCandle?.high)}</span>
+              <span>{t.low} {formatPrice(lastCandle?.low)}</span>
+            </>
+          )}
+          <select
+            className="market-timeframe-select"
+            value={(isLiveRunning ? activePhemexSettings : phemexSettings).resolution}
+            onChange={(event) => {
+              void changeMarketTimeframe(event.target.value);
+            }}
+            title={t.timeframe}
+          >
+            <option value="60">1m</option>
+            <option value="300">5m</option>
+            <option value="900">15m</option>
+            <option value="1800">30m</option>
+            <option value="3600">1h</option>
+            <option value="14400">4h</option>
+          </select>
+          <div className="chart-options">
               <button
                 className={autoScalePrice ? "toggle active" : "toggle"}
                 onClick={() => setAutoScalePrice((value) => !value)}
@@ -2106,6 +3887,7 @@ function TradingApp() {
                   <button className={settingsTab === "chart" ? "tab active" : "tab"} onClick={() => setSettingsTab("chart")}>{t.chart}</button>
                   <button className={settingsTab === "orders" ? "tab active" : "tab"} onClick={() => setSettingsTab("orders")}>{t.orders}</button>
                   <button className={settingsTab === "drawings" ? "tab active" : "tab"} onClick={() => setSettingsTab("drawings")}>{t.drawings}</button>
+                  <button className={settingsTab === "phemex" ? "tab active" : "tab"} onClick={() => setSettingsTab("phemex")}>{t.exchange}</button>
                   <button className={settingsTab === "language" ? "tab active" : "tab"} onClick={() => setSettingsTab("language")}>{t.language}</button>
                 </div>
 
@@ -2174,6 +3956,179 @@ function TradingApp() {
                   </div>
                 )}
 
+                {settingsTab === "phemex" && (
+                  <div className="style-section">
+                    <div className="style-section-title">{t.phemexConnection}</div>
+                    <div className="exchange-subsection">
+                      <div className="subsection-title">{t.connectionSection}</div>
+                      <div className="api-settings-grid">
+                        <label>
+                          {t.apiKey}
+                          <input
+                            type="password"
+                            value={phemexSettings.apiKey}
+                            onChange={(event) => updatePhemexSetting("apiKey", event.target.value)}
+                            autoComplete="off"
+                          />
+                        </label>
+                        <label>
+                          {t.apiSecret}
+                          <input
+                            type="password"
+                            value={phemexSettings.apiSecret}
+                            onChange={(event) => updatePhemexSetting("apiSecret", event.target.value)}
+                            autoComplete="off"
+                          />
+                        </label>
+                      </div>
+                      <div className="api-actions connection-actions">
+                        <button className="small" onClick={savePhemexSettings} disabled={isExchangeBusy}>{t.saveApiSettings}</button>
+                        <button className="small" onClick={testPhemexConnection} disabled={isExchangeBusy}>{t.testConnection}</button>
+                      </div>
+                      <div className="style-switches compact">
+                        <button className={phemexSettings.testnet ? "switch active" : "switch"} onClick={() => updatePhemexSetting("testnet", true)}>{t.testnet}</button>
+                        <button className={!phemexSettings.testnet ? "switch active" : "switch"} onClick={() => updatePhemexSetting("testnet", false)}>{t.mainnet}</button>
+                      </div>
+                      <label className={phemexSettings.testnet ? "checkbox-row muted" : "checkbox-row warning"}>
+                        <input
+                          type="checkbox"
+                          checked={phemexSettings.allowMainnetOrders}
+                          onChange={(event) => updatePhemexSetting("allowMainnetOrders", event.target.checked)}
+                          disabled={phemexSettings.testnet}
+                        />
+                        <span>
+                          <strong>{t.allowMainnetOrders}</strong>
+                          <small>{t.allowMainnetOrdersHint}</small>
+                        </span>
+                      </label>
+                    </div>
+                    <div className="exchange-subsection">
+                      <div className="subsection-title">{t.dataModeSection}</div>
+                      <div className="api-settings-grid">
+                        <label>
+                          {t.symbol}
+                          <div className="coin-dropdown">
+                            <button
+                              type="button"
+                              className="coin-dropdown-trigger"
+                              onClick={() => setIsCoinDropdownOpen((value) => !value)}
+                            >
+                              <span>{phemexSettings.symbol}</span>
+                              <small>{coinFavorites.includes(phemexSettings.symbol) ? "★" : "☆"}</small>
+                            </button>
+                            {isCoinDropdownOpen && (
+                              <div className="coin-dropdown-menu">
+                                {coinOptions.includes(phemexSettings.symbol) ? null : (
+                                  <button
+                                    type="button"
+                                    className="coin-option selected"
+                                    onClick={() => setIsCoinDropdownOpen(false)}
+                                  >
+                                    <span>{phemexSettings.symbol}</span>
+                                    <small>☆</small>
+                                  </button>
+                                )}
+                                {sortedCoinOptions.map((symbol) => {
+                                  const isFavorite = coinFavorites.includes(symbol);
+                                  return (
+                                    <button
+                                      type="button"
+                                      className={symbol === phemexSettings.symbol ? "coin-option selected" : "coin-option"}
+                                      key={symbol}
+                                      onClick={() => {
+                                        updatePhemexSetting("symbol", symbol);
+                                        setIsCoinDropdownOpen(false);
+                                      }}
+                                    >
+                                      <span>{symbol}</span>
+                                      <small
+                                        aria-label={`${symbol} Favorit`}
+                                        onClick={(event) => {
+                                          event.stopPropagation();
+                                          toggleCoinFavorite(symbol);
+                                        }}
+                                      >
+                                        {isFavorite ? "★" : "☆"}
+                                      </small>
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                            )}
+                          </div>
+                        </label>
+                        <label>
+                          {t.exchangeMode}
+                          <select
+                            value={phemexSettings.mode}
+                            onChange={(event) => updatePhemexSetting("mode", event.target.value as "replay" | "live")}
+                          >
+                            <option value="replay">{t.replayMode}</option>
+                            <option value="live">{t.liveMode}</option>
+                          </select>
+                        </label>
+                        <label>
+                          {t.timeframe}
+                          <select
+                            value={phemexSettings.resolution}
+                            onChange={(event) => updatePhemexSetting("resolution", event.target.value)}
+                          >
+                            <option value="60">1m</option>
+                            <option value="300">5m</option>
+                            <option value="900">15m</option>
+                            <option value="1800">30m</option>
+                            <option value="3600">1h</option>
+                            <option value="14400">4h</option>
+                          </select>
+                        </label>
+                        <label>
+                          {t.candleLimit}
+                          <select
+                            value={phemexSettings.limit}
+                            onChange={(event) => updatePhemexSetting("limit", event.target.value)}
+                          >
+                            <option value="100">100</option>
+                            <option value="500">500</option>
+                            <option value="1000">1000</option>
+                          </select>
+                        </label>
+                        <label>
+                          {t.pollSeconds}
+                          <input
+                            type="number"
+                            min="1"
+                            step="1"
+                            value={phemexSettings.pollSeconds}
+                            onChange={(event) => updatePhemexSetting("pollSeconds", event.target.value)}
+                          />
+                        </label>
+                      </div>
+                    </div>
+                    <div className="exchange-status">
+                      <div className={showLiveStatus ? "status-dot live" : exchangeRequestState === "error" ? "status-dot error" : "status-dot"} />
+                      <div>
+                        <strong>{t.liveStatus}: {exchangeStatusText}</strong>
+                        <span>
+                          {t.lastFetch}: {liveLastFetchAt ? new Date(liveLastFetchAt).toLocaleTimeString() : t.liveWaiting}
+                          {showLiveStatus && liveCountdownSeconds !== null ? ` · ${t.nextFetch}: ${liveCountdownSeconds}s` : ""}
+                        </span>
+                      </div>
+                    </div>
+                    <div className="api-actions-group">
+                      <div className="api-actions data-actions">
+                        <button className="small primary" onClick={applyExchangeSettings} disabled={isExchangeBusy}>{t.applySettings}</button>
+                        <button className="small" onClick={() => syncPhemexExchangeState()} disabled={isExchangeBusy}>{t.syncExchange}</button>
+                        <button className="small primary" onClick={() => loadPhemexChart()} disabled={isExchangeBusy || isLiveRunning}>{t.loadReplayData}</button>
+                        {isLiveRunning ? (
+                          <button className="small danger" onClick={stopLiveMode} disabled={isExchangeBusy}>{t.stopLive}</button>
+                        ) : (
+                          <button className="small primary" onClick={startLiveMode} disabled={phemexSettings.mode !== "live" || isExchangeBusy}>{t.startLive}</button>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                )}
+
                 {settingsTab === "language" && (
                   <div className="style-section">
                     <div className="style-section-title">{t.language}</div>
@@ -2204,80 +4159,227 @@ function TradingApp() {
                 <button onClick={() => useChartPrice("entry")}>{t.useEntry}</button>
                 <button onClick={() => useChartPrice("tp")}>{t.useTp}</button>
                 <button onClick={() => useChartPrice("sl")}>{t.useSl}</button>
-                <button className="buy-action" onClick={() => createOrder("buy", chartMenu.price, { keepInputs: true })}>
-                  {t.buyHere}
-                </button>
-                <button className="sell-action" onClick={() => createOrder("sell", chartMenu.price, { keepInputs: true })}>
-                  {t.sellHere}
-                </button>
+              </div>
+            )}
+            {protectionConfirm && (
+              <div
+                className="protection-confirm"
+                style={{ left: protectionConfirm.x, top: protectionConfirm.y }}
+                onClick={(event) => event.stopPropagation()}
+              >
+                <strong>Änderung an Phemex senden?</strong>
+                <span>{protectionConfirm.orderId}</span>
+                <div>
+                  <button className="small primary" onClick={sendProtectionConfirm}>Senden</button>
+                  <button className="small" onClick={cancelProtectionConfirm}>Abbrechen</button>
+                </div>
               </div>
             )}
           </div>
-          <div className="replay-controls">
-            <button onClick={() => setIsPlaying((value) => !value)}>
-              {isPlaying ? <Pause size={18} /> : <Play size={18} />}
-              {isPlaying ? t.pause : t.play}
-            </button>
-            <button onClick={stepForward} disabled={visibleCount >= allCandles.length}>
-              <SkipForward size={18} />
-              {t.step}
-            </button>
-            <label>
-              {t.replayDelay}
-              <input
-                type="range"
-                min="100"
-                max="2500"
-                step="100"
-                value={speedMs}
-                onChange={(event) => setSpeedMs(Number(event.target.value))}
-              />
-              <span>{speedMs} ms</span>
-            </label>
-            <button onClick={resetReplay}>
-              <RotateCcw size={18} />
-              {t.reset}
-            </button>
-          </div>
+          {!showLiveStatus && (
+            <div className="replay-controls">
+              <button onClick={() => setIsPlaying((value) => !value)}>
+                {isPlaying ? <Pause size={18} /> : <Play size={18} />}
+                {isPlaying ? t.pause : t.play}
+              </button>
+              <button onClick={stepForward} disabled={visibleCount >= allCandles.length}>
+                <SkipForward size={18} />
+                {t.step}
+              </button>
+              <label>
+                {t.replayDelay}
+                <input
+                  type="range"
+                  min="100"
+                  max="2500"
+                  step="100"
+                  value={speedMs}
+                  onChange={(event) => setSpeedMs(Number(event.target.value))}
+                />
+                <span>{speedMs} ms</span>
+              </label>
+              <button onClick={resetReplay}>
+                <RotateCcw size={18} />
+                {t.reset}
+              </button>
+            </div>
+          )}
         </div>
 
         <aside className="side-panel">
-          <div className="panel-block">
-            <div className="panel-title">
-              <Send size={18} />
-              {t.order}
+          {showLiveStatus ? (
+            <div className="panel-block live-order-panel">
+              <div className="live-order-top">
+                <div className="live-order-switch">
+                  <button
+                    className={phemexSettings.marginMode === "cross" ? "active" : ""}
+                    onClick={() => updatePhemexSetting("marginMode", "cross")}
+                  >
+                    {t.cross}
+                  </button>
+                  <button
+                    className={phemexSettings.marginMode === "isolated" ? "active" : ""}
+                    onClick={() => updatePhemexSetting("marginMode", "isolated")}
+                  >
+                    {t.isolated}
+                  </button>
+                </div>
+                <label className="leverage-input">
+                  {t.leverage}
+                  <span>
+                    <input
+                      type="number"
+                      min="1"
+                      max="100"
+                      step="1"
+                      value={phemexSettings.leverage}
+                      onChange={(event) => updatePhemexSetting("leverage", event.target.value)}
+                    />
+                    x
+                  </span>
+                </label>
+              </div>
+
+              <div className="live-order-type">Limit</div>
+
+              <label className="live-field">
+                {t.limitPrice}
+                <div className="live-input-row">
+                  <input
+                    type="number"
+                    value={entry}
+                    placeholder={formatPrice(liveLastPrice ?? lastCandle?.close)}
+                    onChange={(event) => setEntry(event.target.value)}
+                  />
+                  <button type="button" onClick={useLiveLastPrice} title={t.useLastPrice}>{t.lastPrice}</button>
+                  <span>USDT</span>
+                </div>
+              </label>
+
+              <label className="live-field">
+                {t.size}
+                <div className="live-input-row">
+                  <input
+                    type="number"
+                    min="0.01"
+                    step="0.01"
+                    placeholder={`Min 0.01 ${baseAsset}`}
+                    value={quantity}
+                    onChange={(event) => {
+                      setLiveCapitalPercent(0);
+                      setQuantity(Number(event.target.value));
+                    }}
+                  />
+                  <span>{baseAsset}</span>
+                </div>
+              </label>
+
+              <div className="live-protection-grid">
+                <label className="live-field">
+                  {t.takeProfit}
+                  <input
+                    type="number"
+                    value={takeProfit}
+                    placeholder="TP"
+                    onChange={(event) => setTakeProfit(event.target.value)}
+                  />
+                </label>
+                <label className="live-field">
+                  {t.stopLoss}
+                  <input
+                    type="number"
+                    value={stopLoss}
+                    placeholder="SL"
+                    onChange={(event) => setStopLoss(event.target.value)}
+                  />
+                </label>
+              </div>
+
+              <div className="live-size-slider">
+                <input
+                  type="range"
+                  min="0"
+                  max="100"
+                  step="1"
+                  value={Math.min(liveCapitalPercent, 100)}
+                  onChange={(event) => updateLiveCapitalPercent(Number(event.target.value))}
+                />
+                <label className="percent-input" title="Kapital in Prozent frei eingeben">
+                  <input
+                    type="number"
+                    min="0"
+                    step="0.1"
+                    value={liveCapitalPercent}
+                    onChange={(event) => updateLiveCapitalPercent(Number(event.target.value))}
+                  />
+                  <span>%</span>
+                </label>
+              </div>
+
+              <div className="live-available">
+                {t.available}: <strong>{futuresBalance === null ? "0.0000" : futuresBalance.toFixed(4)} USDT</strong>
+              </div>
+
+              <div className="live-order-summary">
+                <span>{t.size}</span>
+                <strong>{Number(quantity || 0).toFixed(4)} {baseAsset}</strong>
+                <span>{t.cost}</span>
+                <strong>
+                  <em>{liveOrderMargin === undefined ? "0.0000" : liveOrderMargin.toFixed(4)}</em>
+                  {" / "}
+                  <b>{liveOrderNotional === undefined ? "0.0000" : liveOrderNotional.toFixed(4)}</b> USDT
+                </strong>
+                <span>{t.estimatedLiquidation}</span>
+                <strong>-- / -- USDT</strong>
+              </div>
+
+              <div className="live-action-row">
+                <button className="live-long" onClick={() => submitOrder("buy")} disabled={isExchangeBusy}>
+                  {t.openLong}
+                </button>
+                <button className="live-short" onClick={() => submitOrder("sell")} disabled={isExchangeBusy}>
+                  {t.openShort}
+                </button>
+              </div>
             </div>
-            <div className="segmented">
-              <button className={side === "buy" ? "active buy" : ""} onClick={() => setSide("buy")}>Buy</button>
-              <button className={side === "sell" ? "active sell" : ""} onClick={() => setSide("sell")}>Sell</button>
+          ) : (
+            <div className="panel-block">
+              <div className="panel-title">
+                <Send size={18} />
+                {t.order}
+              </div>
+              <div className="segmented">
+                <button className={side === "buy" ? "active buy" : ""} onClick={() => setSide("buy")}>Buy</button>
+                <button className={side === "sell" ? "active sell" : ""} onClick={() => setSide("sell")}>Sell</button>
+              </div>
+              <label>
+                {t.quantity}
+                <input type="number" min="0.01" step="0.01" value={quantity} onChange={(event) => setQuantity(Number(event.target.value))} />
+              </label>
+              <label>
+                Entry
+                <input type="number" placeholder={`Market ${formatPrice(lastCandle?.close)}`} value={entry} onChange={(event) => setEntry(event.target.value)} />
+              </label>
+              <label>
+                {t.takeProfit}
+                <input type="number" value={takeProfit} onChange={(event) => setTakeProfit(event.target.value)} />
+              </label>
+              <label>
+                {t.stopLoss}
+                <input type="number" value={stopLoss} onChange={(event) => setStopLoss(event.target.value)} />
+              </label>
+              <button className="submit" onClick={() => submitOrder()}>
+                <Send size={18} />
+                {t.submitOrder}
+              </button>
             </div>
-            <label>
-              {t.quantity}
-              <input type="number" min="0.01" step="0.01" value={quantity} onChange={(event) => setQuantity(Number(event.target.value))} />
-            </label>
-            <label>
-              Entry
-              <input type="number" placeholder={`Market ${formatPrice(lastCandle?.close)}`} value={entry} onChange={(event) => setEntry(event.target.value)} />
-            </label>
-            <label>
-              {t.takeProfit}
-              <input type="number" value={takeProfit} onChange={(event) => setTakeProfit(event.target.value)} />
-            </label>
-            <label>
-              {t.stopLoss}
-              <input type="number" value={stopLoss} onChange={(event) => setStopLoss(event.target.value)} />
-            </label>
-            <button className="submit" onClick={submitOrder}>
-              <Send size={18} />
-              {t.submitOrder}
-            </button>
-          </div>
+          )}
 
           <div className="panel-block orderbook">
             <div className="panel-title">
               <BookOpen size={18} />
               {t.orderbook}
-              <button className="icon-button" onClick={() => setOrders([])} title={t.clearOrderbook}>
+              <button className="icon-button" onClick={requestClearOrderbook} title={t.clearOrderbook}>
                 <Trash2 size={16} />
               </button>
             </div>
@@ -2343,17 +4445,30 @@ function TradingApp() {
             <span className="table-actions">
               {(order.status === "pending" || order.status === "active") && (
                 <>
-                  <button className="small" onClick={() => confirmOrderProtection(order.id)} title={t.saveProtection}>
+                  <button
+                    className="small"
+                    onClick={() =>
+                      isLiveRunning && (order.phemexOrderId || order.phemexClOrdId)
+                        ? requestProtectionConfirm(order.id)
+                        : confirmOrderProtection(order.id)
+                    }
+                    title={t.saveProtection}
+                  >
                     <Save size={14} />
                   </button>
-                  <button className="small danger" onClick={() => cancelOrder(order.id)}>
-                    {t.cancel}
+                  <button
+                    className="small danger"
+                    onClick={() => order.status === "active" ? closeActiveOrder(order.id) : cancelOrder(order.id)}
+                  >
+                    {order.status === "active" ? t.close : t.cancel}
                   </button>
                 </>
               )}
-              <button className="small" onClick={() => deleteOrder(order.id)}>
-                <Trash2 size={14} />
-              </button>
+              {order.status !== "pending" && order.status !== "active" && (
+                <button className="small" onClick={() => deleteOrder(order.id)}>
+                  <Trash2 size={14} />
+                </button>
+              )}
             </span>
           </div>
         ))}
@@ -2363,3 +4478,4 @@ function TradingApp() {
 }
 
 createRoot(document.getElementById("root")!).render(<TradingApp />);
+
