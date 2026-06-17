@@ -187,6 +187,50 @@ const pollMsFromSettings = (settings: Pick<PhemexSettings, "pollSeconds">) => {
   return Math.max(1, Number.isFinite(seconds) ? seconds : 10) * 1000;
 };
 
+const chartTimeToNumber = (time: Time | undefined) => {
+  if (time === undefined) return undefined;
+  if (typeof time === "number") return time;
+  if (typeof time === "string") {
+    const parsed = Date.parse(time);
+    return Number.isFinite(parsed) ? Math.floor(parsed / 1000) : undefined;
+  }
+  return Date.UTC(time.year, time.month - 1, time.day) / 1000;
+};
+
+const logicalToChartTime = (candles: Candle[], logical: number): Time | undefined => {
+  if (!candles.length || !Number.isFinite(logical)) return undefined;
+  const lowerIndex = Math.max(0, Math.min(candles.length - 1, Math.floor(logical)));
+  const upperIndex = Math.max(0, Math.min(candles.length - 1, Math.ceil(logical)));
+  const lowerTime = chartTimeToNumber(candles[lowerIndex]?.time);
+  const upperTime = chartTimeToNumber(candles[upperIndex]?.time);
+  if (lowerTime === undefined) return candles[lowerIndex]?.time;
+  if (upperIndex === lowerIndex || upperTime === undefined) return candles[lowerIndex]?.time;
+  const ratio = logical - lowerIndex;
+  return Math.round(lowerTime + (upperTime - lowerTime) * ratio) as Time;
+};
+
+const chartTimeToLogical = (candles: Candle[], time: Time | undefined) => {
+  const target = chartTimeToNumber(time);
+  if (target === undefined || !candles.length) return undefined;
+  const times = candles.map((candle) => chartTimeToNumber(candle.time));
+  const exactIndex = times.findIndex((value) => value === target);
+  if (exactIndex >= 0) return exactIndex;
+  for (let index = 0; index < times.length - 1; index += 1) {
+    const current = times[index];
+    const next = times[index + 1];
+    if (current === undefined || next === undefined) continue;
+    if (target >= current && target <= next) {
+      const span = next - current;
+      return span === 0 ? index : index + (target - current) / span;
+    }
+  }
+  const first = times[0];
+  const last = times.at(-1);
+  if (first !== undefined && target < first) return 0;
+  if (last !== undefined && target > last) return candles.length - 1;
+  return undefined;
+};
+
 const formatPrice = (value?: number) => (value === undefined ? "-" : value.toFixed(2));
 
 const clampProtectionPrice = (order: TradeOrder, field: "takeProfit" | "stopLoss", price: number) => {
@@ -287,6 +331,7 @@ type DrawingTool = "cursor" | "line" | "horizontal" | "ray" | "rect" | "zigzag";
 type DrawingPoint = {
   logical: number;
   price: number;
+  time?: Time;
 };
 
 type DrawingShape = {
@@ -469,6 +514,15 @@ const loadStoredDrawings = (): DrawingShape[] => {
       )
       .map((item) => ({
         ...item,
+        start: {
+          ...item.start,
+          time: item.start?.time
+        },
+        end: {
+          ...item.end,
+          time: item.end?.time
+        },
+        points: Array.isArray(item.points) ? item.points.map((point: DrawingPoint) => ({ ...point, time: point.time })) : undefined,
         strokeColor:
           typeof item.strokeColor === "string"
             ? item.strokeColor
@@ -483,7 +537,6 @@ const loadStoredDrawings = (): DrawingShape[] => {
               : defaultDrawingFillColor,
         lineWidth: Number.isFinite(item.lineWidth) ? item.lineWidth : 1.4,
         borderWidth: Number.isFinite(item.borderWidth) ? item.borderWidth : 1.4,
-        points: Array.isArray(item.points) ? item.points : undefined,
         locked: Boolean(item.locked)
       }));
   } catch {
@@ -1014,20 +1067,58 @@ function TradingApp() {
         Math.abs(y - highY) <= Math.abs(y - lowY)
           ? candle.high
           : candle.low;
-      return { logical: candleIndex, price: snappedPrice };
+      return { logical: candleIndex, price: snappedPrice, time: candle.time };
     }
 
-    return { logical: Number(logical), price };
+    return {
+      logical: Number(logical),
+      price,
+      time: logicalToChartTime(visibleCandles, Number(logical))
+    };
   }, [visibleCandles]);
 
   const drawingPointToScreen = useCallback((point: DrawingPoint) => {
     const chart = chartRef.current;
     const series = candleSeriesRef.current;
-    const x = chart?.timeScale().logicalToCoordinate(point.logical as Logical);
+    const resolvedLogical = point.time !== undefined ? chartTimeToLogical(visibleCandles, point.time) : point.logical;
+    const x = resolvedLogical === undefined ? null : chart?.timeScale().logicalToCoordinate(resolvedLogical as Logical);
     const y = series?.priceToCoordinate(point.price);
     if (x === null || x === undefined || y === null || y === undefined) return null;
     return { x, y };
-  }, []);
+  }, [visibleCandles]);
+
+  const makeDrawingPoint = useCallback((logical: number, price: number): DrawingPoint => ({
+    logical,
+    price,
+    time: logicalToChartTime(visibleCandles, logical)
+  }), [visibleCandles]);
+
+  const resolveDrawingLogical = useCallback((point: DrawingPoint) =>
+    point.time !== undefined ? chartTimeToLogical(visibleCandles, point.time) ?? point.logical : point.logical,
+  [visibleCandles]);
+
+  const moveDrawingPoint = useCallback((point: DrawingPoint, logicalDelta: number, priceDelta: number): DrawingPoint =>
+    makeDrawingPoint(resolveDrawingLogical(point) + logicalDelta, point.price + priceDelta), [makeDrawingPoint, resolveDrawingLogical]);
+
+  const addMissingDrawingTimes = useCallback((drawing: DrawingShape): DrawingShape => {
+    const withTime = (point: DrawingPoint): DrawingPoint =>
+      point.time !== undefined ? point : { ...point, time: logicalToChartTime(visibleCandles, point.logical) };
+    return {
+      ...drawing,
+      start: withTime(drawing.start),
+      end: withTime(drawing.end),
+      points: drawing.points?.map(withTime)
+    };
+  }, [visibleCandles]);
+
+  const preserveDrawingTimes = useCallback(() => {
+    setDrawings((current) => current.map(addMissingDrawingTimes));
+    setDrawingDraft((current) => current ? addMissingDrawingTimes(current) : current);
+    drawingDraftRef.current = drawingDraftRef.current ? addMissingDrawingTimes(drawingDraftRef.current) : null;
+    setZigZagDraftPoints((current) => current.map((point) =>
+      point.time !== undefined ? point : { ...point, time: logicalToChartTime(visibleCandles, point.logical) }
+    ));
+  }, [addMissingDrawingTimes, visibleCandles]);
 
   const projectedDrawings = useMemo(() => {
     void chartViewVersion;
@@ -1595,13 +1686,13 @@ function TradingApp() {
                 return {
                   ...drawing,
                   start: { ...drawing.start, price: pending.point.price },
-                  end: { ...drawing.end, logical: pending.point.logical }
+                  end: makeDrawingPoint(pending.point.logical, drawing.end.price)
                 };
               }
               if (pending.drag.handle === "bottomLeft") {
                 return {
                   ...drawing,
-                  start: { ...drawing.start, logical: pending.point.logical },
+                  start: makeDrawingPoint(pending.point.logical, drawing.start.price),
                   end: { ...drawing.end, price: pending.point.price }
                 };
               }
@@ -1620,25 +1711,16 @@ function TradingApp() {
               if (drawing.tool === "ray" || drawing.tool === "horizontal") {
                 return {
                   ...drawing,
-                  end: { logical: pending.point.logical, price: drawing.start.price }
+                  end: makeDrawingPoint(pending.point.logical, drawing.start.price)
                 };
               }
               return { ...drawing, end: pending.point };
             }
             return {
               ...pending.drag.original,
-              start: {
-                logical: pending.drag.original.start.logical + pending.logicalDelta,
-                price: pending.drag.original.start.price + pending.priceDelta
-              },
-              end: {
-                logical: pending.drag.original.end.logical + pending.logicalDelta,
-                price: pending.drag.original.end.price + pending.priceDelta
-              },
-              points: pending.drag.original.points?.map((point) => ({
-                logical: point.logical + pending.logicalDelta,
-                price: point.price + pending.priceDelta
-              }))
+              start: moveDrawingPoint(pending.drag.original.start, pending.logicalDelta, pending.priceDelta),
+              end: moveDrawingPoint(pending.drag.original.end, pending.logicalDelta, pending.priceDelta),
+              points: pending.drag.original.points?.map((point) => moveDrawingPoint(point, pending.logicalDelta, pending.priceDelta))
             };
           })
         );
@@ -2774,7 +2856,7 @@ function TradingApp() {
       ...draft,
       end:
         draft.tool === "ray" || draft.tool === "horizontal"
-          ? { logical: point.logical, price: draft.start.price }
+          ? makeDrawingPoint(point.logical, draft.start.price)
           : point
     };
     drawingDraftRef.current = next;
@@ -3219,6 +3301,7 @@ function TradingApp() {
   };
 
   const changeMarketTimeframe = async (resolution: string) => {
+    preserveDrawingTimes();
     const nextSettings = { ...phemexSettings, resolution };
     setPhemexSettings(nextSettings);
     setActivePhemexSettings(nextSettings);
@@ -3241,6 +3324,7 @@ function TradingApp() {
   };
 
   const changeMarketSymbol = async (symbol: string) => {
+    preserveDrawingTimes();
     const nextSettings = { ...phemexSettings, symbol };
     setPhemexSettings(nextSettings);
     setActivePhemexSettings(nextSettings);
@@ -3528,21 +3612,23 @@ function TradingApp() {
               <span>{t.low} {formatPrice(lastCandle?.low)}</span>
             </>
           )}
-          <select
-            className="market-timeframe-select"
-            value={(isLiveRunning ? activePhemexSettings : phemexSettings).resolution}
-            onChange={(event) => {
-              void changeMarketTimeframe(event.target.value);
-            }}
-            title={t.timeframe}
-          >
-            <option value="60">1m</option>
-            <option value="300">5m</option>
-            <option value="900">15m</option>
-            <option value="1800">30m</option>
-            <option value="3600">1h</option>
-            <option value="14400">4h</option>
-          </select>
+          {showLiveStatus && (
+            <select
+              className="market-timeframe-select"
+              value={activePhemexSettings.resolution}
+              onChange={(event) => {
+                void changeMarketTimeframe(event.target.value);
+              }}
+              title={t.timeframe}
+            >
+              <option value="60">1m</option>
+              <option value="300">5m</option>
+              <option value="900">15m</option>
+              <option value="1800">30m</option>
+              <option value="3600">1h</option>
+              <option value="14400">4h</option>
+            </select>
+          )}
           <div className="chart-options">
               <button
                 className={autoScalePrice ? "toggle active" : "toggle"}
