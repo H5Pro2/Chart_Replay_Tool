@@ -1969,9 +1969,19 @@ function TradingApp() {
       scheduleOverlayRefresh(true);
     };
 
-    const closeMenu = () => {
+    const closeMenu = (event?: MouseEvent | KeyboardEvent) => {
+      if (event instanceof MouseEvent) {
+        const target = event.target instanceof Element ? event.target : null;
+        const clickedInsideMenu = target?.closest(
+          ".chart-context-menu, .drawing-context-menu, .chart-style-panel, .chart-options, .market-favorite-dropdown, .coin-dropdown, .topbar-button"
+        );
+        if (clickedInsideMenu) return;
+      }
       setChartMenu(null);
       setDrawingMenu(null);
+      setShowChartOptions(false);
+      setIsCoinDropdownOpen(false);
+      setIsMarketFavoritesOpen(false);
     };
 
     chartNode.addEventListener("contextmenu", handleContextMenu);
