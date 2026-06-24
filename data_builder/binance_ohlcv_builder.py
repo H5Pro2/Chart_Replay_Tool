@@ -23,7 +23,7 @@ START_YEAR = 2026
 START_MONTH = 3
 MONTHS = 2
 
-DATA_DIR = "data"
+DATA_DIR = "chart_data"
 STRIDE = 1
 
 # --------------------------------------------------
