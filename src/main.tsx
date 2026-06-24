@@ -426,6 +426,7 @@ type Language = "de" | "en";
 type SettingsTab = "colors" | "chart" | "orders" | "drawings" | "phemex" | "language";
 
 type PhemexSettings = {
+  exchange: "phemex" | "binance";
   apiKey: string;
   apiSecret: string;
   testnet: boolean;
@@ -997,6 +998,7 @@ function TradingApp() {
   const [exchangeDebugPopup, setExchangeDebugPopup] = useState<ExchangeDebugPopup | null>(null);
   const [orderbookConfirm, setOrderbookConfirm] = useState<OrderbookConfirm | null>(null);
   const [phemexSettings, setPhemexSettings] = useState<PhemexSettings>({
+    exchange: storedExchangeOptions.exchange === "binance" ? "binance" : "phemex",
     apiKey: "",
     apiSecret: "",
     testnet: storedExchangeOptions.testnet ?? true,
@@ -1011,6 +1013,7 @@ function TradingApp() {
     leverage: storedExchangeOptions.leverage || "10"
   });
   const [activePhemexSettings, setActivePhemexSettings] = useState<PhemexSettings>(() => ({
+    exchange: storedExchangeOptions.exchange === "binance" ? "binance" : "phemex",
     apiKey: "",
     apiSecret: "",
     testnet: storedExchangeOptions.testnet ?? true,
@@ -1186,9 +1189,18 @@ function TradingApp() {
       .filter(Boolean) as Array<{ drawing: DrawingShape; start: { x: number; y: number }; end: { x: number; y: number }; points?: Array<{ x: number; y: number }> }>;
   }, [chartTheme.drawingSize, chartViewVersion, drawingDraft, drawingPointToScreen, drawings, zigZagDraftPoints]);
 
-  const scheduleOverlayRefresh = useCallback((withFollowUp = false) => {
+  const scheduleOverlayRefresh = useCallback((withFollowUp = false, immediate = false) => {
     window.cancelAnimationFrame(overlayRefreshFrameRef.current);
     if (withFollowUp) window.cancelAnimationFrame(overlayRefreshFollowUpFrameRef.current);
+    if (immediate) {
+      queueMicrotask(() => setChartViewVersion((version) => version + 1));
+      if (withFollowUp) {
+        overlayRefreshFollowUpFrameRef.current = window.requestAnimationFrame(() => {
+          setChartViewVersion((version) => version + 1);
+        });
+      }
+      return;
+    }
     overlayRefreshFrameRef.current = window.requestAnimationFrame(() => {
       setChartViewVersion((version) => version + 1);
       if (withFollowUp) {
@@ -1273,6 +1285,7 @@ function TradingApp() {
 
   useEffect(() => {
     scheduleStorageWrite(exchangeOptionsStorageKey, {
+      exchange: phemexSettings.exchange,
       testnet: phemexSettings.testnet,
       symbol: phemexSettings.symbol,
       pollSeconds: phemexSettings.pollSeconds,
@@ -1285,6 +1298,7 @@ function TradingApp() {
       leverage: phemexSettings.leverage
     });
   }, [
+    phemexSettings.exchange,
     phemexSettings.limit,
     phemexSettings.mode,
     phemexSettings.liveOrdersEnabled,
@@ -1320,6 +1334,7 @@ function TradingApp() {
         if (!settings) return;
         const mergeSettings = (current: PhemexSettings) => ({
           ...current,
+          exchange: storedExchangeOptions.exchange ? current.exchange : settings.exchange === "binance" ? "binance" : "phemex",
           apiKey: settings.apiKey || "",
           apiSecret: settings.hasSecret ? "********" : "",
           testnet: storedExchangeOptions.testnet !== undefined ? current.testnet : settings.testnet !== false,
@@ -1394,7 +1409,7 @@ function TradingApp() {
     });
     observer.observe(chartElement.current);
     const handleVisibleRangeChange = () => {
-      scheduleOverlayRefresh();
+      scheduleOverlayRefresh(false, true);
     };
     chart.timeScale().subscribeVisibleLogicalRangeChange(handleVisibleRangeChange);
 
@@ -1966,7 +1981,7 @@ function TradingApp() {
     };
 
     const handleWheel = () => {
-      scheduleOverlayRefresh(true);
+      scheduleOverlayRefresh(true, true);
     };
 
     const closeMenu = (event?: MouseEvent | KeyboardEvent) => {
@@ -2178,6 +2193,7 @@ function TradingApp() {
             price: parsedEntry,
             takeProfit: Number.isFinite(parsedTp) ? parsedTp : undefined,
             stopLoss: Number.isFinite(parsedSl) ? parsedSl : undefined,
+            exchange: activePhemexSettings.exchange,
             testnet: activePhemexSettings.testnet
           })
         });
@@ -2223,6 +2239,7 @@ function TradingApp() {
             symbol: activePhemexSettings.symbol,
             orderID: exchangeOrderId,
             clOrdID: order.phemexClOrdId,
+            exchange: activePhemexSettings.exchange,
             testnet: activePhemexSettings.testnet
           })
         });
@@ -2301,6 +2318,7 @@ function TradingApp() {
         symbol: activePhemexSettings.symbol,
         orderID: exchangeOrderId,
         clOrdID: order.phemexClOrdId,
+        exchange: activePhemexSettings.exchange,
         testnet: activePhemexSettings.testnet
       })
     });
@@ -2336,6 +2354,7 @@ function TradingApp() {
         price: order.entry,
         takeProfit: order.takeProfit,
         stopLoss: order.stopLoss,
+        exchange: activePhemexSettings.exchange,
         testnet: activePhemexSettings.testnet
       })
     });
@@ -2439,6 +2458,7 @@ function TradingApp() {
             quantity: order.quantity,
             takeProfit: order.takeProfit,
             stopLoss: order.stopLoss,
+            exchange: activePhemexSettings.exchange,
             testnet: activePhemexSettings.testnet
           })
         });
@@ -2533,6 +2553,7 @@ function TradingApp() {
             price: order.entry,
             takeProfit: order.takeProfit,
             stopLoss: order.stopLoss,
+            exchange: activePhemexSettings.exchange,
             testnet: activePhemexSettings.testnet
           })
         });
@@ -2971,7 +2992,37 @@ function TradingApp() {
     setChartTheme((current) => ({ ...current, [key]: value }));
   };
 
+  const loadSavedExchangeCredentials = async (exchange: PhemexSettings["exchange"]) => {
+    try {
+      const response = await fetch(`/api/phemex-settings?exchange=${encodeURIComponent(exchange)}`);
+      const settings = response.ok ? await response.json() : undefined;
+      setPhemexSettings((current) => {
+        if (current.exchange !== exchange || !settings) return current;
+        return {
+          ...current,
+          apiKey: settings.apiKey || "",
+          apiSecret: settings.hasSecret ? "********" : "",
+          testnet: settings.testnet !== false,
+          allowMainnetOrders: Boolean(settings.allowMainnetOrders)
+        };
+      });
+    } catch {
+      setPhemexSettings((current) => current.exchange === exchange ? { ...current, apiKey: "", apiSecret: "" } : current);
+    }
+  };
+
   const updatePhemexSetting = (key: keyof PhemexSettings, value: string | boolean) => {
+    if (key === "exchange") {
+      const exchange = value as PhemexSettings["exchange"];
+      setPhemexSettings((current) => ({
+        ...current,
+        exchange,
+        apiKey: "",
+        apiSecret: ""
+      }));
+      void loadSavedExchangeCredentials(exchange);
+      return;
+    }
     setPhemexSettings((current) => ({ ...current, [key]: value }));
     if (isLiveRunning && key === "liveOrdersEnabled") {
       setActivePhemexSettings((current) => ({ ...current, liveOrdersEnabled: Boolean(value) }));
@@ -3025,6 +3076,7 @@ function TradingApp() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           symbol: settings.symbol,
+          exchange: settings.exchange,
           testnet: settings.testnet
         })
       });
@@ -3035,7 +3087,7 @@ function TradingApp() {
     } catch {
       setFuturesBalance(null);
     }
-  }, [activePhemexSettings.symbol, activePhemexSettings.testnet]);
+  }, [activePhemexSettings.exchange, activePhemexSettings.symbol, activePhemexSettings.testnet]);
 
   useEffect(() => {
     if (!activePhemexSettings.apiKey || !activePhemexSettings.apiSecret) return;
@@ -3049,6 +3101,7 @@ function TradingApp() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         symbol: settings.symbol,
+        exchange: settings.exchange,
         testnet: settings.testnet
       })
     });
@@ -3112,6 +3165,7 @@ function TradingApp() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         symbol: settings.symbol,
+        exchange: settings.exchange,
         testnet: settings.testnet
       })
     });
@@ -3198,6 +3252,7 @@ function TradingApp() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           symbol: phemexSettings.symbol,
+          exchange: phemexSettings.exchange,
           testnet: phemexSettings.testnet
         })
       });
@@ -3215,6 +3270,7 @@ function TradingApp() {
       setExchangeRequestState("error");
       showExchangeDebug("Phemex Verbindung", t.connectionFailed, {
         symbol: phemexSettings.symbol,
+        exchange: phemexSettings.exchange,
         testnet: phemexSettings.testnet
       });
     }
@@ -3231,6 +3287,7 @@ function TradingApp() {
           symbol: settings.symbol,
           resolution: Number(settings.resolution || 300),
           limit: Number(settings.limit || 500),
+          exchange: settings.exchange,
           testnet: settings.testnet
         })
       });
@@ -3253,6 +3310,7 @@ function TradingApp() {
     } catch {
       showExchangeDebug("Phemex Chart", t.phemexChartFailed, {
         symbol: settings.symbol,
+        exchange: settings.exchange,
         resolution: settings.resolution,
         limit: settings.limit,
         testnet: settings.testnet
@@ -3386,6 +3444,7 @@ function TradingApp() {
     }
     let failureDetails: unknown = {
       symbol: settings.symbol,
+      exchange: settings.exchange,
       testnet: settings.testnet
     };
     let failureMessage = "Phemex Live-Preis konnte nicht geladen werden.";
@@ -3395,6 +3454,7 @@ function TradingApp() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           symbol: settings.symbol,
+          exchange: settings.exchange,
           testnet: settings.testnet
         })
       });
@@ -3404,6 +3464,7 @@ function TradingApp() {
         failureMessage = result.message || failureMessage;
         failureDetails = {
           symbol: settings.symbol,
+          exchange: settings.exchange,
           testnet: settings.testnet,
           status: result.status,
           payload: result.payload
@@ -4077,6 +4138,16 @@ function TradingApp() {
                     <div className="style-section-title">{t.phemexConnection}</div>
                     <div className="exchange-subsection">
                       <div className="subsection-title">{t.connectionSection}</div>
+                      <label className="exchange-select-card">
+                        <span>Exchange</span>
+                        <select
+                          value={phemexSettings.exchange}
+                          onChange={(event) => updatePhemexSetting("exchange", event.target.value as PhemexSettings["exchange"])}
+                        >
+                          <option value="phemex">Phemex</option>
+                          <option value="binance">Binance</option>
+                        </select>
+                      </label>
                       <div className="api-settings-grid">
                         <label>
                           {t.apiKey}

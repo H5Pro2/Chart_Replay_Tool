@@ -914,6 +914,35 @@ button.tab.active {
   text-transform: uppercase;
 }
 
+.exchange-select-card {
+  align-items: center;
+  background: linear-gradient(180deg, rgba(22, 32, 45, 0.98), rgba(17, 25, 36, 0.98));
+  border: 1px solid rgba(52, 190, 205, 0.28);
+  border-radius: var(--radius-sm);
+  display: grid;
+  gap: 10px;
+  grid-template-columns: minmax(120px, 0.45fr) minmax(180px, 1fr);
+  min-height: 48px;
+  padding: 8px 10px;
+}
+
+.exchange-select-card span {
+  color: #cbd7e6;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.exchange-select-card select {
+  background: #0f1722;
+  border: 1px solid rgba(52, 190, 205, 0.62);
+  border-radius: var(--radius-sm);
+  color: #eef5ff;
+  font-size: 14px;
+  font-weight: 700;
+  min-height: 34px;
+  padding: 6px 10px;
+}
+
 .style-grid {
   display: grid;
   gap: 8px 12px;
