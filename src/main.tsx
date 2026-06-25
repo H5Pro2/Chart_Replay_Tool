@@ -1989,18 +1989,21 @@ function TradingApp() {
     };
 
     const closeMenu = (event?: MouseEvent | KeyboardEvent) => {
-      if (event instanceof MouseEvent) {
-        const target = event.target instanceof Element ? event.target : null;
-        const clickedInsideMenu = target?.closest(
-          ".chart-context-menu, .drawing-context-menu, .chart-style-panel, .chart-options, .market-favorite-dropdown, .coin-dropdown, .topbar-button"
-        );
-        if (clickedInsideMenu) return;
+      if (!(event instanceof MouseEvent)) {
+        setChartMenu(null);
+        setDrawingMenu(null);
+        setShowChartOptions(false);
+        setIsCoinDropdownOpen(false);
+        setIsMarketFavoritesOpen(false);
+        return;
       }
-      setChartMenu(null);
-      setDrawingMenu(null);
-      setShowChartOptions(false);
-      setIsCoinDropdownOpen(false);
-      setIsMarketFavoritesOpen(false);
+
+      const target = event.target instanceof Element ? event.target : null;
+      if (!target?.closest(".chart-context-menu")) setChartMenu(null);
+      if (!target?.closest(".drawing-context-menu")) setDrawingMenu(null);
+      if (!target?.closest(".chart-style-panel, .chart-options, .topbar-button")) setShowChartOptions(false);
+      if (!target?.closest(".coin-dropdown")) setIsCoinDropdownOpen(false);
+      if (!target?.closest(".market-favorite-dropdown, .market-favorite-toggle")) setIsMarketFavoritesOpen(false);
     };
 
     chartNode.addEventListener("contextmenu", handleContextMenu);
