@@ -31,7 +31,7 @@ Im Replay-Modus arbeitet das Tool lokal mit CSV-Daten. Orders werden im internen
 
 Im Live-Modus kann das Tool Marktdaten und Accountdaten über eine Exchange-API laden. Aktuell sind Phemex und Binance als Exchange auswählbar.
 
-API-Daten werden lokal in `.env.local` gespeichert. Diese Datei ist absichtlich ignoriert und darf nicht gepusht werden.
+API-Daten werden lokal in `.env.local` gespeichert.
 
 Wichtige Live-Funktionen:
 
@@ -54,7 +54,7 @@ chart_data/phemex_chart/
 chart_data/binance_chart/
 ```
 
-Diese generierten CSV-Dateien sind lokale Laufzeitdaten und werden nicht gepusht.
+Diese generierten CSV-Dateien sind lokale Laufzeitdaten.
 
 ## CSV-Format
 
@@ -132,7 +132,7 @@ Die Symbol-Auswahl nutzt `coin_liste.txt`. Favoriten werden im Browser lokal ges
 
 ## Sicherheit
 
-- `.env.local` enthält API Keys und wird nicht committed.
+- `.env.local` enthält lokale API Keys.
 - Mainnet-Orders sind zusätzlich gesperrt, bis sie in den Exchange-Einstellungen ausdrücklich erlaubt werden.
 - Im Replay-Modus werden keine echten Exchange-Orders gesendet.
 - Generierte Chart-CSV-Dateien in `chart_data/phemex_chart` und `chart_data/binance_chart` sind lokale Laufzeitdaten.
