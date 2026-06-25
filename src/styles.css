@@ -1189,6 +1189,14 @@ button.switch.active {
   border-color: #344258;
 }
 
+.chart-context-menu button.context-buy {
+  color: #22c55e;
+}
+
+.chart-context-menu button.context-sell {
+  color: #fb923c;
+}
+
 .protection-confirm {
   background: rgba(15, 21, 29, 0.98);
   border: 1px solid rgba(56, 189, 248, 0.46);

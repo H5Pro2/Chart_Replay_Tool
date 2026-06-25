@@ -714,6 +714,8 @@ const translations = {
     useEntry: "Als Entry übernehmen",
     useTp: "Als TP übernehmen",
     useSl: "Als SL übernehmen",
+    buyOrderHere: "Buy Order hier",
+    sellOrderHere: "Sell Order hier",
     play: "Play",
     pause: "Pause",
     step: "Step",
@@ -873,6 +875,8 @@ const translations = {
     useEntry: "Use as Entry",
     useTp: "Use as TP",
     useSl: "Use as SL",
+    buyOrderHere: "Buy Order here",
+    sellOrderHere: "Sell Order here",
     play: "Play",
     pause: "Pause",
     step: "Step",
@@ -4346,6 +4350,16 @@ function TradingApp() {
                 <button onClick={() => useChartPrice("entry")}>{t.useEntry}</button>
                 <button onClick={() => useChartPrice("tp")}>{t.useTp}</button>
                 <button onClick={() => useChartPrice("sl")}>{t.useSl}</button>
+                {!isLiveRunning && (
+                  <>
+                    <button className="context-buy" onClick={() => createOrder("buy", chartMenu.price)}>
+                      {t.buyOrderHere}
+                    </button>
+                    <button className="context-sell" onClick={() => createOrder("sell", chartMenu.price)}>
+                      {t.sellOrderHere}
+                    </button>
+                  </>
+                )}
               </div>
             )}
             {protectionConfirm && (
