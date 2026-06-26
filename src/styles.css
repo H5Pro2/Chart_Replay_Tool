@@ -1177,6 +1177,56 @@ button.switch.active {
   min-width: 110px;
 }
 
+.csv-builder-modal {
+  background: rgba(17, 24, 34, 0.98);
+  border: 1px solid #344258;
+  border-radius: var(--radius-md);
+  box-shadow: 0 24px 54px rgba(0, 0, 0, 0.46);
+  color: #d5deea;
+  display: grid;
+  gap: 14px;
+  max-width: min(560px, calc(100vw - 32px));
+  padding: 18px;
+  width: 520px;
+}
+
+.csv-builder-modal p {
+  color: #9fb1c8;
+  margin: 0;
+}
+
+.csv-builder-grid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: 1fr 1fr;
+}
+
+.csv-builder-grid label {
+  background: #151d29;
+  border: 1px solid #273241;
+  border-radius: var(--radius-sm);
+  color: #9fb1c8;
+  display: grid;
+  gap: 7px;
+  padding: 9px 10px;
+}
+
+.csv-builder-grid input,
+.csv-builder-grid select {
+  background: #0f151d;
+  border: 1px solid #344258;
+  border-radius: var(--radius-sm);
+  color: #eef5ff;
+  min-height: 34px;
+  padding: 6px 9px;
+}
+
+.csv-builder-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
 .chart-context-menu button {
   border-color: transparent;
   justify-content: flex-start;

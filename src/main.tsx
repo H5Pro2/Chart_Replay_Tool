@@ -22,6 +22,7 @@ import {
   MoveHorizontal,
   MousePointer2,
   Focus,
+  FileDown,
   FileUp,
   Palette,
   Pause,
@@ -401,6 +402,16 @@ type OrderbookConfirm = {
   message: string;
 };
 
+type CsvBuilderState = {
+  coin: string;
+  quote: string;
+  timeframe: string;
+  startYear: string;
+  startMonth: string;
+  months: string;
+  testnet: boolean;
+};
+
 type OrderLineField = "entry" | "takeProfit" | "stopLoss";
 
 type ChartTheme = {
@@ -594,6 +605,17 @@ const translations = {
   de: {
     appTitle: "Chart_Replay_Tool",
     csvLoad: "CSV laden",
+    csvCreate: "CSV erstellen",
+    csvBuilderTitle: "Binance CSV erstellen",
+    csvBuilderHint: "Erstellt Binance-Futures-Kerzen im bestehenden chart_data CSV-Format.",
+    csvDownload: "Download",
+    coin: "Coin",
+    quote: "Quote",
+    startYear: "Startjahr",
+    startMonth: "Startmonat",
+    months: "Monate",
+    csvBuilderDone: (path: string) => `Binance CSV erstellt: ${path}`,
+    csvBuilderFailed: "Binance CSV konnte nicht erstellt werden.",
     candles: "Kerzen",
     last: "Last",
     high: "High",
@@ -755,6 +777,17 @@ const translations = {
   en: {
     appTitle: "Chart_Replay_Tool",
     csvLoad: "Load CSV",
+    csvCreate: "Create CSV",
+    csvBuilderTitle: "Create Binance CSV",
+    csvBuilderHint: "Creates Binance futures candles in the existing chart_data CSV format.",
+    csvDownload: "Download",
+    coin: "Coin",
+    quote: "Quote",
+    startYear: "Start Year",
+    startMonth: "Start Month",
+    months: "Months",
+    csvBuilderDone: (path: string) => `Binance CSV created: ${path}`,
+    csvBuilderFailed: "Binance CSV could not be created.",
     candles: "Candles",
     last: "Last",
     high: "High",
@@ -1001,6 +1034,7 @@ function TradingApp() {
   const [protectionConfirm, setProtectionConfirm] = useState<ProtectionConfirm | null>(null);
   const [exchangeDebugPopup, setExchangeDebugPopup] = useState<ExchangeDebugPopup | null>(null);
   const [orderbookConfirm, setOrderbookConfirm] = useState<OrderbookConfirm | null>(null);
+  const [showCsvBuilder, setShowCsvBuilder] = useState(false);
   const [phemexSettings, setPhemexSettings] = useState<PhemexSettings>({
     exchange: storedExchangeOptions.exchange === "binance" ? "binance" : "phemex",
     apiKey: "",
@@ -1030,6 +1064,15 @@ function TradingApp() {
     allowMainnetOrders: Boolean(storedExchangeOptions.allowMainnetOrders),
     marginMode: storedExchangeOptions.marginMode === "isolated" ? "isolated" : "cross",
     leverage: storedExchangeOptions.leverage || "10"
+  }));
+  const [csvBuilder, setCsvBuilder] = useState<CsvBuilderState>(() => ({
+    coin: "SOL",
+    quote: "USDT",
+    timeframe: "5m",
+    startYear: "2026",
+    startMonth: "3",
+    months: "2",
+    testnet: storedExchangeOptions.testnet ?? true
   }));
   const t = translations[language];
   const [message, setMessage] = useState(translations.de.demoLoaded);
@@ -3581,6 +3624,56 @@ function TradingApp() {
     );
   };
 
+  const downloadBinanceCsv = async () => {
+    setExchangeRequestState("loading");
+    try {
+      const response = await fetch("/api/binance-csv-build", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          coin: csvBuilder.coin,
+          quote: csvBuilder.quote,
+          timeframe: csvBuilder.timeframe,
+          startYear: Number(csvBuilder.startYear || 2026),
+          startMonth: Number(csvBuilder.startMonth || 1),
+          months: Number(csvBuilder.months || 1),
+          testnet: csvBuilder.testnet
+        })
+      });
+      const result = await response.json();
+      if (!response.ok || !result.ok || typeof result.csv !== "string") {
+        throw new Error(result.message || t.csvBuilderFailed);
+      }
+      const fallbackName = `${csvBuilder.startMonth}-${Number(csvBuilder.startMonth || 1) + Number(csvBuilder.months || 1) - 1}_${csvBuilder.startYear}_${csvBuilder.timeframe}_${csvBuilder.coin}${csvBuilder.quote}.csv`;
+      const fileName = String(result.path || fallbackName).split("/").pop() || fallbackName;
+      const blob = new Blob([result.csv], { type: "text/csv;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = fileName;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+      setMessage(t.csvBuilderDone(result.path || fileName));
+      setMessageKind("custom");
+      setExchangeRequestState("idle");
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : t.csvBuilderFailed;
+      showExchangeDebug(t.csvBuilderTitle, reason, {
+        exchange: "binance",
+        coin: csvBuilder.coin,
+        quote: csvBuilder.quote,
+        timeframe: csvBuilder.timeframe,
+        startYear: csvBuilder.startYear,
+        startMonth: csvBuilder.startMonth,
+        months: csvBuilder.months,
+        testnet: csvBuilder.testnet
+      });
+      setExchangeRequestState("error");
+    }
+  };
+
   const resetReplay = () => {
     setVisibleCount(Math.min(4, allCandles.length));
     shouldFitContentRef.current = true;
@@ -3610,6 +3703,14 @@ function TradingApp() {
           >
             <BookOpen size={18} />
             {t.exchange}
+          </button>
+          <button
+            type="button"
+            className="topbar-button"
+            onClick={() => setShowCsvBuilder(true)}
+          >
+            <FileDown size={18} />
+            {t.csvCreate}
           </button>
           <label className="file-button">
             <FileUp size={18} />
@@ -3642,6 +3743,98 @@ function TradingApp() {
             <div className="confirm-actions">
               <button className="small" onClick={() => setOrderbookConfirm(null)}>Abbrechen</button>
               <button className="small danger" onClick={confirmClearOrderbook}>Orderbook leeren</button>
+            </div>
+          </div>
+        </div>
+      )}
+      {showCsvBuilder && (
+        <div className="exchange-debug-backdrop" onClick={() => setShowCsvBuilder(false)}>
+          <div className="csv-builder-modal" onClick={(event) => event.stopPropagation()}>
+            <div className="exchange-debug-title">
+              <strong>{t.csvBuilderTitle}</strong>
+              <button className="small" onClick={() => setShowCsvBuilder(false)}>×</button>
+            </div>
+            <p>{t.csvBuilderHint}</p>
+            <div className="csv-builder-grid">
+              <label>
+                {t.coin}
+                <select
+                  value={csvBuilder.coin}
+                  onChange={(event) => setCsvBuilder((current) => ({ ...current, coin: event.target.value }))}
+                >
+                  {coinOptions.map((symbol) => {
+                    const coin = symbol.replace(/USDT$/i, "");
+                    return <option key={coin} value={coin}>{coin}</option>;
+                  })}
+                </select>
+              </label>
+              <label>
+                {t.quote}
+                <select
+                  value={csvBuilder.quote}
+                  onChange={(event) => setCsvBuilder((current) => ({ ...current, quote: event.target.value }))}
+                >
+                  <option value="USDT">USDT</option>
+                  <option value="USDC">USDC</option>
+                  <option value="BUSD">BUSD</option>
+                </select>
+              </label>
+              <label>
+                {t.timeframe}
+                <select
+                  value={csvBuilder.timeframe}
+                  onChange={(event) => setCsvBuilder((current) => ({ ...current, timeframe: event.target.value }))}
+                >
+                  <option value="1m">1m</option>
+                  <option value="5m">5m</option>
+                  <option value="15m">15m</option>
+                  <option value="30m">30m</option>
+                  <option value="1h">1h</option>
+                  <option value="4h">4h</option>
+                  <option value="1d">1d</option>
+                </select>
+              </label>
+              <label>
+                {t.startYear}
+                <input
+                  type="number"
+                  min="2017"
+                  max="2100"
+                  value={csvBuilder.startYear}
+                  onChange={(event) => setCsvBuilder((current) => ({ ...current, startYear: event.target.value }))}
+                />
+              </label>
+              <label>
+                {t.startMonth}
+                <input
+                  type="number"
+                  min="1"
+                  max="12"
+                  value={csvBuilder.startMonth}
+                  onChange={(event) => setCsvBuilder((current) => ({ ...current, startMonth: event.target.value }))}
+                />
+              </label>
+              <label>
+                {t.months}
+                <input
+                  type="number"
+                  min="1"
+                  max="24"
+                  value={csvBuilder.months}
+                  onChange={(event) => setCsvBuilder((current) => ({ ...current, months: event.target.value }))}
+                />
+              </label>
+              <div className="style-switches compact">
+                <button className={csvBuilder.testnet ? "switch active" : "switch"} onClick={() => setCsvBuilder((current) => ({ ...current, testnet: true }))}>{t.testnet}</button>
+                <button className={!csvBuilder.testnet ? "switch active" : "switch"} onClick={() => setCsvBuilder((current) => ({ ...current, testnet: false }))}>{t.mainnet}</button>
+              </div>
+            </div>
+            <div className="csv-builder-actions">
+              <button className="small" onClick={() => setShowCsvBuilder(false)}>{t.cancel}</button>
+              <button className="small primary" onClick={downloadBinanceCsv} disabled={isExchangeBusy}>
+                <FileDown size={16} />
+                {t.csvDownload}
+              </button>
             </div>
           </div>
         </div>

@@ -32,6 +32,29 @@ const binanceIntervalFromResolution = (resolution: number) => {
   };
   return map[resolution] || "5m";
 };
+const binanceIntervalMs = (interval: string) => {
+  const match = interval.match(/^(\d+)([mhd])$/);
+  if (!match) return 5 * 60 * 1000;
+  const value = Number(match[1]);
+  const unit = match[2];
+  if (unit === "m") return value * 60 * 1000;
+  if (unit === "h") return value * 60 * 60 * 1000;
+  return value * 24 * 60 * 60 * 1000;
+};
+const resolutionFromBinanceInterval = (interval: string) => {
+  const match = interval.match(/^(\d+)([mhd])$/);
+  if (!match) return 300;
+  const value = Number(match[1]);
+  const unit = match[2];
+  if (unit === "m") return value * 60;
+  if (unit === "h") return value * 3600;
+  return value * 86400;
+};
+const monthRange = (startYear: number, startMonth: number, months: number) => {
+  const start = Date.UTC(startYear, startMonth - 1, 1);
+  const end = Date.UTC(startYear, startMonth - 1 + months, 1);
+  return { start, end };
+};
 const signBinanceQuery = (query: string, apiSecret: string) =>
   createHmac("sha256", apiSecret).update(query).digest("hex");
 const signedBinanceQuery = (params: Record<string, string | number | boolean | undefined>, apiSecret: string) => {
@@ -272,6 +295,70 @@ const phemexSettingsPlugin = () => ({
           ok: true,
           count: payload.data.rows.length,
           path: `chart_data/phemex_chart/${filename}`,
+          csv
+        }));
+      } catch (error) {
+        response.statusCode = 500;
+        response.end(error instanceof Error ? error.message : "Unknown error");
+      }
+    });
+
+    server.middlewares.use("/api/binance-csv-build", async (request, response) => {
+      try {
+        if (request.method !== "POST") {
+          response.statusCode = 405;
+          response.end("Method not allowed");
+          return;
+        }
+
+        const body = await parseBody(request);
+        const coin = String(body.coin || "SOL").toUpperCase().replace(/[^A-Z0-9]/g, "");
+        const quote = String(body.quote || "USDT").toUpperCase().replace(/[^A-Z0-9]/g, "");
+        const symbol = `${coin}${quote}`;
+        const interval = String(body.timeframe || "5m");
+        const startYear = Number(body.startYear || 2026);
+        const startMonth = Number(body.startMonth || 1);
+        const months = Math.max(1, Math.min(24, Number(body.months || 1)));
+        const testnet = body.testnet !== false;
+
+        if (!Number.isInteger(startYear) || startYear < 2017 || startYear > 2100 || !Number.isInteger(startMonth) || startMonth < 1 || startMonth > 12) {
+          response.statusCode = 400;
+          response.end(JSON.stringify({ ok: false, message: "Invalid date range" }));
+          return;
+        }
+
+        const { start, end } = monthRange(startYear, startMonth, months);
+        const stepMs = binanceIntervalMs(interval);
+        const rows: unknown[] = [];
+        let cursor = start;
+        while (cursor < end) {
+          const url = `${binanceHost(testnet)}/fapi/v1/klines?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&limit=1500&startTime=${cursor}&endTime=${end - 1}`;
+          const binanceResponse = await fetch(url);
+          const payload = await binanceResponse.json();
+          if (!binanceResponse.ok || !Array.isArray(payload)) {
+            response.statusCode = 502;
+            response.end(JSON.stringify({ ok: false, message: payload.msg || "Binance CSV build request failed", payload }));
+            return;
+          }
+          if (!payload.length) break;
+          rows.push(...payload);
+          const lastOpenTime = Number(payload[payload.length - 1]?.[0]);
+          const nextCursor = lastOpenTime + stepMs;
+          if (!Number.isFinite(nextCursor) || nextCursor <= cursor) break;
+          cursor = nextCursor;
+          if (payload.length < 1500) break;
+        }
+
+        const csv = binanceKlinesToCsv(rows, symbol, resolutionFromBinanceInterval(interval));
+        const endMonth = startMonth + months - 1;
+        const filename = `${startMonth}-${endMonth}_${startYear}_${safeFilePart(interval)}_${safeFilePart(symbol)}.csv`;
+        await mkdir(binanceChartDir, { recursive: true });
+        await writeFile(resolve(binanceChartDir, filename), csv, "utf-8");
+        response.setHeader("Content-Type", "application/json");
+        response.end(JSON.stringify({
+          ok: true,
+          count: rows.length,
+          path: `chart_data/binance_chart/${filename}`,
           csv
         }));
       } catch (error) {
