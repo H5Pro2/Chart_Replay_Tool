@@ -3704,19 +3704,23 @@ function TradingApp() {
             <BookOpen size={18} />
             {t.exchange}
           </button>
-          <button
-            type="button"
-            className="topbar-button"
-            onClick={() => setShowCsvBuilder(true)}
-          >
-            <FileDown size={18} />
-            {t.csvCreate}
-          </button>
-          <label className="file-button">
-            <FileUp size={18} />
-            {t.csvLoad}
-            <input type="file" accept=".csv,text/csv" onChange={(event) => handleCsv(event.target.files?.[0])} />
-          </label>
+          {!showLiveStatus && (
+            <>
+              <button
+                type="button"
+                className="topbar-button"
+                onClick={() => setShowCsvBuilder(true)}
+              >
+                <FileDown size={18} />
+                {t.csvCreate}
+              </button>
+              <label className="file-button">
+                <FileUp size={18} />
+                {t.csvLoad}
+                <input type="file" accept=".csv,text/csv" onChange={(event) => handleCsv(event.target.files?.[0])} />
+              </label>
+            </>
+          )}
         </div>
       </section>
       {exchangeDebugPopup && (
