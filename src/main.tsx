@@ -3013,6 +3013,17 @@ function TradingApp() {
     setDrawingTool("cursor");
   }, [chartTheme.drawingSize, zigZagDraftPoints]);
 
+  const finishDrawingWithContextMenu = (event: React.MouseEvent<SVGSVGElement>) => {
+    if (drawingTool === "cursor") return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (drawingTool === "zigzag") {
+      finishZigZagDrawing();
+      return;
+    }
+    finishDrawing();
+  };
+
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
       if (drawingTool !== "zigzag") return;
@@ -4023,6 +4034,7 @@ function TradingApp() {
               onMouseMove={updateDrawing}
               onMouseUp={finishDrawing}
               onMouseLeave={finishDrawing}
+              onContextMenuCapture={finishDrawingWithContextMenu}
               onDoubleClick={(event) => {
                 event.preventDefault();
                 finishZigZagDrawing();
