@@ -1375,15 +1375,25 @@ function TradingApp() {
   }, []);
 
   useEffect(() => {
-    fetch("/api/phemex-settings")
+    const requestedExchange = storedExchangeOptions.exchange === "binance" || storedExchangeOptions.exchange === "phemex"
+      ? storedExchangeOptions.exchange
+      : undefined;
+    const settingsUrl = requestedExchange
+      ? `/api/phemex-settings?exchange=${encodeURIComponent(requestedExchange)}`
+      : "/api/phemex-settings";
+
+    fetch(settingsUrl)
       .then((response) => response.ok ? response.json() : undefined)
       .then((settings) => {
         if (!settings) return;
+        const settingsExchange = settings.exchange === "binance" ? "binance" : "phemex";
+        const activeExchange = requestedExchange || settingsExchange;
+        const credentialsBelongToActiveExchange = settingsExchange === activeExchange;
         const mergeSettings = (current: PhemexSettings) => ({
           ...current,
-          exchange: storedExchangeOptions.exchange ? current.exchange : settings.exchange === "binance" ? "binance" : "phemex",
-          apiKey: settings.apiKey || "",
-          apiSecret: settings.hasSecret ? "********" : "",
+          exchange: activeExchange,
+          apiKey: credentialsBelongToActiveExchange ? settings.apiKey || "" : "",
+          apiSecret: credentialsBelongToActiveExchange && settings.hasSecret ? "********" : "",
           testnet: storedExchangeOptions.testnet !== undefined ? current.testnet : settings.testnet !== false,
           symbol: storedExchangeOptions.symbol ? current.symbol : settings.symbol || "SOLUSDT",
           pollSeconds: storedExchangeOptions.pollSeconds ? current.pollSeconds : settings.pollSeconds || "10",
