@@ -953,6 +953,7 @@ function TradingApp() {
   const storedAppOptions = useMemo(() => loadStoredAppOptions(), []);
   const storedExchangeOptions = useMemo(() => loadStoredExchangeOptions(), []);
   const chartElement = useRef<HTMLDivElement | null>(null);
+  const drawingLayerRef = useRef<SVGSVGElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const candleSeriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
   const lineSeriesRef = useRef<Map<string, ISeriesApi<"Line">>>(new Map());
@@ -963,6 +964,7 @@ function TradingApp() {
   const previousCandleSetRef = useRef<Candle[] | null>(null);
   const overlayRefreshFrameRef = useRef(0);
   const overlayRefreshFollowUpFrameRef = useRef(0);
+  const updateDrawingDomRef = useRef<() => void>(() => undefined);
   const storageWriteTimersRef = useRef<Record<string, number>>({});
   const drawingDragFrameRef = useRef(0);
   const orderDragFrameRef = useRef(0);
@@ -1237,22 +1239,120 @@ function TradingApp() {
       .filter(Boolean) as Array<{ drawing: DrawingShape; start: { x: number; y: number }; end: { x: number; y: number }; points?: Array<{ x: number; y: number }> }>;
   }, [chartTheme.drawingSize, chartViewVersion, drawingDraft, drawingPointToScreen, drawings, zigZagDraftPoints]);
 
+  useEffect(() => {
+    updateDrawingDomRef.current = () => {
+      const layer = drawingLayerRef.current;
+      if (!layer) return;
+      const chartWidth = chartElement.current?.clientWidth ?? 0;
+      const drawingPaneWidth = Math.max(0, chartWidth - rightPriceScaleOffset);
+      const zigZagDraft =
+        zigZagDraftPoints.length >= 2
+          ? {
+              id: "ZIGZAG-DRAFT",
+              tool: "zigzag" as const,
+              start: zigZagDraftPoints[0],
+              end: zigZagDraftPoints.at(-1) ?? zigZagDraftPoints[0],
+              points: zigZagDraftPoints,
+              strokeColor: defaultDrawingStrokeColor,
+              fillColor: defaultDrawingFillColor,
+              lineWidth: chartTheme.drawingSize,
+              borderWidth: chartTheme.drawingSize
+            }
+          : null;
+
+      [...drawings, ...(drawingDraft ? [drawingDraft] : []), ...(zigZagDraft ? [zigZagDraft] : [])].forEach((drawing) => {
+        const points = drawing.points
+          ?.map((point) => drawingPointToScreen(point))
+          .filter(Boolean) as Array<{ x: number; y: number }> | undefined;
+        const start = drawingPointToScreen(drawing.start);
+        const end = drawingPointToScreen(drawing.end);
+        if (!start || !end) return;
+        const selector = `[data-drawing-id="${drawing.id}"]`;
+
+        if (drawing.tool === "zigzag" && points?.length) {
+          const pointString = points.map((point) => `${point.x},${point.y}`).join(" ");
+          layer.querySelectorAll<SVGPolylineElement>(`${selector}[data-drawing-part="zigzag"]`)
+            .forEach((element) => element.setAttribute("points", pointString));
+          points.forEach((point, index) => {
+            const handle = layer.querySelector<SVGCircleElement>(`${selector}[data-drawing-handle="point-${index}"]`);
+            handle?.setAttribute("cx", String(point.x));
+            handle?.setAttribute("cy", String(point.y));
+          });
+          return;
+        }
+
+        if (drawing.tool === "rect") {
+          const x = Math.min(start.x, end.x);
+          const y = Math.min(start.y, end.y);
+          const width = Math.abs(end.x - start.x);
+          const height = Math.abs(end.y - start.y);
+          const corners = {
+            topLeft: { x, y },
+            topRight: { x: x + width, y },
+            bottomRight: { x: x + width, y: y + height },
+            bottomLeft: { x, y: y + height }
+          };
+          layer.querySelectorAll<SVGRectElement>(`${selector}[data-drawing-part="rect"]`).forEach((element) => {
+            element.setAttribute("x", String(x));
+            element.setAttribute("y", String(y));
+            element.setAttribute("width", String(width));
+            element.setAttribute("height", String(height));
+          });
+          Object.entries(corners).forEach(([handleName, point]) => {
+            const handle = layer.querySelector<SVGCircleElement>(`${selector}[data-drawing-handle="${handleName}"]`);
+            handle?.setAttribute("cx", String(point.x));
+            handle?.setAttribute("cy", String(point.y));
+          });
+          return;
+        }
+
+        let renderStart = { x: Number(start.x), y: Number(start.y) };
+        let projectedEnd = { x: Number(end.x), y: Number(end.y) };
+        if (drawing.tool === "horizontal") {
+          renderStart = { x: 0, y: Number(start.y) };
+          projectedEnd = { x: drawingPaneWidth, y: Number(start.y) };
+        } else if (drawing.tool === "ray") {
+          const dx = end.x - start.x;
+          const dy = end.y - start.y;
+          const rayEndX = drawingPaneWidth;
+          projectedEnd = { x: rayEndX, y: dx === 0 ? end.y : start.y + (dy / dx) * (rayEndX - start.x) };
+        }
+        layer.querySelectorAll<SVGLineElement>(`${selector}[data-drawing-part="line"]`).forEach((element) => {
+          element.setAttribute("x1", String(renderStart.x));
+          element.setAttribute("y1", String(renderStart.y));
+          element.setAttribute("x2", String(projectedEnd.x));
+          element.setAttribute("y2", String(projectedEnd.y));
+        });
+        const startHandle = layer.querySelector<SVGCircleElement>(`${selector}[data-drawing-handle="start"]`);
+        const endHandle = layer.querySelector<SVGCircleElement>(`${selector}[data-drawing-handle="end"]`);
+        startHandle?.setAttribute("cx", String(renderStart.x));
+        startHandle?.setAttribute("cy", String(renderStart.y));
+        endHandle?.setAttribute("cx", String(projectedEnd.x));
+        endHandle?.setAttribute("cy", String(projectedEnd.y));
+      });
+    };
+  }, [chartTheme.drawingSize, drawingDraft, drawingPointToScreen, drawings, zigZagDraftPoints]);
+
   const scheduleOverlayRefresh = useCallback((withFollowUp = false, immediate = false) => {
     window.cancelAnimationFrame(overlayRefreshFrameRef.current);
     if (withFollowUp) window.cancelAnimationFrame(overlayRefreshFollowUpFrameRef.current);
     if (immediate) {
+      updateDrawingDomRef.current();
       flushSync(() => setChartViewVersion((version) => version + 1));
       if (withFollowUp) {
         overlayRefreshFollowUpFrameRef.current = window.requestAnimationFrame(() => {
+          updateDrawingDomRef.current();
           setChartViewVersion((version) => version + 1);
         });
       }
       return;
     }
     overlayRefreshFrameRef.current = window.requestAnimationFrame(() => {
+      updateDrawingDomRef.current();
       setChartViewVersion((version) => version + 1);
       if (withFollowUp) {
         overlayRefreshFollowUpFrameRef.current = window.requestAnimationFrame(() => {
+          updateDrawingDomRef.current();
           setChartViewVersion((version) => version + 1);
         });
       }
@@ -4034,6 +4134,7 @@ function TradingApp() {
               </button>
             </div>
             <svg
+              ref={drawingLayerRef}
               className={drawingTool === "cursor" ? "drawing-layer" : "drawing-layer active"}
               onMouseDown={startDrawing}
               onMouseMove={updateDrawing}
@@ -4058,11 +4159,15 @@ function TradingApp() {
                     <React.Fragment key={drawing.id}>
                       <polyline
                         className="drawing-hit-area"
+                        data-drawing-id={drawing.id}
+                        data-drawing-part="zigzag"
                         points={pointString}
                         onMouseDown={(event) => startDrawingMove(event, drawing)}
                         onContextMenu={(event) => openDrawingContextMenu(event, drawing)}
                       />
                       <polyline
+                        data-drawing-id={drawing.id}
+                        data-drawing-part="zigzag"
                         className={[
                           drawing.id === "ZIGZAG-DRAFT" ? "drawing-shape draft" : "drawing-shape zigzag",
                           isSelected ? "selected" : "",
@@ -4080,6 +4185,8 @@ function TradingApp() {
                           <circle
                             key={`${drawing.id}-point-${index}`}
                             className="drawing-handle"
+                            data-drawing-id={drawing.id}
+                            data-drawing-handle={`point-${index}`}
                             cx={screenPoint.x}
                             cy={screenPoint.y}
                             r={5}
@@ -4102,6 +4209,8 @@ function TradingApp() {
                     <React.Fragment key={drawing.id}>
                       <rect
                         className="drawing-hit-area rect-hit"
+                        data-drawing-id={drawing.id}
+                        data-drawing-part="rect"
                         onMouseDown={(event) => startDrawingMove(event, drawing)}
                         onContextMenu={(event) => openDrawingContextMenu(event, drawing)}
                         x={x}
@@ -4110,6 +4219,8 @@ function TradingApp() {
                         height={Math.abs(end.y - start.y)}
                       />
                       <rect
+                        data-drawing-id={drawing.id}
+                        data-drawing-part="rect"
                         className={[
                           drawingDraft?.id === drawing.id ? "drawing-shape draft" : "drawing-shape rect",
                         isSelected ? "selected" : "",
@@ -4129,10 +4240,10 @@ function TradingApp() {
                       />
                       {isSelected && !drawing.locked && (
                         <>
-                          <circle className="drawing-handle" cx={topLeft.x} cy={topLeft.y} r={5} onMouseDown={(event) => startDrawingResize(event, drawing, "topLeft")} onContextMenu={(event) => openDrawingContextMenu(event, drawing)} />
-                          <circle className="drawing-handle" cx={topRight.x} cy={topRight.y} r={5} onMouseDown={(event) => startDrawingResize(event, drawing, "topRight")} onContextMenu={(event) => openDrawingContextMenu(event, drawing)} />
-                          <circle className="drawing-handle" cx={bottomRight.x} cy={bottomRight.y} r={5} onMouseDown={(event) => startDrawingResize(event, drawing, "bottomRight")} onContextMenu={(event) => openDrawingContextMenu(event, drawing)} />
-                          <circle className="drawing-handle" cx={bottomLeft.x} cy={bottomLeft.y} r={5} onMouseDown={(event) => startDrawingResize(event, drawing, "bottomLeft")} onContextMenu={(event) => openDrawingContextMenu(event, drawing)} />
+                          <circle className="drawing-handle" data-drawing-id={drawing.id} data-drawing-handle="topLeft" cx={topLeft.x} cy={topLeft.y} r={5} onMouseDown={(event) => startDrawingResize(event, drawing, "topLeft")} onContextMenu={(event) => openDrawingContextMenu(event, drawing)} />
+                          <circle className="drawing-handle" data-drawing-id={drawing.id} data-drawing-handle="topRight" cx={topRight.x} cy={topRight.y} r={5} onMouseDown={(event) => startDrawingResize(event, drawing, "topRight")} onContextMenu={(event) => openDrawingContextMenu(event, drawing)} />
+                          <circle className="drawing-handle" data-drawing-id={drawing.id} data-drawing-handle="bottomRight" cx={bottomRight.x} cy={bottomRight.y} r={5} onMouseDown={(event) => startDrawingResize(event, drawing, "bottomRight")} onContextMenu={(event) => openDrawingContextMenu(event, drawing)} />
+                          <circle className="drawing-handle" data-drawing-id={drawing.id} data-drawing-handle="bottomLeft" cx={bottomLeft.x} cy={bottomLeft.y} r={5} onMouseDown={(event) => startDrawingResize(event, drawing, "bottomLeft")} onContextMenu={(event) => openDrawingContextMenu(event, drawing)} />
                         </>
                       )}
                     </React.Fragment>
@@ -4142,6 +4253,8 @@ function TradingApp() {
                   <React.Fragment key={drawing.id}>
                     <line
                       className="drawing-hit-area"
+                      data-drawing-id={drawing.id}
+                      data-drawing-part="line"
                       onMouseDown={(event) => startDrawingMove(event, drawing)}
                       onContextMenu={(event) => openDrawingContextMenu(event, drawing)}
                       x1={start.x}
@@ -4150,6 +4263,8 @@ function TradingApp() {
                       y2={end.y}
                     />
                     <line
+                      data-drawing-id={drawing.id}
+                      data-drawing-part="line"
                       className={[
                         drawingDraft?.id === drawing.id ? "drawing-shape draft" : `drawing-shape ${drawing.tool}`,
                       isSelected ? "selected" : "",
@@ -4165,8 +4280,8 @@ function TradingApp() {
                     />
                     {isSelected && !drawing.locked && (
                       <>
-                        <circle className="drawing-handle" cx={start.x} cy={start.y} r={5} onMouseDown={(event) => startDrawingResize(event, drawing, "start")} onContextMenu={(event) => openDrawingContextMenu(event, drawing)} />
-                        <circle className="drawing-handle" cx={end.x} cy={end.y} r={5} onMouseDown={(event) => startDrawingResize(event, drawing, "end")} onContextMenu={(event) => openDrawingContextMenu(event, drawing)} />
+                        <circle className="drawing-handle" data-drawing-id={drawing.id} data-drawing-handle="start" cx={start.x} cy={start.y} r={5} onMouseDown={(event) => startDrawingResize(event, drawing, "start")} onContextMenu={(event) => openDrawingContextMenu(event, drawing)} />
+                        <circle className="drawing-handle" data-drawing-id={drawing.id} data-drawing-handle="end" cx={end.x} cy={end.y} r={5} onMouseDown={(event) => startDrawingResize(event, drawing, "end")} onContextMenu={(event) => openDrawingContextMenu(event, drawing)} />
                       </>
                     )}
                   </React.Fragment>
