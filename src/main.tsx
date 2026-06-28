@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
+import { flushSync } from "react-dom";
 import {
   CandlestickSeries,
   createChart,
@@ -1240,7 +1241,7 @@ function TradingApp() {
     window.cancelAnimationFrame(overlayRefreshFrameRef.current);
     if (withFollowUp) window.cancelAnimationFrame(overlayRefreshFollowUpFrameRef.current);
     if (immediate) {
-      queueMicrotask(() => setChartViewVersion((version) => version + 1));
+      flushSync(() => setChartViewVersion((version) => version + 1));
       if (withFollowUp) {
         overlayRefreshFollowUpFrameRef.current = window.requestAnimationFrame(() => {
           setChartViewVersion((version) => version + 1);
@@ -1461,12 +1462,12 @@ function TradingApp() {
     const observer = new ResizeObserver(() => {
       if (chartElement.current) {
         chart.resize(chartElement.current.clientWidth, chartElement.current.clientHeight);
-        scheduleOverlayRefresh(true);
+        if (hasChartOverlaysRef.current) scheduleOverlayRefresh(true);
       }
     });
     observer.observe(chartElement.current);
     const handleVisibleRangeChange = () => {
-      scheduleOverlayRefresh(false, true);
+      if (hasChartOverlaysRef.current) scheduleOverlayRefresh(false, true);
     };
     chart.timeScale().subscribeVisibleLogicalRangeChange(handleVisibleRangeChange);
 
@@ -1924,11 +1925,15 @@ function TradingApp() {
       const mouseX = event.clientX - rect.left;
       const activeLine = draggedLineRef.current;
       const activeChip = draggedChipRef.current;
-      const isPriceScaleInteraction = mouseX > rect.width - 74 && event.buttons === 1;
+      const isPrimaryDrag = event.buttons === 1;
+      const isPriceScaleInteraction = mouseX > rect.width - 74 && isPrimaryDrag;
+      const isTimeScaleInteraction = mouseY > rect.height - 42 && isPrimaryDrag;
+      const isChartPanInteraction = isPrimaryDrag && !activeLine && !activeChip && drawingTool === "cursor";
       const isDrawingInteraction = draggedDrawingRef.current !== null || drawingDraftRef.current !== null;
+      const needsImmediateOverlayRefresh = isPriceScaleInteraction || isTimeScaleInteraction || isChartPanInteraction;
 
-      if (hasChartOverlaysRef.current && (isPriceScaleInteraction || isDrawingInteraction || activeLine || activeChip)) {
-        scheduleOverlayRefresh();
+      if (hasChartOverlaysRef.current && (needsImmediateOverlayRefresh || isDrawingInteraction || activeLine || activeChip)) {
+        scheduleOverlayRefresh(needsImmediateOverlayRefresh, needsImmediateOverlayRefresh);
       }
 
       if (!activeLine && !activeChip) {
