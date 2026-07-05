@@ -1902,8 +1902,16 @@ input[type="text"] {
   background: #2bdc3f;
 }
 
+.live-action-row .live-long:hover:not(:disabled) {
+  background: #1e9a2c;
+}
+
 .live-short {
   background: #ff424d;
+}
+
+.live-action-row .live-short:hover:not(:disabled) {
+  background: #b32e36;
 }
 
 .icon-button {

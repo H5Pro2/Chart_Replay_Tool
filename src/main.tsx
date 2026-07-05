@@ -3501,7 +3501,6 @@ function TradingApp() {
       setExchangeRequestState("loading");
       try {
         lastLiveOrderSubmitAtRef.current = Date.now();
-        await savePhemexSettingsPayload(activePhemexSettings);
         const response = await fetch("/api/phemex-order", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -3514,7 +3513,9 @@ function TradingApp() {
             takeProfit: Number.isFinite(parsedTp) ? parsedTp : undefined,
             stopLoss: Number.isFinite(parsedSl) ? parsedSl : undefined,
             exchange: activePhemexSettings.exchange,
-            testnet: activePhemexSettings.testnet
+            testnet: activePhemexSettings.testnet,
+            liveOrdersEnabled: activePhemexSettings.liveOrdersEnabled,
+            allowMainnetOrders: activePhemexSettings.allowMainnetOrders
           })
         });
         const result = await response.json();
@@ -6239,11 +6240,11 @@ function TradingApp() {
           </div>
           {!showLiveStatus && (
             <div className="replay-controls">
-              <button onClick={() => setIsPlaying((value) => !value)}>
+              <button type="button" onClick={() => setIsPlaying((value) => !value)}>
                 {isPlaying ? <Pause size={18} /> : <Play size={18} />}
                 {isPlaying ? t.pause : t.play}
               </button>
-              <button onClick={stepForward} disabled={visibleCount >= allCandles.length}>
+              <button type="button" onClick={stepForward} disabled={visibleCount >= allCandles.length}>
                 <SkipForward size={18} />
                 {t.step}
               </button>
@@ -6259,7 +6260,7 @@ function TradingApp() {
                 />
                 <span>{speedMs} ms</span>
               </label>
-              <button onClick={resetReplay}>
+              <button type="button" onClick={resetReplay}>
                 <RotateCcw size={18} />
                 {t.reset}
               </button>
@@ -6273,19 +6274,19 @@ function TradingApp() {
                 <small>{botProcessStatus.running && botProcessStatus.pid ? `PID ${botProcessStatus.pid}` : t.botModeLive}</small>
               </div>
               <div className="live-bot-controls-actions">
-                <button onClick={() => controlBotProcess("start")} disabled={botSettings.enabled}>
+                <button type="button" onClick={() => controlBotProcess("start")} disabled={botSettings.enabled}>
                   <Play size={17} />
                   {t.botStart}
                 </button>
-                <button onClick={pauseBotTicks} disabled={!botSettings.enabled}>
+                <button type="button" onClick={pauseBotTicks} disabled={!botSettings.enabled}>
                   <Pause size={17} />
                   {t.botPause}
                 </button>
-                <button onClick={() => controlBotProcess("stop")} disabled={!botProcessStatus.running && !botSettings.enabled}>
+                <button type="button" onClick={() => controlBotProcess("stop")} disabled={!botProcessStatus.running && !botSettings.enabled}>
                   <Square size={16} />
                   {t.botStop}
                 </button>
-                <button onClick={() => controlBotProcess("reload")}>
+                <button type="button" onClick={() => controlBotProcess("reload")}>
                   <RotateCcw size={17} />
                   {t.botReload}
                 </button>
@@ -6300,12 +6301,14 @@ function TradingApp() {
               <div className="live-order-top">
                 <div className="live-order-switch">
                   <button
+                    type="button"
                     className={phemexSettings.marginMode === "cross" ? "active" : ""}
                     onClick={() => updatePhemexSetting("marginMode", "cross")}
                   >
                     {t.cross}
                   </button>
                   <button
+                    type="button"
                     className={phemexSettings.marginMode === "isolated" ? "active" : ""}
                     onClick={() => updatePhemexSetting("marginMode", "isolated")}
                   >
@@ -6451,10 +6454,10 @@ function TradingApp() {
               </div>
 
               <div className="live-action-row">
-                <button className="live-long" onClick={() => submitOrder("buy")} disabled={isExchangeBusy}>
+                <button type="button" className="live-long" onClick={() => submitOrder("buy")} disabled={isExchangeBusy}>
                   {t.openLong}
                 </button>
-                <button className="live-short" onClick={() => submitOrder("sell")} disabled={isExchangeBusy}>
+                <button type="button" className="live-short" onClick={() => submitOrder("sell")} disabled={isExchangeBusy}>
                   {t.openShort}
                 </button>
               </div>
@@ -6466,8 +6469,8 @@ function TradingApp() {
                 {t.order}
               </div>
               <div className="segmented">
-                <button className={side === "buy" ? "active buy" : ""} onClick={() => setSide("buy")}>Buy</button>
-                <button className={side === "sell" ? "active sell" : ""} onClick={() => setSide("sell")}>Sell</button>
+                <button type="button" className={side === "buy" ? "active buy" : ""} onClick={() => setSide("buy")}>Buy</button>
+                <button type="button" className={side === "sell" ? "active sell" : ""} onClick={() => setSide("sell")}>Sell</button>
               </div>
               <label>
                 {t.quantity}
@@ -6485,7 +6488,7 @@ function TradingApp() {
                 {t.stopLoss}
                 <input type="number" value={stopLoss} onChange={(event) => setStopLoss(event.target.value)} />
               </label>
-              <button className="submit" onClick={() => submitOrder()}>
+              <button type="button" className="submit" onClick={() => submitOrder()}>
                 <Send size={18} />
                 {t.submitOrder}
               </button>
@@ -6496,7 +6499,7 @@ function TradingApp() {
             <div className="panel-title">
               <BookOpen size={18} />
               {t.orderbook}
-              <button className="icon-button" onClick={requestClearOrderbook} title={t.clearOrderbook}>
+              <button type="button" className="icon-button" onClick={requestClearOrderbook} title={t.clearOrderbook}>
                 <Trash2 size={16} />
               </button>
             </div>

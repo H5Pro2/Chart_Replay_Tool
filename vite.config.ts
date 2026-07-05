@@ -980,7 +980,11 @@ const phemexSettingsPlugin = () => ({
           response.end(JSON.stringify({ ok: false, message: `${exchange === "binance" ? "Binance" : "Phemex"} API key/secret missing` }));
           return;
         }
-        const liveOrdersEnabled = exchange === "binance" ? values.BINANCE_LIVE_ORDERS_ENABLED === "true" : values.PHEMEX_LIVE_ORDERS_ENABLED === "true";
+        const liveOrdersEnabled = typeof body.liveOrdersEnabled === "boolean"
+          ? body.liveOrdersEnabled
+          : exchange === "binance"
+            ? values.BINANCE_LIVE_ORDERS_ENABLED === "true"
+            : values.PHEMEX_LIVE_ORDERS_ENABLED === "true";
         if (!liveOrdersEnabled) {
           response.statusCode = 403;
           response.end(JSON.stringify({ ok: false, message: `${exchange === "binance" ? "Binance" : "Phemex"} live orders are disabled in Exchange settings.` }));
@@ -993,7 +997,10 @@ const phemexSettingsPlugin = () => ({
         const price = Number(body.price);
         const orderType = String(body.orderType || "limit").toLowerCase() === "market" ? "market" : "limit";
         if (exchange === "binance") {
-          if (!testnet && values.BINANCE_ALLOW_MAINNET_ORDERS !== "true") {
+          const allowMainnetOrders = typeof body.allowMainnetOrders === "boolean"
+            ? body.allowMainnetOrders
+            : values.BINANCE_ALLOW_MAINNET_ORDERS === "true";
+          if (!testnet && !allowMainnetOrders) {
             response.statusCode = 403;
             response.end(JSON.stringify({ ok: false, message: "Mainnet orders are disabled. Enable Mainnet orders in Exchange settings." }));
             return;
@@ -1068,9 +1075,12 @@ const phemexSettingsPlugin = () => ({
           response.end(JSON.stringify({ ok: true, orderID: String(payload.orderId), clOrdID: payload.clientOrderId, payload }));
           return;
         }
-        if (!testnet && values.PHEMEX_ALLOW_MAINNET_ORDERS !== "true") {
+        const allowMainnetOrders = typeof body.allowMainnetOrders === "boolean"
+          ? body.allowMainnetOrders
+          : values.PHEMEX_ALLOW_MAINNET_ORDERS === "true";
+        if (!testnet && !allowMainnetOrders) {
           response.statusCode = 403;
-          response.end(JSON.stringify({ ok: false, message: "Mainnet orders are disabled. Set PHEMEX_ALLOW_MAINNET_ORDERS=true in .env.local." }));
+          response.end(JSON.stringify({ ok: false, message: "Mainnet orders are disabled. Enable Mainnet orders in Exchange settings." }));
           return;
         }
 
