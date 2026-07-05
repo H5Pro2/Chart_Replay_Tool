@@ -1,13 +1,18 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import { createHmac } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { basename, resolve } from "node:path";
 
 const envPath = resolve(process.cwd(), ".env.local");
 const phemexChartDir = resolve(process.cwd(), "chart_data", "phemex_chart");
 const binanceChartDir = resolve(process.cwd(), "chart_data", "binance_chart");
 const coinListPath = resolve(process.cwd(), "coin_liste.txt");
+const botBridgeDir = resolve(process.cwd(), "bot_bridge");
+const defaultBotScript = "long_bot.py";
+let selectedBotScript = defaultBotScript;
+let managedBotProcess: ChildProcessWithoutNullStreams | null = null;
 
 const timeframeFromResolution = (resolution: number) => {
   if (resolution % 86400 === 0) return `${resolution / 86400}d`;
@@ -17,12 +22,49 @@ const timeframeFromResolution = (resolution: number) => {
 
 const safeFilePart = (value: string) => value.replace(/[^a-z0-9_-]/gi, "_");
 const cleanEnvValue = (value?: string) => String(value || "").trim();
-const activeExchangeFromBody = (body: Record<string, string>, values: Record<string, string>) =>
+const activeExchangeFromBody = (body: Record<string, unknown>, values: Record<string, string>) =>
   (String(body.exchange || values.EXCHANGE || values.PHEMEX_EXCHANGE || "phemex").toLowerCase() === "binance" ? "binance" : "phemex") as "phemex" | "binance";
+type LiveOrderGuard = {
+  inFlight: boolean;
+  lastSentAt: number;
+  lastOrderID?: string;
+  lastClOrdID?: string;
+};
+const liveOrderGuardWindowMs = 20_000;
+const liveOrderGuards = new Map<string, LiveOrderGuard>();
+const liveOrderGuardKey = (exchange: "phemex" | "binance", symbol: string, testnet: boolean) =>
+  `${exchange}:${testnet ? "testnet" : "mainnet"}:${symbol}`;
+const lockLiveOrderGuard = (exchange: "phemex" | "binance", symbol: string, testnet: boolean) => {
+  const key = liveOrderGuardKey(exchange, symbol, testnet);
+  const now = Date.now();
+  const current = liveOrderGuards.get(key);
+  if (current?.inFlight || (current && now - current.lastSentAt < liveOrderGuardWindowMs)) {
+    return {
+      ok: false as const,
+      key,
+      guard: current,
+      retryAfterMs: Math.max(0, liveOrderGuardWindowMs - (now - (current?.lastSentAt || now)))
+    };
+  }
+  liveOrderGuards.set(key, { inFlight: true, lastSentAt: now });
+  return { ok: true as const, key };
+};
+const markLiveOrderGuardSent = (key: string, orderID?: unknown, clOrdID?: unknown) => {
+  liveOrderGuards.set(key, {
+    inFlight: false,
+    lastSentAt: Date.now(),
+    lastOrderID: orderID ? String(orderID) : undefined,
+    lastClOrdID: clOrdID ? String(clOrdID) : undefined
+  });
+};
+const releaseLiveOrderGuard = (key?: string) => {
+  if (key) liveOrderGuards.delete(key);
+};
 const binanceHost = (testnet: boolean) => testnet ? "https://testnet.binancefuture.com" : "https://fapi.binance.com";
 const binanceIntervalFromResolution = (resolution: number) => {
   const map: Record<number, string> = {
     60: "1m",
+    180: "3m",
     300: "5m",
     900: "15m",
     1800: "30m",
@@ -69,7 +111,7 @@ const signedBinanceQuery = (params: Record<string, string | number | boolean | u
 };
 
 const parseBody = (request: import("node:http").IncomingMessage) =>
-  new Promise<Record<string, string>>((resolveBody, reject) => {
+  new Promise<Record<string, unknown>>((resolveBody, reject) => {
     let body = "";
     request.on("data", (chunk) => {
       body += chunk;
@@ -82,6 +124,207 @@ const parseBody = (request: import("node:http").IncomingMessage) =>
       }
     });
   });
+
+const normalizeBotScriptName = (value?: unknown) => {
+  const script = basename(String(value || defaultBotScript).trim());
+  return /^[a-zA-Z0-9_.-]+\.py$/.test(script) ? script : defaultBotScript;
+};
+
+const botScriptPath = (script?: unknown) => resolve(botBridgeDir, normalizeBotScriptName(script));
+const botTickUrl = "http://127.0.0.1:8790/tick";
+const botHealthUrl = "http://127.0.0.1:8790/health";
+
+const listBotScripts = async () => {
+  await mkdir(botBridgeDir, { recursive: true });
+  const entries = await readdir(botBridgeDir, { withFileTypes: true });
+  const scripts = entries
+    .filter((entry) => entry.isFile() && /^[a-zA-Z0-9_.-]+\.py$/.test(entry.name))
+    .map((entry) => entry.name)
+    .sort((left, right) => left.localeCompare(right));
+  return scripts.includes(defaultBotScript) ? scripts : [defaultBotScript, ...scripts];
+};
+
+const isBotHealthy = async () => {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 700);
+  try {
+    const response = await fetch(botHealthUrl, { signal: controller.signal });
+    return response.ok;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
+const waitForBotHealth = async (timeoutMs = 3500) => {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (await isBotHealthy()) return true;
+    await new Promise((resolveWait) => setTimeout(resolveWait, 150));
+  }
+  return false;
+};
+
+const fetchWithTimeout = async (url: string, init: RequestInit, timeoutMs = 1800) => {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
+const listProjectBotProcesses = () =>
+  new Promise<Array<{ pid: number }>>((resolveList) => {
+    const escapedDir = botBridgeDir.replace(/'/g, "''");
+    const listProcess = spawn("powershell.exe", [
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-Command",
+      `$target = '${escapedDir}'; Get-CimInstance Win32_Process -Filter "name = 'python.exe'" | Where-Object { $_.CommandLine -like '*bot_bridge*' -and $_.CommandLine -like '*.py*' -and ($_.CommandLine -like '*MCM_TradingView*' -or $_.CommandLine -like "*$target*") } | Select-Object -ExpandProperty ProcessId`
+    ], {
+      windowsHide: true
+    });
+    let output = "";
+    listProcess.stdout.on("data", (chunk) => {
+      output += String(chunk);
+    });
+    listProcess.once("exit", () => {
+      const processes = output
+        .split(/\r?\n/)
+        .map((line) => Number(line.trim()))
+        .filter((pid) => Number.isFinite(pid) && pid > 0)
+        .map((pid) => ({ pid }));
+      resolveList(processes);
+    });
+    listProcess.once("error", () => resolveList([]));
+  });
+
+const managedBotStatus = async () => {
+  let externalProcesses = await listProjectBotProcesses();
+  if (externalProcesses.length > 1) {
+    await cleanupProjectBotProcesses();
+    managedBotProcess = null;
+    externalProcesses = [];
+  }
+  const managedRunning = Boolean(managedBotProcess && managedBotProcess.exitCode === null && !managedBotProcess.killed);
+  const pid = managedRunning ? managedBotProcess?.pid ?? null : externalProcesses[0]?.pid ?? null;
+  const ready = await isBotHealthy();
+  return {
+    running: ready && (managedRunning || externalProcesses.length > 0),
+    pid,
+    processCount: externalProcesses.length,
+    ready,
+    script: selectedBotScript,
+    url: botTickUrl
+  };
+};
+
+const cleanupProjectBotProcesses = () =>
+  new Promise<void>((resolveCleanup) => {
+    const escapedDir = botBridgeDir.replace(/'/g, "''");
+    const cleanupProcess = spawn("powershell.exe", [
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-Command",
+      `$target = '${escapedDir}'; Get-CimInstance Win32_Process -Filter "name = 'python.exe'" | Where-Object { $_.CommandLine -like '*bot_bridge*' -and $_.CommandLine -like '*.py*' -and ($_.CommandLine -like '*MCM_TradingView*' -or $_.CommandLine -like "*$target*") } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`
+    ], {
+      stdio: "ignore",
+      windowsHide: true
+    });
+    cleanupProcess.once("exit", () => resolveCleanup());
+    cleanupProcess.once("error", () => resolveCleanup());
+  });
+
+const stopManagedBot = () =>
+  new Promise<void>((resolveStop) => {
+    if (!managedBotProcess || managedBotProcess.exitCode !== null || managedBotProcess.killed) {
+      managedBotProcess = null;
+      cleanupProjectBotProcesses().finally(resolveStop);
+      return;
+    }
+    const processToStop = managedBotProcess;
+    const timer = setTimeout(() => {
+      try {
+        processToStop.kill("SIGKILL");
+      } catch {
+        // ignore cleanup race
+      }
+      managedBotProcess = null;
+      cleanupProjectBotProcesses().finally(resolveStop);
+    }, 1500);
+    processToStop.once("exit", () => {
+      clearTimeout(timer);
+      if (managedBotProcess === processToStop) managedBotProcess = null;
+      cleanupProjectBotProcesses().finally(resolveStop);
+    });
+    processToStop.kill();
+  });
+
+const startManagedBot = async (script?: unknown) => {
+  selectedBotScript = normalizeBotScriptName(script || selectedBotScript);
+  const currentStatus = await managedBotStatus();
+  if (currentStatus.running && currentStatus.ready && currentStatus.processCount === 1 && currentStatus.script === selectedBotScript) {
+    return currentStatus;
+  }
+  await stopManagedBot();
+  await cleanupProjectBotProcesses();
+  managedBotProcess = spawn("python", [botScriptPath(selectedBotScript)], {
+    cwd: process.cwd(),
+    stdio: "pipe",
+    windowsHide: true
+  });
+  managedBotProcess.once("exit", () => {
+    managedBotProcess = null;
+  });
+  await waitForBotHealth();
+  return managedBotStatus();
+};
+
+const openBotBridgeFolder = async () => {
+  await mkdir(botBridgeDir, { recursive: true });
+  const explorerProcess = spawn("powershell.exe", [
+    "-NoProfile",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-Command",
+    "Start-Process",
+    "explorer.exe",
+    "-ArgumentList",
+    botBridgeDir
+  ], {
+    detached: true,
+    stdio: "ignore",
+    windowsHide: true
+  });
+  explorerProcess.unref();
+};
+
+const copyBotBridgePath = async () => {
+  await mkdir(botBridgeDir, { recursive: true });
+  const escapedPath = botBridgeDir.replace(/'/g, "''");
+  const clipboardProcess = spawn("powershell.exe", [
+    "-NoProfile",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-Command",
+    `Set-Clipboard -Value '${escapedPath}'`
+  ], {
+    stdio: "ignore",
+    windowsHide: true
+  });
+  await new Promise<void>((resolveCopy, rejectCopy) => {
+    clipboardProcess.once("exit", (code) => {
+      if (code === 0) resolveCopy();
+      else rejectCopy(new Error(`Set-Clipboard failed with code ${code}`));
+    });
+    clipboardProcess.once("error", rejectCopy);
+  });
+};
 
 const serializeEnv = (values: Record<string, string>) =>
   Object.entries(values)
@@ -165,6 +408,134 @@ const phemexErrorMessage = (payload: any, fallback: string) => {
   return [message, code, bizError].filter(Boolean).join(" / ");
 };
 
+const numberFromExchangeValue = (value: unknown) => {
+  const parsed = Number(String(value ?? "").replace(",", "."));
+  return Number.isFinite(parsed) ? parsed : undefined;
+};
+
+const positionSizeFromExchangeRow = (row: Record<string, unknown>) => {
+  const size =
+    numberFromExchangeValue(row.sizeRq) ??
+    numberFromExchangeValue(row.size) ??
+    numberFromExchangeValue(row.posSizeRq) ??
+    numberFromExchangeValue(row.positionSizeRq) ??
+    numberFromExchangeValue(row.positionQtyRq) ??
+    numberFromExchangeValue(row.positionAmt) ??
+    numberFromExchangeValue(row.positionQty) ??
+    numberFromExchangeValue(row.posQty) ??
+    numberFromExchangeValue(row.qty);
+  return Math.abs(size ?? 0);
+};
+
+const phemexPositionRows = (payload: any) => {
+  const data = payload?.data || {};
+  const candidates = [
+    data.positions,
+    data.rows,
+    data.account?.positions,
+    data.accounts?.positions,
+    data.account?.rows,
+    data.position,
+    data.account?.position
+  ];
+  return candidates.flatMap((candidate) => {
+    if (Array.isArray(candidate)) return candidate;
+    if (candidate && typeof candidate === "object") return [candidate];
+    return [];
+  }) as Record<string, unknown>[];
+};
+
+const assertNoExchangeExposure = async (
+  exchange: "phemex" | "binance",
+  symbol: string,
+  testnet: boolean,
+  apiKey: string,
+  apiSecret: string
+) => {
+  if (exchange === "binance") {
+    const openOrdersQuery = signedBinanceQuery({ symbol }, apiSecret);
+    const openOrdersResponse = await fetch(`${binanceHost(testnet)}/fapi/v1/openOrders?${openOrdersQuery}`, {
+      headers: { "X-MBX-APIKEY": apiKey }
+    });
+    const openOrdersPayload = await openOrdersResponse.json();
+    if (!openOrdersResponse.ok || !Array.isArray(openOrdersPayload)) {
+      throw new Error(openOrdersPayload.msg || "Binance open orders check failed");
+    }
+
+    const positionQuery = signedBinanceQuery({ symbol }, apiSecret);
+    const positionResponse = await fetch(`${binanceHost(testnet)}/fapi/v3/positionRisk?${positionQuery}`, {
+      headers: { "X-MBX-APIKEY": apiKey }
+    });
+    const positionPayload = await positionResponse.json();
+    if (!positionResponse.ok || positionPayload.code) {
+      throw new Error(positionPayload.msg || "Binance position check failed");
+    }
+    const positions = Array.isArray(positionPayload) ? positionPayload : [];
+    const positionSize = positions.reduce((sum, row) => sum + positionSizeFromExchangeRow(row), 0);
+    return {
+      hasExposure: openOrdersPayload.length > 0 || positionSize > 0,
+      openOrdersCount: openOrdersPayload.length,
+      positionSize
+    };
+  }
+
+  const host = testnet ? "https://testnet-api.phemex.com" : "https://api.phemex.com";
+  const ordersPath = "/g-orders/activeList";
+  const ordersQuery = `symbol=${encodeURIComponent(symbol)}`;
+  const ordersExpiry = Math.floor(Date.now() / 1000) + 60;
+  const ordersSignature = signPhemexRequest(ordersPath, ordersQuery, ordersExpiry, "", apiSecret);
+  const ordersResponse = await fetch(`${host}${ordersPath}?${ordersQuery}`, {
+    method: "GET",
+    headers: {
+      "x-phemex-access-token": apiKey,
+      "x-phemex-request-expiry": String(ordersExpiry),
+      "x-phemex-request-signature": ordersSignature
+    }
+  });
+  const rawOrdersPayload = await ordersResponse.text();
+  let ordersPayload: any;
+  try {
+    ordersPayload = JSON.parse(rawOrdersPayload);
+  } catch {
+    ordersPayload = { msg: rawOrdersPayload };
+  }
+  if (!(ordersPayload.code === 10002 && ordersPayload.msg === "OM_ORDER_NOT_FOUND") && (!ordersResponse.ok || ordersPayload.code !== 0)) {
+    throw new Error(phemexErrorMessage(ordersPayload, "Phemex open orders check failed"));
+  }
+  const openRows = Array.isArray(ordersPayload.data?.rows) ? ordersPayload.data.rows : [];
+
+  const positionPath = "/g-accounts/accountPositions";
+  const positionQuery = `currency=USDT&symbol=${encodeURIComponent(symbol)}`;
+  const positionExpiry = Math.floor(Date.now() / 1000) + 60;
+  const positionSignature = signPhemexRequest(positionPath, positionQuery, positionExpiry, "", apiSecret);
+  const positionResponse = await fetch(`${host}${positionPath}?${positionQuery}`, {
+    method: "GET",
+    headers: {
+      "x-phemex-access-token": apiKey,
+      "x-phemex-request-expiry": String(positionExpiry),
+      "x-phemex-request-signature": positionSignature
+    }
+  });
+  const rawPositionPayload = await positionResponse.text();
+  let positionPayload: any;
+  try {
+    positionPayload = JSON.parse(rawPositionPayload);
+  } catch {
+    positionPayload = { msg: rawPositionPayload };
+  }
+  if (!positionResponse.ok || positionPayload.code !== 0) {
+    throw new Error(phemexErrorMessage(positionPayload, "Phemex position check failed"));
+  }
+  const positionSize = phemexPositionRows(positionPayload)
+    .reduce((sum, row) => sum + positionSizeFromExchangeRow(row), 0);
+
+  return {
+    hasExposure: openRows.length > 0 || positionSize > 0,
+    openOrdersCount: openRows.length,
+    positionSize
+  };
+};
+
 const phemexSettingsPlugin = () => ({
   name: "phemex-settings",
   configureServer(server: import("vite").ViteDevServer) {
@@ -175,6 +546,159 @@ const phemexSettingsPlugin = () => ({
       } catch (error) {
         response.statusCode = 500;
         response.end(error instanceof Error ? error.message : "Unknown error");
+      }
+    });
+
+    server.middlewares.use("/api/bot-tick", async (request, response) => {
+      try {
+        if (request.method !== "POST") {
+          response.statusCode = 405;
+          response.end("Method not allowed");
+          return;
+        }
+        const body = await parseBody(request);
+        const targetUrl = cleanEnvValue(body.url);
+        if (!targetUrl || !/^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?\//i.test(targetUrl)) {
+          response.statusCode = 400;
+          response.setHeader("Content-Type", "application/json");
+          response.end(JSON.stringify({ ok: false, message: "Bot URL must point to localhost or 127.0.0.1." }));
+          return;
+        }
+
+        const tickPayload = {
+          mode: body.mode || "replay",
+          botMode: body.botMode || "signals",
+          exchange: body.exchange || "phemex",
+          symbol: body.symbol || "SOLUSDT",
+          timeframe: body.timeframe || "5m",
+          livePrice: body.livePrice,
+          candle: body.candle,
+          openOrders: body.openOrders || [],
+          balance: body.balance,
+          liveOrdersEnabled: body.liveOrdersEnabled === true
+        };
+        const canRestartManagedBot = /^https?:\/\/(127\.0\.0\.1|localhost):8790\/tick$/i.test(targetUrl);
+        const postBotTick = () => fetchWithTimeout(targetUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(tickPayload)
+        });
+
+        let botResponse: Response;
+        try {
+          if (canRestartManagedBot && !(await isBotHealthy())) {
+            await stopManagedBot();
+            const status = await startManagedBot(body.script);
+            if (!status.ready) throw new Error("Bot process is not ready.");
+          }
+          botResponse = await postBotTick();
+        } catch (error) {
+          if (!canRestartManagedBot) throw error;
+          await stopManagedBot();
+          const status = await startManagedBot(body.script);
+          if (!status.ready) throw new Error("Bot process started, but /health did not answer.");
+          botResponse = await postBotTick();
+        }
+        const text = await botResponse.text();
+        response.statusCode = botResponse.ok ? 200 : botResponse.status;
+        response.setHeader("Content-Type", "application/json");
+        response.end(JSON.stringify({
+          ok: botResponse.ok,
+          data: text ? JSON.parse(text) : null
+        }));
+      } catch (error) {
+        response.statusCode = 500;
+        response.setHeader("Content-Type", "application/json");
+        response.end(JSON.stringify({
+          ok: false,
+          message: error instanceof Error ? error.message : "Bot tick failed"
+        }));
+      }
+    });
+
+    server.middlewares.use("/api/bot-process", async (request, response) => {
+      try {
+        if (request.method === "GET") {
+          response.setHeader("Content-Type", "application/json");
+          response.end(JSON.stringify({ ok: true, ...(await managedBotStatus()) }));
+          return;
+        }
+        if (request.method !== "POST") {
+          response.statusCode = 405;
+          response.end("Method not allowed");
+          return;
+        }
+        const body = await parseBody(request);
+        const action = String(body.action || "status");
+        if (action === "start") {
+          const status = await startManagedBot(body.script);
+          response.setHeader("Content-Type", "application/json");
+          response.end(JSON.stringify({ ok: true, ...status }));
+          return;
+        }
+        if (action === "stop") {
+          await stopManagedBot();
+          response.setHeader("Content-Type", "application/json");
+          response.end(JSON.stringify({ ok: true, ...(await managedBotStatus()) }));
+          return;
+        }
+        if (action === "reload") {
+          await stopManagedBot();
+          const status = await startManagedBot(body.script);
+          response.setHeader("Content-Type", "application/json");
+          response.end(JSON.stringify({ ok: true, ...status }));
+          return;
+        }
+        response.statusCode = 400;
+        response.setHeader("Content-Type", "application/json");
+        response.end(JSON.stringify({ ok: false, message: "Unknown bot action." }));
+      } catch (error) {
+        response.statusCode = 500;
+        response.setHeader("Content-Type", "application/json");
+        response.end(JSON.stringify({
+          ok: false,
+          message: error instanceof Error ? error.message : "Bot process action failed"
+        }));
+      }
+    });
+
+    server.middlewares.use("/api/bot-scripts", async (request, response) => {
+      try {
+        if (request.method !== "GET") {
+          response.statusCode = 405;
+          response.end("Method not allowed");
+          return;
+        }
+        const scripts = await listBotScripts();
+        response.setHeader("Content-Type", "application/json");
+        response.end(JSON.stringify({ ok: true, scripts, selected: selectedBotScript }));
+      } catch (error) {
+        response.statusCode = 500;
+        response.setHeader("Content-Type", "application/json");
+        response.end(JSON.stringify({
+          ok: false,
+          message: error instanceof Error ? error.message : "Bot scripts could not be loaded"
+        }));
+      }
+    });
+
+    server.middlewares.use("/api/bot-folder", async (request, response) => {
+      try {
+        if (request.method !== "POST") {
+          response.statusCode = 405;
+          response.end("Method not allowed");
+          return;
+        }
+        await copyBotBridgePath();
+        response.setHeader("Content-Type", "application/json");
+        response.end(JSON.stringify({ ok: true, path: botBridgeDir }));
+      } catch (error) {
+        response.statusCode = 500;
+        response.setHeader("Content-Type", "application/json");
+        response.end(JSON.stringify({
+          ok: false,
+          message: error instanceof Error ? error.message : "Bot folder could not be opened"
+        }));
       }
     });
 
@@ -438,6 +962,7 @@ const phemexSettingsPlugin = () => ({
     });
 
     server.middlewares.use("/api/phemex-order", async (request, response) => {
+      let orderGuardKey: string | undefined;
       try {
         if (request.method !== "POST") {
           response.statusCode = 405;
@@ -455,42 +980,90 @@ const phemexSettingsPlugin = () => ({
           response.end(JSON.stringify({ ok: false, message: `${exchange === "binance" ? "Binance" : "Phemex"} API key/secret missing` }));
           return;
         }
+        const liveOrdersEnabled = exchange === "binance" ? values.BINANCE_LIVE_ORDERS_ENABLED === "true" : values.PHEMEX_LIVE_ORDERS_ENABLED === "true";
+        if (!liveOrdersEnabled) {
+          response.statusCode = 403;
+          response.end(JSON.stringify({ ok: false, message: `${exchange === "binance" ? "Binance" : "Phemex"} live orders are disabled in Exchange settings.` }));
+          return;
+        }
 
         const testnet = body.testnet !== false;
+        const symbol = String(body.symbol || "SOLUSDT").toUpperCase();
+        const quantity = Number(body.quantity);
+        const price = Number(body.price);
+        const orderType = String(body.orderType || "limit").toLowerCase() === "market" ? "market" : "limit";
         if (exchange === "binance") {
           if (!testnet && values.BINANCE_ALLOW_MAINNET_ORDERS !== "true") {
             response.statusCode = 403;
             response.end(JSON.stringify({ ok: false, message: "Mainnet orders are disabled. Enable Mainnet orders in Exchange settings." }));
             return;
           }
-          const symbol = String(body.symbol || "SOLUSDT").toUpperCase();
           const side = body.side === "sell" ? "SELL" : "BUY";
-          const quantity = Number(body.quantity);
-          const price = Number(body.price);
-          if (!Number.isFinite(quantity) || quantity <= 0 || !Number.isFinite(price) || price <= 0) {
+          if (!Number.isFinite(quantity) || quantity <= 0 || (orderType === "limit" && (!Number.isFinite(price) || price <= 0))) {
             response.statusCode = 400;
-            response.end(JSON.stringify({ ok: false, message: "Order needs valid quantity and price" }));
+            response.end(JSON.stringify({ ok: false, message: orderType === "limit" ? "Order needs valid quantity and price" : "Market order needs valid quantity" }));
             return;
           }
-          const params = signedBinanceQuery({
+          const guardLock = lockLiveOrderGuard(exchange, symbol, testnet);
+          if (!guardLock.ok) {
+            response.statusCode = 409;
+            response.setHeader("Content-Type", "application/json");
+            response.end(JSON.stringify({
+              ok: false,
+              message: "Live-Order blockiert: Fuer dieses Symbol wurde gerade bereits eine Order gesendet. Bitte erst Boersenabgleich abwarten.",
+              duplicateGuard: {
+                exchange,
+                symbol,
+                testnet,
+                inFlight: guardLock.guard.inFlight,
+                retryAfterMs: guardLock.retryAfterMs,
+                lastSentAt: guardLock.guard.lastSentAt,
+                lastOrderID: guardLock.guard.lastOrderID,
+                lastClOrdID: guardLock.guard.lastClOrdID
+              }
+            }));
+            return;
+          }
+          orderGuardKey = guardLock.key;
+          const exposure = await assertNoExchangeExposure(exchange, symbol, testnet, apiKey, apiSecret);
+          if (exposure.hasExposure) {
+            releaseLiveOrderGuard(orderGuardKey);
+            orderGuardKey = undefined;
+            response.statusCode = 409;
+            response.setHeader("Content-Type", "application/json");
+            response.end(JSON.stringify({
+              ok: false,
+              message: "Live-Order blockiert: Auf der Boerse ist fuer dieses Symbol bereits eine offene Order oder Position vorhanden.",
+              exposure
+            }));
+            return;
+          }
+          const binanceOrderParams: Record<string, string | number> = {
             symbol,
             side,
-            type: "LIMIT",
-            timeInForce: "GTC",
+            type: orderType === "market" ? "MARKET" : "LIMIT",
             quantity,
-            price,
             newClientOrderId: `crt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-          }, apiSecret);
+          };
+          if (orderType === "limit") {
+            binanceOrderParams.timeInForce = "GTC";
+            binanceOrderParams.price = price;
+          }
+          const params = signedBinanceQuery(binanceOrderParams, apiSecret);
           const binanceResponse = await fetch(`${binanceHost(testnet)}/fapi/v1/order?${params}`, {
             method: "POST",
             headers: { "X-MBX-APIKEY": apiKey }
           });
           const payload = await binanceResponse.json();
           if (!binanceResponse.ok || payload.code) {
+            releaseLiveOrderGuard(orderGuardKey);
+            orderGuardKey = undefined;
             response.statusCode = 502;
             response.end(JSON.stringify({ ok: false, message: payload.msg || "Binance order failed", status: binanceResponse.status, payload }));
             return;
           }
+          markLiveOrderGuardSent(orderGuardKey, payload.orderId, payload.clientOrderId);
+          orderGuardKey = undefined;
           response.setHeader("Content-Type", "application/json");
           response.end(JSON.stringify({ ok: true, orderID: String(payload.orderId), clOrdID: payload.clientOrderId, payload }));
           return;
@@ -501,15 +1074,46 @@ const phemexSettingsPlugin = () => ({
           return;
         }
 
-        const symbol = String(body.symbol || "SOLUSDT").toUpperCase();
         const side = body.side === "sell" ? "Sell" : "Buy";
-        const quantity = Number(body.quantity);
-        const price = Number(body.price);
         const takeProfit = Number(body.takeProfit);
         const stopLoss = Number(body.stopLoss);
-        if (!Number.isFinite(quantity) || quantity <= 0 || !Number.isFinite(price) || price <= 0) {
+        if (!Number.isFinite(quantity) || quantity <= 0 || (orderType === "limit" && (!Number.isFinite(price) || price <= 0))) {
           response.statusCode = 400;
-          response.end(JSON.stringify({ ok: false, message: "Order needs valid quantity and price" }));
+          response.end(JSON.stringify({ ok: false, message: orderType === "limit" ? "Order needs valid quantity and price" : "Market order needs valid quantity" }));
+          return;
+        }
+        const guardLock = lockLiveOrderGuard(exchange, symbol, testnet);
+        if (!guardLock.ok) {
+          response.statusCode = 409;
+          response.setHeader("Content-Type", "application/json");
+          response.end(JSON.stringify({
+            ok: false,
+            message: "Live-Order blockiert: Fuer dieses Symbol wurde gerade bereits eine Order gesendet. Bitte erst Boersenabgleich abwarten.",
+            duplicateGuard: {
+              exchange,
+              symbol,
+              testnet,
+              inFlight: guardLock.guard.inFlight,
+              retryAfterMs: guardLock.retryAfterMs,
+              lastSentAt: guardLock.guard.lastSentAt,
+              lastOrderID: guardLock.guard.lastOrderID,
+              lastClOrdID: guardLock.guard.lastClOrdID
+            }
+          }));
+          return;
+        }
+        orderGuardKey = guardLock.key;
+        const exposure = await assertNoExchangeExposure(exchange, symbol, testnet, apiKey, apiSecret);
+        if (exposure.hasExposure) {
+          releaseLiveOrderGuard(orderGuardKey);
+          orderGuardKey = undefined;
+          response.statusCode = 409;
+          response.setHeader("Content-Type", "application/json");
+          response.end(JSON.stringify({
+            ok: false,
+            message: "Live-Order blockiert: Auf der Boerse ist fuer dieses Symbol bereits eine offene Order oder Position vorhanden.",
+            exposure
+          }));
           return;
         }
 
@@ -519,13 +1123,15 @@ const phemexSettingsPlugin = () => ({
           symbol,
           side,
           posSide: "Merged",
-          ordType: "Limit",
-          timeInForce: "GoodTillCancel",
+          ordType: orderType === "market" ? "Market" : "Limit",
+          timeInForce: orderType === "market" ? "ImmediateOrCancel" : "GoodTillCancel",
           orderQtyRq: String(quantity),
-          priceRp: String(price),
           clOrdID: `crt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
           text: "Chart_Replay_Tool"
         };
+        if (orderType === "limit") {
+          orderBody.priceRp = String(price);
+        }
         if (Number.isFinite(takeProfit) && takeProfit > 0) {
           orderBody.takeProfitRp = String(takeProfit);
         }
@@ -554,6 +1160,8 @@ const phemexSettingsPlugin = () => ({
           payload = { msg: rawPayload };
         }
         if (!phemexResponse.ok || payload.code !== 0 || Number(payload.data?.bizError || 0) !== 0) {
+          releaseLiveOrderGuard(orderGuardKey);
+          orderGuardKey = undefined;
           response.statusCode = 502;
           response.end(JSON.stringify({
             ok: false,
@@ -564,6 +1172,8 @@ const phemexSettingsPlugin = () => ({
           return;
         }
 
+        markLiveOrderGuardSent(orderGuardKey, payload.data?.orderID, payload.data?.clOrdID);
+        orderGuardKey = undefined;
         response.setHeader("Content-Type", "application/json");
         response.end(JSON.stringify({
           ok: true,
@@ -572,6 +1182,7 @@ const phemexSettingsPlugin = () => ({
           payload
         }));
       } catch (error) {
+        releaseLiveOrderGuard(orderGuardKey);
         response.statusCode = 500;
         response.end(error instanceof Error ? error.message : "Unknown error");
       }
@@ -826,6 +1437,8 @@ const phemexSettingsPlugin = () => ({
         const quantity = Number(body.quantity);
         const takeProfit = Number(body.takeProfit);
         const stopLoss = Number(body.stopLoss);
+        const takeProfitOrderID = String(body.takeProfitOrderID || "").trim();
+        const stopLossOrderID = String(body.stopLossOrderID || "").trim();
         if (!Number.isFinite(quantity) || quantity <= 0) {
           response.statusCode = 400;
           response.end(JSON.stringify({ ok: false, message: "Position protection needs valid quantity" }));
@@ -880,6 +1493,101 @@ const phemexSettingsPlugin = () => ({
         }
 
         const host = testnet ? "https://testnet-api.phemex.com" : "https://api.phemex.com";
+        const applyOrderReference = (params: URLSearchParams, orderReference: string) => {
+          if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(orderReference)) {
+            params.set("orderID", orderReference);
+          } else {
+            params.set("origClOrdID", orderReference);
+          }
+        };
+        const cancelExistingProtection = async (orderID: string) => {
+          if (!orderID) return undefined;
+          const path = "/g-orders/cancel";
+          const expiry = Math.floor(Date.now() / 1000) + 60;
+          const params = new URLSearchParams({
+            symbol,
+            posSide: "Merged"
+          });
+          applyOrderReference(params, orderID);
+          const query = params.toString();
+          const signature = signPhemexRequest(path, query, expiry, "", apiSecret);
+          const phemexResponse = await fetch(`${host}${path}?${query}`, {
+            method: "DELETE",
+            headers: {
+              "x-phemex-access-token": apiKey,
+              "x-phemex-request-expiry": String(expiry),
+              "x-phemex-request-signature": signature
+            }
+          });
+          const rawPayload = await phemexResponse.text();
+          let payload: any;
+          try {
+            payload = JSON.parse(rawPayload);
+          } catch {
+            payload = { msg: rawPayload };
+          }
+          if (!phemexResponse.ok || (payload.code !== 0 && payload.code !== 10002)) {
+            throw {
+              message: phemexErrorMessage(payload, "Phemex old protection cancel failed"),
+              status: phemexResponse.status,
+              request: { path, params: Object.fromEntries(params.entries()) },
+              payload
+            };
+          }
+          return {
+            orderID,
+            request: { path, params: Object.fromEntries(params.entries()) },
+            payload
+          };
+        };
+
+        const replaceExistingProtection = async (kind: "takeProfit" | "stopLoss", orderID: string, triggerPrice: number) => {
+          const path = "/g-orders/replace";
+          const expiry = Math.floor(Date.now() / 1000) + 60;
+          const params = new URLSearchParams({
+            symbol,
+            posSide: "Merged",
+            clOrdID: `crt-${kind}-replace-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            orderQtyRq: String(quantity),
+            stopPxRp: String(triggerPrice),
+            triggerType: "ByLastPrice",
+            ordType: kind === "takeProfit" ? "MarketIfTouched" : "Stop",
+            timeInForce: "ImmediateOrCancel"
+          });
+          applyOrderReference(params, orderID);
+          const query = params.toString();
+          const signature = signPhemexRequest(path, query, expiry, "", apiSecret);
+          const phemexResponse = await fetch(`${host}${path}?${query}`, {
+            method: "PUT",
+            headers: {
+              "x-phemex-access-token": apiKey,
+              "x-phemex-request-expiry": String(expiry),
+              "x-phemex-request-signature": signature
+            }
+          });
+          const rawPayload = await phemexResponse.text();
+          let payload: any;
+          try {
+            payload = JSON.parse(rawPayload);
+          } catch {
+            payload = { msg: rawPayload };
+          }
+          if (!phemexResponse.ok || payload.code !== 0 || Number(payload.data?.bizError || 0) !== 0) {
+            throw {
+              message: phemexErrorMessage(payload, `Phemex ${kind} protection replace failed`),
+              status: phemexResponse.status,
+              request: { path, params: Object.fromEntries(params.entries()) },
+              payload
+            };
+          }
+          return {
+            orderID: payload.data?.orderID || orderID,
+            clOrdID: payload.data?.clOrdID,
+            request: { path, params: Object.fromEntries(params.entries()) },
+            payload
+          };
+        };
+
         const createConditionalOrder = async (kind: "takeProfit" | "stopLoss", triggerPrice: number) => {
           const path = "/g-orders";
           const expiry = Math.floor(Date.now() / 1000) + 60;
@@ -933,11 +1641,21 @@ const phemexSettingsPlugin = () => ({
         };
 
         const result: Record<string, unknown> = {};
-        if (Number.isFinite(takeProfit) && takeProfit > 0) {
-          result.takeProfit = await createConditionalOrder("takeProfit", takeProfit);
+        const hasTakeProfit = Number.isFinite(takeProfit) && takeProfit > 0;
+        const hasStopLoss = Number.isFinite(stopLoss) && stopLoss > 0;
+        if (hasTakeProfit) {
+          result.takeProfit = takeProfitOrderID
+            ? await replaceExistingProtection("takeProfit", takeProfitOrderID, takeProfit)
+            : await createConditionalOrder("takeProfit", takeProfit);
+        } else if (takeProfitOrderID) {
+          result.oldTakeProfit = await cancelExistingProtection(takeProfitOrderID);
         }
-        if (Number.isFinite(stopLoss) && stopLoss > 0) {
-          result.stopLoss = await createConditionalOrder("stopLoss", stopLoss);
+        if (hasStopLoss) {
+          result.stopLoss = stopLossOrderID
+            ? await replaceExistingProtection("stopLoss", stopLossOrderID, stopLoss)
+            : await createConditionalOrder("stopLoss", stopLoss);
+        } else if (stopLossOrderID) {
+          result.oldStopLoss = await cancelExistingProtection(stopLossOrderID);
         }
 
         response.setHeader("Content-Type", "application/json");
@@ -951,6 +1669,133 @@ const phemexSettingsPlugin = () => ({
           request: error?.request,
           payload: error?.payload
         }));
+      }
+    });
+
+    server.middlewares.use("/api/phemex-close-position", async (request, response) => {
+      try {
+        if (request.method !== "POST") {
+          response.statusCode = 405;
+          response.end("Method not allowed");
+          return;
+        }
+
+        const values = await loadEnvValues();
+        const body = await parseBody(request);
+        const exchange = activeExchangeFromBody(body, values);
+        const apiKey = cleanEnvValue(exchange === "binance" ? values.BINANCE_API_KEY : values.PHEMEX_API_KEY);
+        const apiSecret = cleanEnvValue(exchange === "binance" ? values.BINANCE_API_SECRET : values.PHEMEX_API_SECRET);
+        if (!apiKey || !apiSecret) {
+          response.statusCode = 401;
+          response.end(JSON.stringify({ ok: false, message: `${exchange === "binance" ? "Binance" : "Phemex"} API key/secret missing` }));
+          return;
+        }
+
+        const testnet = body.testnet !== false;
+        const liveOrdersEnabled = exchange === "binance" ? values.BINANCE_LIVE_ORDERS_ENABLED === "true" : values.PHEMEX_LIVE_ORDERS_ENABLED === "true";
+        if (!liveOrdersEnabled) {
+          response.statusCode = 403;
+          response.end(JSON.stringify({ ok: false, message: `${exchange === "binance" ? "Binance" : "Phemex"} live orders are disabled in Exchange settings.` }));
+          return;
+        }
+        if (!testnet && (exchange === "binance" ? values.BINANCE_ALLOW_MAINNET_ORDERS : values.PHEMEX_ALLOW_MAINNET_ORDERS) !== "true") {
+          response.statusCode = 403;
+          response.end(JSON.stringify({ ok: false, message: "Mainnet orders are disabled. Enable Mainnet orders in Exchange settings." }));
+          return;
+        }
+
+        const symbol = String(body.symbol || "SOLUSDT").toUpperCase();
+        const side = String(body.side || "").toLowerCase() === "sell" ? "sell" : "buy";
+        const quantity = Number(body.quantity);
+        if (!Number.isFinite(quantity) || quantity <= 0) {
+          response.statusCode = 400;
+          response.end(JSON.stringify({ ok: false, message: "Close needs valid quantity" }));
+          return;
+        }
+
+        if (exchange === "binance") {
+          const query = signedBinanceQuery({
+            symbol,
+            side: side === "buy" ? "SELL" : "BUY",
+            type: "MARKET",
+            quantity,
+            reduceOnly: true,
+            newClientOrderId: `crt-close-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+          }, apiSecret);
+          const binanceResponse = await fetch(`${binanceHost(testnet)}/fapi/v1/order?${query}`, {
+            method: "POST",
+            headers: { "X-MBX-APIKEY": apiKey }
+          });
+          const payload = await binanceResponse.json();
+          if (!binanceResponse.ok || payload.code) {
+            response.statusCode = 502;
+            response.end(JSON.stringify({
+              ok: false,
+              message: payload.msg || "Binance close position failed",
+              status: binanceResponse.status,
+              payload
+            }));
+            return;
+          }
+          response.setHeader("Content-Type", "application/json");
+          response.end(JSON.stringify({ ok: true, orderID: String(payload.orderId), clOrdID: payload.clientOrderId, payload }));
+          return;
+        }
+
+        const path = "/g-orders";
+        const expiry = Math.floor(Date.now() / 1000) + 60;
+        const orderBody: Record<string, string | boolean> = {
+          symbol,
+          side: side === "buy" ? "Sell" : "Buy",
+          posSide: "Merged",
+          ordType: "Market",
+          timeInForce: "ImmediateOrCancel",
+          orderQtyRq: String(quantity),
+          reduceOnly: true,
+          clOrdID: `crt-close-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          text: "Chart_Replay_Tool"
+        };
+        const rawBody = JSON.stringify(orderBody);
+        const signature = signPhemexRequest(path, "", expiry, rawBody, apiSecret);
+        const host = testnet ? "https://testnet-api.phemex.com" : "https://api.phemex.com";
+        const phemexResponse = await fetch(`${host}${path}`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-phemex-access-token": apiKey,
+            "x-phemex-request-expiry": String(expiry),
+            "x-phemex-request-signature": signature
+          },
+          body: rawBody
+        });
+        const rawPayload = await phemexResponse.text();
+        let payload: any;
+        try {
+          payload = JSON.parse(rawPayload);
+        } catch {
+          payload = { msg: rawPayload };
+        }
+        if (!phemexResponse.ok || payload.code !== 0 || Number(payload.data?.bizError || 0) !== 0) {
+          response.statusCode = 502;
+          response.end(JSON.stringify({
+            ok: false,
+            message: phemexErrorMessage(payload, "Phemex close position failed"),
+            status: phemexResponse.status,
+            payload
+          }));
+          return;
+        }
+
+        response.setHeader("Content-Type", "application/json");
+        response.end(JSON.stringify({
+          ok: true,
+          orderID: payload.data?.orderID,
+          clOrdID: payload.data?.clOrdID,
+          payload
+        }));
+      } catch (error) {
+        response.statusCode = 500;
+        response.end(error instanceof Error ? error.message : "Unknown error");
       }
     });
 
