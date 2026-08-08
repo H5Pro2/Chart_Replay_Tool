@@ -67,6 +67,9 @@ type TradeOrder = {
   closedAt?: Time;
   closePrice?: number;
   result?: "TP" | "SL" | "CANCEL" | "CLOSE";
+  spotGrid?: boolean;
+  mechanic?: "spot_grid" | string;
+  gridIndex?: number;
 };
 
 type CsvRow = Record<string, string | number | undefined>;
@@ -82,6 +85,8 @@ const defaultCandles: Candle[] = [
   { time: "2026-01-07" as Time, open: 110, high: 112, low: 106, close: 108, volume: 1710 },
   { time: "2026-01-08" as Time, open: 108, high: 115, low: 107, close: 114, volume: 1970 }
 ];
+
+const GRID_BOT_STOP_LOSS_ENABLED = true;
 
 const numberFrom = (value: unknown) => {
   const normalized = String(value ?? "").replace(",", ".").trim();
@@ -386,7 +391,7 @@ const orderExchangeLabel = (order: TradeOrder) => {
   const exchange = order.exchange ?? (order.id.startsWith("POS-") ? order.id.split("-")[1] : undefined);
   if (exchange === "phemex") return "Phemex";
   if (exchange === "binance") return "Binance";
-  return "Replay";
+  return "Test Trading";
 };
 
 const orderTypeLabel = (order: TradeOrder) => {
@@ -568,6 +573,14 @@ type CsvBuilderState = {
 
 type OrderLineField = "entry" | "takeProfit" | "stopLoss";
 
+type GridTriggerLine = {
+  id: string;
+  price: number;
+  side: Side;
+  index: number;
+  distancePercent: number;
+};
+
 type ChartTheme = {
   upColor: string;
   downColor: string;
@@ -614,6 +627,18 @@ type BotSettings = {
   mode: "signals" | "paper" | "live";
   orderType: "limit" | "market";
   script: string;
+  gridEnabled: boolean;
+  gridPriceFrom: string;
+  gridPriceTo: string;
+  gridStepPercent: string;
+  gridTakeProfitPercent: string;
+  gridStopLossPercent: string;
+  gridDirection: "long" | "short" | "neutral";
+  gridCount: string;
+  gridInvestment: string;
+  gridLeverage: string;
+  gridAmountMode: "asset" | "usdt";
+  gridAmountValue: string;
 };
 
 type BotProcessStatus = {
@@ -658,6 +683,7 @@ const defaultDrawingFillColor = "#7db8ff";
 const rightPriceScaleOffset = 64;
 const phemexOrderIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const isOpenTradeOrder = (order: TradeOrder) => order.status === "pending" || order.status === "active";
+const isSpotGridTradeOrder = (order: TradeOrder) => order.spotGrid === true || order.mechanic === "spot_grid";
 const keepSingleOpenOrder = (orders: TradeOrder[]) => {
   let hasOpenOrder = false;
   return orders.filter((order) => {
@@ -709,12 +735,33 @@ const loadStoredBotOptions = (): BotSettings => {
   try {
     const raw = window.localStorage.getItem(botOptionsStorageKey);
     const parsed = raw ? JSON.parse(raw) : {};
+    const storedScript = typeof parsed.script === "string" && parsed.script.trim() ? parsed.script : "long_bot.py";
     return {
       enabled: Boolean(parsed.enabled),
       url: typeof parsed.url === "string" && parsed.url.trim() ? parsed.url : "http://127.0.0.1:8790/tick",
       mode: parsed.mode === "paper" || parsed.mode === "live" ? parsed.mode : "signals",
       orderType: parsed.orderType === "market" ? "market" : "limit",
-      script: typeof parsed.script === "string" && parsed.script.trim() ? parsed.script : "long_bot.py"
+      script: storedScript === "phemex_grid_bot.py" || storedScript === "grid_bot.py" ? "spot_grid_bot.py" : storedScript,
+      gridEnabled: Boolean(parsed.gridEnabled),
+      gridPriceFrom: typeof parsed.gridPriceFrom === "string"
+        ? parsed.gridPriceFrom.replace(",", ".")
+        : typeof parsed.gridBasePrice === "string"
+          ? parsed.gridBasePrice.replace(",", ".")
+          : "",
+      gridPriceTo: typeof parsed.gridPriceTo === "string" ? parsed.gridPriceTo.replace(",", ".") : "",
+      gridStepPercent: typeof parsed.gridStepPercent === "string" ? parsed.gridStepPercent.replace(",", ".") : "1",
+      gridTakeProfitPercent: typeof parsed.gridTakeProfitPercent === "string" ? parsed.gridTakeProfitPercent.replace(",", ".") : "1",
+      gridStopLossPercent: typeof parsed.gridStopLossPercent === "string" ? parsed.gridStopLossPercent.replace(",", ".") : "0.98",
+      gridDirection: parsed.gridDirection === "long" || parsed.gridDirection === "short" ? parsed.gridDirection : "neutral",
+      gridCount: typeof parsed.gridCount === "string" ? parsed.gridCount.replace(",", ".") : "500",
+      gridInvestment: typeof parsed.gridInvestment === "string" ? parsed.gridInvestment.replace(",", ".") : "",
+      gridLeverage: typeof parsed.gridLeverage === "string" ? parsed.gridLeverage.replace(",", ".") : "10",
+      gridAmountMode: parsed.gridAmountMode === "asset" ? "asset" : "usdt",
+      gridAmountValue: typeof parsed.gridAmountValue === "string"
+        ? parsed.gridAmountValue.replace(",", ".")
+        : typeof parsed.gridInvestment === "string"
+          ? parsed.gridInvestment.replace(",", ".")
+          : ""
     };
   } catch {
     return {
@@ -722,7 +769,19 @@ const loadStoredBotOptions = (): BotSettings => {
       url: "http://127.0.0.1:8790/tick",
       mode: "signals",
       orderType: "limit",
-      script: "long_bot.py"
+      script: "long_bot.py",
+      gridEnabled: false,
+      gridPriceFrom: "",
+      gridPriceTo: "",
+      gridStepPercent: "1",
+      gridTakeProfitPercent: "1",
+      gridStopLossPercent: "0.98",
+      gridDirection: "neutral",
+      gridCount: "500",
+      gridInvestment: "",
+      gridLeverage: "10",
+      gridAmountMode: "asset",
+      gridAmountValue: ""
     };
   }
 };
@@ -944,6 +1003,33 @@ const translations = {
     botSignal: (action: string) => `Bot-Signal: ${action}`,
     botTickFailed: "Bot-Tick konnte nicht gesendet werden.",
     botLiveMissingQuantity: "Live-Bot kann nicht starten: Bitte zuerst eine Größe in der Live-Ordermaske eintragen.",
+    botGrid: "Bot-Grid",
+    botGridEnabled: "Triggerlinien anzeigen",
+    botGridHint: "Zeigt nur Grid-Trigger im Chart. Es wird dadurch keine Order gesetzt.",
+    botGridPriceFrom: "Preis von",
+    botGridPriceTo: "Preis bis",
+    botGridPriceRange: "Preisklasse",
+    botGridStepPercent: "Grid-Abstand %",
+    botGridTakeProfitPercent: "TP %",
+    botGridStopLossPercent: "SL %",
+    botGridCount: "Gitter",
+    botGridInvestment: "Spot-Kapital",
+    botGridAmountMode: "Mengenmodus",
+    botGridAmountModeAsset: "Asset pro Grid",
+    botGridAmountModeUsdt: "USDT pro Grid",
+    botGridAmountValue: "Menge pro Grid",
+    botGridLeverage: "Hebel",
+    botGridProfitPerGrid: "Gewinn pro Netz",
+    botGridAmountPerGrid: "Menge pro Grid",
+    botGridEstimatedLiquidation: "Future-Schutz",
+    botGridDirection: "Richtung",
+    botGridDirectionLong: "Long",
+    botGridDirectionShort: "Short",
+    botGridDirectionNeutral: "Neutral",
+    botGridApply: "Übernehmen",
+    botGridApplied: "Grid-Einstellungen übernommen.",
+    botGridAppliedShort: "Übernommen",
+    botGridInvalid: "Grid-Einstellungen sind unvollständig oder ungültig.",
     phemexConnection: "Phemex-Anbindung",
     connectionSection: "Verbindung",
     dataModeSection: "Datenmodus",
@@ -957,7 +1043,7 @@ const translations = {
     timeframe: "Zeiteinheit",
     candleLimit: "Kerzenanzahl",
     exchangeMode: "Modus",
-    replayMode: "Replay",
+    replayMode: "Test Trading",
     liveMode: "Live",
     pollSeconds: "Preisabruf in Sekunden",
     liveStatus: "Live-Status",
@@ -1039,6 +1125,7 @@ const translations = {
     play: "Play",
     pause: "Pause",
     step: "Step",
+    replayPosition: "Replay",
     replayDelay: "Ablaufzeit",
     reset: "Reset",
     order: "Order",
@@ -1182,6 +1269,33 @@ const translations = {
     botSignal: (action: string) => `Bot signal: ${action}`,
     botTickFailed: "Bot tick could not be sent.",
     botLiveMissingQuantity: "Live bot cannot start: enter an amount in the live order panel first.",
+    botGrid: "Bot Grid",
+    botGridEnabled: "Show trigger lines",
+    botGridHint: "Shows grid triggers in the chart only. This does not place an order.",
+    botGridPriceFrom: "Price From",
+    botGridPriceTo: "Price To",
+    botGridPriceRange: "Price Range",
+    botGridStepPercent: "Grid Step %",
+    botGridTakeProfitPercent: "TP %",
+    botGridStopLossPercent: "SL %",
+    botGridCount: "Grid",
+    botGridInvestment: "Spot Capital",
+    botGridAmountMode: "Amount Mode",
+    botGridAmountModeAsset: "Asset per Grid",
+    botGridAmountModeUsdt: "USDT per Grid",
+    botGridAmountValue: "Amount per Grid",
+    botGridLeverage: "Leverage",
+    botGridProfitPerGrid: "Profit per Grid",
+    botGridAmountPerGrid: "Amount per Grid",
+    botGridEstimatedLiquidation: "Future Guard",
+    botGridDirection: "Direction",
+    botGridDirectionLong: "Long",
+    botGridDirectionShort: "Short",
+    botGridDirectionNeutral: "Neutral",
+    botGridApply: "Apply",
+    botGridApplied: "Grid settings applied.",
+    botGridAppliedShort: "Applied",
+    botGridInvalid: "Grid settings are incomplete or invalid.",
     phemexConnection: "Phemex Connection",
     connectionSection: "Connection",
     dataModeSection: "Data Mode",
@@ -1195,7 +1309,7 @@ const translations = {
     timeframe: "Timeframe",
     candleLimit: "Candle Limit",
     exchangeMode: "Mode",
-    replayMode: "Replay",
+    replayMode: "Test Trading",
     liveMode: "Live",
     pollSeconds: "Price Poll Seconds",
     liveStatus: "Live Status",
@@ -1277,6 +1391,7 @@ const translations = {
     play: "Play",
     pause: "Pause",
     step: "Step",
+    replayPosition: "Replay",
     replayDelay: "Replay Delay",
     reset: "Reset",
     order: "Order",
@@ -1371,15 +1486,17 @@ function TradingApp() {
   const hasChartOverlaysRef = useRef(false);
   const ordersRef = useRef<TradeOrder[]>([]);
   const botTickInFlightRef = useRef(false);
+  const botReplayQueueRef = useRef<Candle[]>([]);
   const botEnabledRef = useRef(storedBotOptions.enabled);
   const lastMissingProtectionPopupAtRef = useRef(0);
   const liveOrderPlacementRef = useRef<{ locked: boolean; orderID?: string; clOrdID?: string; startedAt: number } | null>(null);
+  const liveProtectionCloseInFlightRef = useRef<Set<string>>(new Set());
   const lastLiveOrderSubmitAtRef = useRef(0);
   const restoreLiveAfterReloadRef = useRef(storedRuntimeState.liveRunning);
   const liveRestoreInFlightRef = useRef(false);
   const submitOrderRef = useRef<(
     forcedSide?: Side,
-    forcedProtection?: { takeProfit?: number; stopLoss?: number }
+    forcedOptions?: { entry?: number; takeProfit?: number; stopLoss?: number; quantity?: number; allowMissingProtection?: boolean }
   ) => Promise<void>>(async () => undefined);
   const canceledPhemexOrderKeysRef = useRef<Set<string>>(new Set());
   const openPhemexOrderKeysRef = useRef<Set<string>>(new Set());
@@ -1404,7 +1521,7 @@ function TradingApp() {
   const [allCandles, setAllCandles] = useState<Candle[]>(defaultCandles);
   const [visibleCount, setVisibleCount] = useState(4);
   const [isPlaying, setIsPlaying] = useState(false);
-  const [speedMs, setSpeedMs] = useState(800);
+  const [speedMs, setSpeedMs] = useState(100);
   const [orders, setOrders] = useState<TradeOrder[]>(() => loadStoredPendingOrders());
   const [side, setSide] = useState<Side>("buy");
   const [quantity, setQuantity] = useState(storedLiveOrderPanelOptions.quantity);
@@ -1466,6 +1583,7 @@ function TradingApp() {
   const [botProcessStatus, setBotProcessStatus] = useState<BotProcessStatus>({ running: false });
   const [botScripts, setBotScripts] = useState<string[]>([storedBotOptions.script || "long_bot.py"]);
   const [botRuntimeInfo, setBotRuntimeInfo] = useState<{ lastTick?: number; lastAction?: string; lastError?: string; lastPayload?: unknown }>({});
+  const [botGridApplyState, setBotGridApplyState] = useState<"idle" | "applied" | "error">("idle");
   const [activePhemexSettings, setActivePhemexSettings] = useState<PhemexSettings>(() => ({
     exchange: storedExchangeOptions.exchange === "binance" ? "binance" : "phemex",
     apiKey: "",
@@ -1511,6 +1629,25 @@ function TradingApp() {
           : t.liveInactive;
 
   const visibleCandles = useMemo(() => allCandles.slice(0, visibleCount), [allCandles, visibleCount]);
+  const makeReplayWindowRange = useCallback((count: number) => {
+    const windowSize = 72;
+    const rightPadding = 12;
+    const lastLogical = Math.max(0, count - 1);
+    const from = lastLogical - windowSize + rightPadding;
+    return {
+      from: from as Logical,
+      to: (from + windowSize) as Logical
+    };
+  }, []);
+  const applyReplayWindowRange = useCallback((count: number) => {
+    const timeScale = chartRef.current?.timeScale();
+    if (!timeScale) return;
+    const range = makeReplayWindowRange(count);
+    timeScale.setVisibleLogicalRange(range);
+    window.requestAnimationFrame(() => {
+      chartRef.current?.timeScale().setVisibleLogicalRange(range);
+    });
+  }, [makeReplayWindowRange]);
   const lastCandle = visibleCandles.at(-1);
   const openOrders = useMemo(
     () => orders.filter((order) => order.status === "pending" || order.status === "active"),
@@ -1570,12 +1707,163 @@ function TradingApp() {
   const liveReferencePrice = liveLastPrice ?? lastCandle?.close;
   const liveOrderPrice = liveOrderType === "market" ? liveReferencePrice : entry ? Number(entry) : liveReferencePrice;
   const effectiveBotOrderType = botSettings.mode === "live" ? liveOrderType : botSettings.orderType;
+  const isGridBotScript = botSettings.script.toLowerCase().includes("grid_bot");
+  const isPhemexGridBotScript = botSettings.script.toLowerCase() === "spot_grid_bot.py";
+  const gridTriggerLines = useMemo<GridTriggerLine[]>(() => {
+    if (!isGridBotScript) return [];
+    const fromPrice = numberFrom(botSettings.gridPriceFrom);
+    const toPrice = numberFrom(botSettings.gridPriceTo);
+    const rawStepPercent = numberFrom(botSettings.gridStepPercent);
+    const gridCount = Math.max(1, Math.floor(numberFrom(botSettings.gridCount) ?? 0));
+    const referencePrice = liveReferencePrice ?? fromPrice ?? toPrice;
+    const minPrice = fromPrice !== undefined && toPrice !== undefined ? Math.min(fromPrice, toPrice) : undefined;
+    const maxPrice = fromPrice !== undefined && toPrice !== undefined ? Math.max(fromPrice, toPrice) : undefined;
+    const spanPercent = minPrice && maxPrice ? ((maxPrice - minPrice) / minPrice) * 100 : 0;
+    const stepPercent = isPhemexGridBotScript && gridCount > 1 ? spanPercent / (gridCount - 1) : rawStepPercent;
+    if (
+      fromPrice === undefined ||
+      toPrice === undefined ||
+      referencePrice === undefined ||
+      minPrice === undefined ||
+      maxPrice === undefined ||
+      !Number.isFinite(fromPrice) ||
+      !Number.isFinite(toPrice) ||
+      !Number.isFinite(referencePrice) ||
+      fromPrice <= 0 ||
+      toPrice <= 0 ||
+      stepPercent === undefined ||
+      !Number.isFinite(stepPercent) ||
+      stepPercent <= 0 ||
+      (isPhemexGridBotScript && gridCount <= 1)
+    ) {
+      return [];
+    }
+
+    const step = Math.max(minPrice * (stepPercent / 100), 0.000001);
+    const maxLines = isPhemexGridBotScript ? Math.min(gridCount, 1000) : 120;
+    const lines: GridTriggerLine[] = [];
+    for (let price = minPrice, index = 0; price <= maxPrice && index < maxLines; price += step, index += 1) {
+      const normalizedPrice = Number(price.toFixed(6));
+      const side: Side =
+        botSettings.gridDirection === "long"
+          ? "buy"
+          : botSettings.gridDirection === "short"
+            ? "sell"
+            : normalizedPrice < referencePrice
+              ? "buy"
+              : "sell";
+      lines.push({
+        id: `grid-${side}-${index}`,
+        price: normalizedPrice,
+        side,
+        index,
+        distancePercent: Math.abs(((normalizedPrice - referencePrice) / referencePrice) * 100)
+      });
+    }
+    return lines.filter((line) => line.price > 0);
+  }, [botSettings.gridCount, botSettings.gridDirection, botSettings.gridPriceFrom, botSettings.gridPriceTo, botSettings.gridStepPercent, isGridBotScript, isPhemexGridBotScript, liveReferencePrice]);
+  const visibleGridTriggerLines = useMemo(() => {
+    if (!botSettings.gridEnabled || !gridTriggerLines.length) return [];
+    const maxVisualLines = 120;
+    if (gridTriggerLines.length <= maxVisualLines) return gridTriggerLines;
+
+    const step = Math.ceil(gridTriggerLines.length / maxVisualLines);
+    const sampled = gridTriggerLines.filter((_, index) => index % step === 0);
+    const referencePrice = liveReferencePrice;
+    if (referencePrice === undefined) return sampled.slice(0, maxVisualLines);
+
+    const nearest = [...gridTriggerLines]
+      .sort((left, right) => Math.abs(left.price - referencePrice) - Math.abs(right.price - referencePrice))
+      .slice(0, 20);
+    const byId = new Map<string, GridTriggerLine>();
+    [...sampled, ...nearest].forEach((line) => byId.set(line.id, line));
+    return [...byId.values()]
+      .sort((left, right) => left.price - right.price)
+      .slice(0, maxVisualLines);
+  }, [botSettings.gridEnabled, gridTriggerLines, liveReferencePrice]);
+  const getGridProtectionForOrder = useCallback((side: Side, entryPrice: number, gridIndex?: unknown) => {
+    if (!isGridBotScript || !Number.isFinite(entryPrice) || entryPrice <= 0 || gridTriggerLines.length < 2) {
+      return { takeProfit: undefined as number | undefined, stopLoss: undefined as number | undefined };
+    }
+
+    const sortedLines = [...gridTriggerLines]
+      .filter((line) => Number.isFinite(line.price) && line.price > 0)
+      .sort((left, right) => left.price - right.price);
+    const indexFromBot = typeof gridIndex === "number" ? gridIndex : numberFrom(gridIndex);
+    let triggerLine =
+      indexFromBot !== undefined
+        ? sortedLines.find((line) => line.index === indexFromBot)
+        : undefined;
+    if (!triggerLine) {
+      triggerLine = sortedLines.reduce((closest, line) => (
+        Math.abs(line.price - entryPrice) < Math.abs(closest.price - entryPrice) ? line : closest
+      ), sortedLines[0]);
+    }
+
+    const lowerLine = [...sortedLines].reverse().find((line) => line.price < triggerLine.price);
+    const upperLine = sortedLines.find((line) => line.price > triggerLine.price);
+    const tpPercent = (numberFrom(botSettings.gridTakeProfitPercent) ?? 1) / 100;
+    const slPercent = (numberFrom(botSettings.gridStopLossPercent) ?? 0.98) / 100;
+    const fallbackTakeProfit = side === "buy"
+      ? entryPrice * (1 + tpPercent)
+      : entryPrice * (1 - tpPercent);
+    const fallbackStopLoss = side === "buy"
+      ? entryPrice * (1 - slPercent)
+      : entryPrice * (1 + slPercent);
+
+    const takeProfit = side === "buy" ? upperLine?.price ?? fallbackTakeProfit : lowerLine?.price ?? fallbackTakeProfit;
+    const stopLoss = GRID_BOT_STOP_LOSS_ENABLED
+      ? side === "buy"
+        ? lowerLine?.price ?? fallbackStopLoss
+        : upperLine?.price ?? fallbackStopLoss
+      : undefined;
+    return {
+      takeProfit: Number(takeProfit.toFixed(6)),
+      stopLoss: stopLoss !== undefined ? Number(stopLoss.toFixed(6)) : undefined
+    };
+  }, [
+    botSettings.gridStopLossPercent,
+    botSettings.gridTakeProfitPercent,
+    gridTriggerLines,
+    isGridBotScript
+  ]);
+  const phemexGridPreview = useMemo(() => {
+    const fromPrice = numberFrom(botSettings.gridPriceFrom);
+    const toPrice = numberFrom(botSettings.gridPriceTo);
+    const gridCount = Math.max(1, Math.floor(numberFrom(botSettings.gridCount) ?? 0));
+    const amountValue = numberFrom(botSettings.gridAmountValue);
+    if (
+      fromPrice === undefined ||
+      toPrice === undefined ||
+      gridCount <= 1 ||
+      amountValue === undefined ||
+      fromPrice <= 0 ||
+      toPrice <= 0 ||
+      amountValue <= 0
+    ) {
+      return {
+        profitPerGrid: "--",
+        amountPerGrid: "--",
+        liquidation: "--"
+      };
+    }
+    const minPrice = Math.min(fromPrice, toPrice);
+    const maxPrice = Math.max(fromPrice, toPrice);
+    const gridStepPercent = ((maxPrice - minPrice) / Math.max(gridCount - 1, 1) / minPrice) * 100;
+    const averagePrice = (minPrice + maxPrice) / 2;
+    const amountPerGrid = botSettings.gridAmountMode === "asset" ? amountValue : amountValue / averagePrice;
+    return {
+      profitPerGrid: `${gridStepPercent.toFixed(2)}%`,
+      amountPerGrid: `${amountPerGrid.toFixed(4)} ${activePhemexSettings.symbol.replace(/USDT$/i, "") || "Coin"}`,
+      liquidation: "Spot only"
+    };
+  }, [activePhemexSettings.symbol, botSettings.gridAmountMode, botSettings.gridAmountValue, botSettings.gridCount, botSettings.gridPriceFrom, botSettings.gridPriceTo]);
   const botNoTradeReason = useMemo(() => {
     if (!botProcessStatus.running) return t.botWaitProcess;
     if (!botSettings.enabled) return t.botWaitTicks;
     if (botSettings.mode === "live" && !isLiveRunning) return t.botWaitLive;
     if (botSettings.mode === "live" && !activePhemexSettings.liveOrdersEnabled) return t.botWaitLiveOrders;
-    if (botSettings.mode === "live" && (!Number.isFinite(quantity) || quantity <= 0)) return t.botWaitQuantity;
+    if (botSettings.mode === "live" && !isPhemexGridBotScript && (!Number.isFinite(quantity) || quantity <= 0)) return t.botWaitQuantity;
     if (openOrders.length > 0) return t.botWaitOpenOrder;
     return t.botTradeReady;
   }, [
@@ -1583,6 +1871,7 @@ function TradingApp() {
     botProcessStatus.running,
     botSettings.enabled,
     botSettings.mode,
+    isPhemexGridBotScript,
     isLiveRunning,
     openOrders.length,
     quantity,
@@ -1992,13 +2281,15 @@ function TradingApp() {
   ]);
 
   useEffect(() => {
-    const openOrders = orders.filter(isOpenTradeOrder);
+    const openOrders = orders.filter((order) => isOpenTradeOrder(order) && !isSpotGridTradeOrder(order));
     if (openOrders.length <= 1) {
       ordersRef.current = orders;
       return;
     }
     setOrders((current) => {
-      const nextOrders = keepSingleOpenOrder(current);
+      const spotGridOrders = current.filter((order) => isOpenTradeOrder(order) && isSpotGridTradeOrder(order));
+      const otherOrders = current.filter((order) => !isOpenTradeOrder(order) || !isSpotGridTradeOrder(order));
+      const nextOrders = [...spotGridOrders, ...keepSingleOpenOrder(otherOrders)];
       ordersRef.current = nextOrders;
       return nextOrders;
     });
@@ -2251,11 +2542,15 @@ function TradingApp() {
       shouldFitContentRef.current = false;
       shouldFitPriceRef.current = false;
     } else if (shouldJumpToLatestRef.current) {
-      const lastLogical = Math.max(0, visibleCandles.length - 1);
-      chartRef.current?.timeScale().setVisibleLogicalRange({
-        from: Math.max(0, lastLogical - 60) as Logical,
-        to: (lastLogical + 4) as Logical
-      });
+      if (isLiveRunning) {
+        const lastLogical = Math.max(0, visibleCandles.length - 1);
+        chartRef.current?.timeScale().setVisibleLogicalRange({
+          from: Math.max(0, lastLogical - 60) as Logical,
+          to: (lastLogical + 10) as Logical
+        });
+      } else {
+        applyReplayWindowRange(visibleCandles.length);
+      }
       shouldJumpToLatestRef.current = false;
       shouldFitContentRef.current = false;
       if (shouldFitPriceRef.current) {
@@ -2266,7 +2561,11 @@ function TradingApp() {
         shouldFitPriceRef.current = false;
       }
     } else if (autoFocusChart || shouldFitContentRef.current) {
-      chartRef.current?.timeScale().fitContent();
+      if (isLiveRunning) {
+        chartRef.current?.timeScale().fitContent();
+      } else {
+        applyReplayWindowRange(visibleCandles.length);
+      }
       if (shouldFitPriceRef.current) {
         chartRef.current?.priceScale("right").setAutoScale(true);
         window.requestAnimationFrame(() => {
@@ -2278,7 +2577,7 @@ function TradingApp() {
       }
       shouldFitContentRef.current = false;
     }
-  }, [autoFocusChart, autoScalePrice, visibleCandles]);
+  }, [applyReplayWindowRange, autoFocusChart, autoScalePrice, isLiveRunning, visibleCandles]);
 
   useEffect(() => {
     chartRef.current?.priceScale("right").setAutoScale(autoScalePrice);
@@ -2293,26 +2592,26 @@ function TradingApp() {
     const end = visibleCandles.at(-1)?.time ?? start;
 
     const upsertLine = (
-      order: TradeOrder,
-      field: OrderLineField,
+      key: string,
       price: number,
       color: string,
-      style = LineStyle.Solid
+      style = LineStyle.Solid,
+      lineWidth: 1 | 2 | 3 | 4 = 2
     ) => {
-      const key = `${order.id}-${field}`;
       activeKeys.add(key);
       let series = lineSeriesRef.current.get(key);
       if (!series) {
         series = chart.addSeries(LineSeries, {
           color,
-          lineWidth: 2,
+          lineWidth,
           lineStyle: style,
           priceLineVisible: false,
-          title: ""
+          title: "",
+          autoscaleInfoProvider: () => null
         });
         lineSeriesRef.current.set(key, series);
       } else {
-        series.applyOptions({ color, lineStyle: style, lineWidth: 2 });
+        series.applyOptions({ color, lineStyle: style, lineWidth, autoscaleInfoProvider: () => null });
       }
       series.setData([
         { time: start, value: price },
@@ -2322,9 +2621,24 @@ function TradingApp() {
 
     openOrders.forEach((order) => {
       const entryColor = order.status === "active" ? "#facc15" : order.side === "buy" ? "#38bdf8" : "#fb923c";
-      upsertLine(order, "entry", order.entry, entryColor, order.status === "active" ? LineStyle.LargeDashed : LineStyle.Solid);
-      if (order.takeProfit !== undefined) upsertLine(order, "takeProfit", order.takeProfit, "#2fbf71", LineStyle.Dashed);
-      if (order.stopLoss !== undefined) upsertLine(order, "stopLoss", order.stopLoss, "#e05252", LineStyle.Dashed);
+      upsertLine(`${order.id}-entry`, order.entry, entryColor, order.status === "active" ? LineStyle.LargeDashed : LineStyle.Solid);
+      if (order.takeProfit !== undefined) upsertLine(`${order.id}-takeProfit`, order.takeProfit, "#2fbf71", LineStyle.Dashed);
+      if (order.stopLoss !== undefined) upsertLine(`${order.id}-stopLoss`, order.stopLoss, "#e05252", LineStyle.Dashed);
+    });
+
+    visibleGridTriggerLines.forEach((line) => {
+      const isActiveGridLine = openOrders.some((order) =>
+        [order.entry, order.takeProfit, order.stopLoss].some((price) =>
+          price !== undefined && Math.abs(price - line.price) <= Math.max(line.price * 0.000001, 0.000001)
+        )
+      );
+      upsertLine(
+        `grid-trigger-${line.id}`,
+        line.price,
+        isActiveGridLine ? "rgba(250, 204, 21, 0.95)" : line.side === "buy" ? "rgba(47, 191, 113, 0.78)" : "rgba(251, 146, 60, 0.78)",
+        LineStyle.Dashed,
+        isActiveGridLine ? 2 : 1
+      );
     });
 
     lineSeriesRef.current.forEach((series, key) => {
@@ -2332,7 +2646,7 @@ function TradingApp() {
       chart.removeSeries(series);
       lineSeriesRef.current.delete(key);
     });
-  }, [chartViewVersion, openOrders, visibleCandles]);
+  }, [chartViewVersion, visibleGridTriggerLines, openOrders, visibleCandles]);
 
   useEffect(() => {
     const updateLineControls = () => {
@@ -2708,6 +3022,10 @@ function TradingApp() {
     };
 
     const closeMenu = (event?: MouseEvent | KeyboardEvent) => {
+      if (event instanceof KeyboardEvent && event.key !== "Escape") {
+        return;
+      }
+
       if (!(event instanceof MouseEvent)) {
         setChartMenu(null);
         setDrawingMenu(null);
@@ -2756,6 +3074,9 @@ function TradingApp() {
             ...order,
             status: "active" as OrderStatus
           };
+          if (isSpotGridTradeOrder(evaluatedOrder)) {
+            return evaluatedOrder;
+          }
         }
 
         const hitTp =
@@ -2805,8 +3126,9 @@ function TradingApp() {
   const createBotPaperOrder = useCallback((botData: Record<string, unknown>, candle: Candle) => {
     if (botSettings.mode !== "paper") return false;
     const action = String(botData.action || "").toLowerCase();
-    if (action !== "place_order" && action !== "buy" && action !== "sell") return false;
-    if (ordersRef.current.some((order) => order.status === "pending" || order.status === "active")) {
+    if (action !== "place_orders" && action !== "place_order" && action !== "buy" && action !== "sell" && action !== "signal_buy" && action !== "signal_sell") return false;
+    const isSpotGridPayload = botData.spotGrid === true || String(botData.mechanic || "").toLowerCase() === "spot_grid";
+    if (!isSpotGridPayload && ordersRef.current.some((order) => order.status === "pending" || order.status === "active")) {
       showExchangeDebug("Bot", "Bot-Order wurde blockiert, weil bereits eine offene Order vorhanden ist.", {
         symbol: activePhemexSettings.symbol,
         action
@@ -2814,12 +3136,95 @@ function TradingApp() {
       return true;
     }
 
-    const sideValue = String(botData.side || action).toLowerCase();
+    const createOrderFromBotData = (data: Record<string, unknown>, index = 0): TradeOrder | undefined => {
+      const itemAction = String(data.action || action || "").toLowerCase();
+      const sideValue = String(data.side || itemAction.replace("signal_", "")).toLowerCase();
+      const orderSide: Side = sideValue.includes("sell") || sideValue === "short" ? "sell" : "buy";
+      const entryValue = Number(data.entry ?? data.price ?? candle.close);
+      const quantityValue = Number(data.quantity ?? data.qty ?? data.size ?? quantity);
+      const takeProfitValue = Number(data.takeProfit ?? data.tp);
+      const stopLossValue = Number(data.stopLoss ?? data.sl);
+      const isSpotGridOrder = data.spotGrid === true || String(data.mechanic || "").toLowerCase() === "spot_grid";
+      const requestedStatus = String(data.status || "").toLowerCase();
+      const orderStatus: OrderStatus =
+        requestedStatus === "active" || requestedStatus === "pending"
+          ? requestedStatus
+          : effectiveBotOrderType === "market"
+            ? "active"
+            : "pending";
+
+      if (!Number.isFinite(entryValue) || !Number.isFinite(quantityValue) || quantityValue <= 0) {
+        return undefined;
+      }
+
+      const gridProtection = isSpotGridOrder
+        ? { takeProfit: Number.isFinite(takeProfitValue) ? takeProfitValue : undefined, stopLoss: undefined as number | undefined }
+        : getGridProtectionForOrder(orderSide, entryValue, data.gridIndex);
+      const botCandleIndex = allCandles.findIndex((item) => item.time === candle.time);
+      const gridIndexValue = numberFrom(data.gridIndex);
+      return {
+        id: `BOT-${Date.now()}-${index}`,
+        side: orderSide,
+        quantity: quantityValue,
+        entry: entryValue,
+        takeProfit: gridProtection.takeProfit ?? (Number.isFinite(takeProfitValue) ? takeProfitValue : undefined),
+        stopLoss: isSpotGridOrder ? undefined : gridProtection.stopLoss ?? (Number.isFinite(stopLossValue) ? stopLossValue : undefined),
+        status: orderStatus,
+        openedAt: candle.time,
+        openedIndex: botCandleIndex >= 0 ? Math.max(-1, botCandleIndex - 1) : undefined,
+        spotGrid: isSpotGridOrder,
+        mechanic: isSpotGridOrder ? "spot_grid" : undefined,
+        gridIndex: gridIndexValue
+      };
+    };
+
+    const nestedOrders = Array.isArray(botData.orders) ? botData.orders as Record<string, unknown>[] : [];
+    if (action === "place_orders" && nestedOrders.length) {
+      const createdOrders = nestedOrders
+        .map((item, index) => createOrderFromBotData({ ...botData, ...item }, index))
+        .filter(Boolean) as TradeOrder[];
+
+      if (!createdOrders.length) {
+        showExchangeDebug("Bot", t.orderNeedsInput, { action, orders: nestedOrders });
+        return true;
+      }
+
+      setOrders((current) => {
+        const newOrders = createdOrders.filter((order) => {
+          if (!isSpotGridTradeOrder(order)) return true;
+          return !current.some((existing) =>
+            isOpenTradeOrder(existing) &&
+            isSpotGridTradeOrder(existing) &&
+            existing.side === order.side &&
+            Math.abs(existing.entry - order.entry) <= 0.000001
+          );
+        });
+        if (!newOrders.length) {
+          ordersRef.current = current;
+          return current;
+        }
+        const nextOrders = [...newOrders, ...current];
+        ordersRef.current = nextOrders;
+        return nextOrders;
+      });
+      setMessage(`Spot-Grid: ${createdOrders.length} Kauf-Level gesetzt.`);
+      setMessageKind("custom");
+      return true;
+    }
+
+    const sideValue = String(botData.side || action.replace("signal_", "")).toLowerCase();
     const orderSide: Side = sideValue.includes("sell") || sideValue === "short" ? "sell" : "buy";
     const entryValue = Number(botData.entry ?? botData.price ?? candle.close);
     const quantityValue = Number(botData.quantity ?? botData.qty ?? botData.size ?? quantity);
     const takeProfitValue = Number(botData.takeProfit ?? botData.tp);
     const stopLossValue = Number(botData.stopLoss ?? botData.sl);
+    const requestedStatus = String(botData.status || "").toLowerCase();
+    const orderStatus: OrderStatus =
+      requestedStatus === "active" || requestedStatus === "pending"
+        ? requestedStatus
+        : effectiveBotOrderType === "market"
+          ? "active"
+          : "pending";
 
     if (!Number.isFinite(entryValue) || !Number.isFinite(quantityValue) || quantityValue <= 0) {
       showExchangeDebug("Bot", t.orderNeedsInput, {
@@ -2831,18 +3236,37 @@ function TradingApp() {
     }
 
     const id = `BOT-${Date.now()}`;
+    const isSpotGridOrder = isSpotGridPayload;
+    const gridProtection = isSpotGridOrder
+      ? { takeProfit: Number.isFinite(takeProfitValue) ? takeProfitValue : undefined, stopLoss: undefined as number | undefined }
+      : getGridProtectionForOrder(orderSide, entryValue, botData.gridIndex);
+    const botCandleIndex = allCandles.findIndex((item) => item.time === candle.time);
     const order: TradeOrder = {
       id,
       side: orderSide,
       quantity: quantityValue,
       entry: entryValue,
-      takeProfit: Number.isFinite(takeProfitValue) ? takeProfitValue : undefined,
-      stopLoss: Number.isFinite(stopLossValue) ? stopLossValue : undefined,
-      status: effectiveBotOrderType === "market" ? "active" : "pending",
+      takeProfit: gridProtection.takeProfit ?? (Number.isFinite(takeProfitValue) ? takeProfitValue : undefined),
+      stopLoss: isSpotGridOrder ? undefined : gridProtection.stopLoss ?? (Number.isFinite(stopLossValue) ? stopLossValue : undefined),
+      status: orderStatus,
       openedAt: candle.time,
-      openedIndex: allCandles.findIndex((item) => item.time === candle.time)
+      openedIndex: botCandleIndex >= 0 ? Math.max(-1, botCandleIndex - 1) : undefined,
+      spotGrid: isSpotGridOrder,
+      mechanic: isSpotGridOrder ? "spot_grid" : undefined,
+      gridIndex: numberFrom(botData.gridIndex)
     };
     setOrders((current) => {
+      if (isSpotGridOrder) {
+        const hasSameGridOrder = current.some((existing) =>
+          isOpenTradeOrder(existing) &&
+          isSpotGridTradeOrder(existing) &&
+          existing.side === order.side &&
+          Math.abs(existing.entry - order.entry) <= 0.000001
+        );
+        const nextOrders = hasSameGridOrder ? current : [order, ...current];
+        ordersRef.current = nextOrders;
+        return nextOrders;
+      }
       if (current.some(isOpenTradeOrder)) {
         ordersRef.current = keepSingleOpenOrder(current);
         return ordersRef.current;
@@ -2854,13 +3278,26 @@ function TradingApp() {
     setMessage(t.orderPlaced(id, orderSide, formatPrice(entryValue)));
     setMessageKind("custom");
     return true;
-  }, [activePhemexSettings.symbol, allCandles, botSettings.mode, effectiveBotOrderType, quantity, t]);
+  }, [activePhemexSettings.symbol, allCandles, botSettings.mode, effectiveBotOrderType, getGridProtectionForOrder, quantity, t]);
 
   const sendBotTick = useCallback(async (source: "replay" | "live", candle?: Candle, livePrice?: number) => {
     if (!botEnabledRef.current || !botSettings.url.trim()) return;
-    if (botTickInFlightRef.current) return;
+    if (botTickInFlightRef.current) {
+      if (source === "replay" && candle) {
+        botReplayQueueRef.current.push(candle);
+        if (botReplayQueueRef.current.length > 1000) {
+          botReplayQueueRef.current = botReplayQueueRef.current.slice(-1000);
+        }
+      }
+      return;
+    }
     const activeCandle = candle ?? lastCandle;
     if (!activeCandle) return;
+    const activeCandleIndex = allCandles.findIndex((item) => item.time === activeCandle.time);
+    const previousCandle = activeCandleIndex > 0 ? allCandles[activeCandleIndex - 1] : undefined;
+    const botCandlePayload = previousCandle
+      ? { ...activeCandle, previousClose: previousCandle.close }
+      : activeCandle;
     botTickInFlightRef.current = true;
     const controller = new AbortController();
     const timer = window.setTimeout(() => controller.abort(), 4500);
@@ -2879,8 +3316,28 @@ function TradingApp() {
           symbol: activePhemexSettings.symbol,
           timeframe: timeframeFromResolution(activePhemexSettings.resolution),
           livePrice,
-          candle: activeCandle,
+          candle: botCandlePayload,
           openOrders: ordersRef.current.filter((order) => order.status === "pending" || order.status === "active"),
+          gridTriggers: gridTriggerLines.map((line) => ({
+            price: line.price,
+            side: line.side,
+            index: line.index,
+            distancePercent: line.distancePercent
+          })),
+          gridSettings: {
+            priceFrom: numberFrom(botSettings.gridPriceFrom),
+            priceTo: numberFrom(botSettings.gridPriceTo),
+            stepPercent: numberFrom(botSettings.gridStepPercent),
+            takeProfitPercent: numberFrom(botSettings.gridTakeProfitPercent),
+            stopLossPercent: numberFrom(botSettings.gridStopLossPercent),
+            direction: botSettings.gridDirection,
+            gridCount: numberFrom(botSettings.gridCount),
+            investment: numberFrom(botSettings.gridInvestment),
+            amountMode: botSettings.gridAmountMode,
+            amountValue: numberFrom(botSettings.gridAmountValue),
+            quantity,
+            leverage: numberFrom(botSettings.gridLeverage)
+          },
           balance: futuresBalance,
           liveOrdersEnabled: activePhemexSettings.liveOrdersEnabled && botSettings.mode === "live"
         })
@@ -2938,6 +3395,16 @@ function TradingApp() {
             });
             return;
           }
+          if (isPhemexGridBotScript) {
+            showExchangeDebug("Spot-Grid", "Spot-Grid ist gegen Future-Orders gesperrt. Live-Spot-Orders werden erst gesendet, wenn eine Spot-API angebunden ist.", {
+              source,
+              symbol: activePhemexSettings.symbol,
+              action: botAction,
+              botScript: botSettings.script,
+              blockedReason: "spotGridFutureGuard"
+            });
+            return;
+          }
           if (!activePhemexSettings.liveOrdersEnabled) {
             setBotRuntimeInfo((current) => ({
               ...current,
@@ -2959,7 +3426,10 @@ function TradingApp() {
             });
             return;
           }
-          if (!Number.isFinite(quantity) || quantity <= 0) {
+          const botEntry = numberFrom(botData.entry ?? botData.price);
+          const botQuantity = numberFrom(botData.quantity ?? botData.qty ?? botData.size);
+          const effectiveBotQuantity = Number.isFinite(botQuantity) && Number(botQuantity) > 0 ? Number(botQuantity) : quantity;
+          if (!Number.isFinite(effectiveBotQuantity) || effectiveBotQuantity <= 0) {
             setBotRuntimeInfo((current) => ({
               ...current,
               lastAction: `blockiert: ${t.botWaitQuantity}`,
@@ -2974,14 +3444,20 @@ function TradingApp() {
           }
           const botTakeProfit = numberFrom(botData.takeProfit ?? botData.take_profit ?? botData.tp);
           const botStopLoss = numberFrom(botData.stopLoss ?? botData.stop_loss ?? botData.sl);
+          const gridProtection = getGridProtectionForOrder(botSide, botEntry ?? activeCandle.close, botData.gridIndex);
           await submitOrderRef.current(botSide, {
-            takeProfit: botTakeProfit,
-            stopLoss: botStopLoss
+            entry: botEntry,
+            quantity: effectiveBotQuantity,
+            takeProfit: gridProtection.takeProfit ?? botTakeProfit,
+            stopLoss: gridProtection.stopLoss ?? botStopLoss,
+            allowMissingProtection: isGridBotScript && !GRID_BOT_STOP_LOSS_ENABLED
           });
+          botReplayQueueRef.current = [];
           return;
         }
       }
       if (result?.data && typeof result.data === "object" && createBotPaperOrder(result.data, activeCandle)) {
+        botReplayQueueRef.current = [];
         return;
       }
       if (result?.data?.action && result.data.action !== "hold") {
@@ -3001,20 +3477,45 @@ function TradingApp() {
     } finally {
       window.clearTimeout(timer);
       botTickInFlightRef.current = false;
+      if (source === "replay" && botReplayQueueRef.current.length && botEnabledRef.current) {
+        const nextQueuedCandle = botReplayQueueRef.current.shift();
+        if (nextQueuedCandle) {
+          window.setTimeout(() => {
+            void sendBotTick("replay", nextQueuedCandle);
+          }, 0);
+        }
+      }
     }
   }, [
     activePhemexSettings.exchange,
     activePhemexSettings.liveOrdersEnabled,
     activePhemexSettings.resolution,
     activePhemexSettings.symbol,
+    allCandles,
     botSettings.mode,
     effectiveBotOrderType,
     botSettings.script,
     botSettings.url,
+    botSettings.gridPriceFrom,
+    botSettings.gridPriceTo,
+    botSettings.gridStepPercent,
+    botSettings.gridTakeProfitPercent,
+    botSettings.gridStopLossPercent,
+    botSettings.gridDirection,
+    botSettings.gridCount,
+    botSettings.gridInvestment,
+    botSettings.gridAmountMode,
+    botSettings.gridAmountValue,
+    botSettings.gridLeverage,
     createBotPaperOrder,
     futuresBalance,
+    getGridProtectionForOrder,
+    gridTriggerLines,
+    isGridBotScript,
+    isPhemexGridBotScript,
     isLiveRunning,
     lastCandle,
+    quantity,
     t
   ]);
 
@@ -3033,6 +3534,20 @@ function TradingApp() {
     });
   }, [allCandles, evaluateOrdersSinceOpened, sendBotTick]);
 
+  const jumpReplayToCount = useCallback(
+    (nextCount: number) => {
+      const maxCount = Math.max(1, allCandles.length);
+      const next = Math.min(Math.max(1, Math.round(nextCount)), maxCount);
+      const nextVisibleCandles = allCandles.slice(0, next);
+      const nextOrders = evaluateOrdersSinceOpened(ordersRef.current, nextVisibleCandles);
+      botReplayQueueRef.current = [];
+      ordersRef.current = nextOrders;
+      setOrders(nextOrders);
+      setVisibleCount(next);
+    },
+    [allCandles, evaluateOrdersSinceOpened]
+  );
+
   const createOrder = (
     orderSide: Side,
     orderEntry: number,
@@ -3044,6 +3559,7 @@ function TradingApp() {
       exchange?: "phemex" | "binance" | "replay";
       orderType?: "limit" | "market" | "position";
       status?: OrderStatus;
+      quantity?: number;
       takeProfit?: number;
       stopLoss?: number;
     }
@@ -3058,7 +3574,9 @@ function TradingApp() {
     const parsedTp = Number.isFinite(options?.takeProfit) ? options?.takeProfit : takeProfit ? Number(takeProfit) : undefined;
     const parsedSl = Number.isFinite(options?.stopLoss) ? options?.stopLoss : stopLoss ? Number(stopLoss) : undefined;
 
-    if (!Number.isFinite(orderEntry) || !Number.isFinite(quantity) || quantity <= 0) {
+    const orderQuantity = Number.isFinite(options?.quantity) && Number(options?.quantity) > 0 ? Number(options?.quantity) : quantity;
+
+    if (!Number.isFinite(orderEntry) || !Number.isFinite(orderQuantity) || orderQuantity <= 0) {
       setMessage(t.orderNeedsInput);
       return;
     }
@@ -3071,7 +3589,7 @@ function TradingApp() {
       exchange: options?.exchange ?? (isLiveRunning ? activePhemexSettings.exchange : "replay"),
       orderType: options?.orderType ?? (isLiveRunning ? liveOrderType : "limit"),
       side: orderSide,
-      quantity,
+      quantity: orderQuantity,
       entry: orderEntry,
       takeProfit: Number.isFinite(parsedTp) ? parsedTp : undefined,
       stopLoss: Number.isFinite(parsedSl) ? parsedSl : undefined,
@@ -3179,7 +3697,72 @@ function TradingApp() {
   };
 
   const updateBotSetting = (key: keyof BotSettings, value: string | boolean) => {
+    if (String(key).startsWith("grid")) {
+      setBotGridApplyState("idle");
+    }
     setBotSettings((current) => ({ ...current, [key]: value }));
+  };
+
+  const applyBotGridSettings = () => {
+    const priceFrom = numberFrom(botSettings.gridPriceFrom);
+    const priceTo = numberFrom(botSettings.gridPriceTo);
+    const stepPercent = numberFrom(botSettings.gridStepPercent);
+    const takeProfitPercent = numberFrom(botSettings.gridTakeProfitPercent);
+    const stopLossPercent = numberFrom(botSettings.gridStopLossPercent);
+    const gridCount = Math.floor(numberFrom(botSettings.gridCount) ?? 0);
+    const gridInvestment = numberFrom(botSettings.gridInvestment);
+    const gridAmountValue = numberFrom(botSettings.gridAmountValue);
+    const phemexGridInvalid =
+      isPhemexGridBotScript &&
+      (
+        gridCount <= 1 ||
+        gridAmountValue === undefined ||
+        gridAmountValue <= 0
+      );
+    const standardGridInvalid =
+      !isPhemexGridBotScript &&
+      (
+        stepPercent === undefined ||
+        takeProfitPercent === undefined ||
+        stopLossPercent === undefined ||
+        stepPercent <= 0 ||
+        takeProfitPercent <= 0 ||
+        stopLossPercent <= 0
+      );
+    if (
+      priceFrom === undefined ||
+      priceTo === undefined ||
+      priceFrom <= 0 ||
+      priceTo <= 0 ||
+      phemexGridInvalid ||
+      standardGridInvalid
+    ) {
+      setBotGridApplyState("error");
+      setMessage(t.botGridInvalid);
+      setMessageKind("custom");
+      return;
+    }
+
+    const nextSettings: BotSettings = {
+      ...botSettings,
+      gridEnabled: true,
+      gridPriceFrom: String(priceFrom),
+      gridPriceTo: String(priceTo),
+      gridStepPercent: String(stepPercent ?? botSettings.gridStepPercent),
+      gridTakeProfitPercent: String(takeProfitPercent ?? botSettings.gridTakeProfitPercent),
+      gridStopLossPercent: String(stopLossPercent ?? botSettings.gridStopLossPercent),
+      gridCount: String(gridCount || botSettings.gridCount),
+      gridInvestment: String(gridInvestment ?? botSettings.gridInvestment),
+      gridLeverage: botSettings.gridLeverage,
+      gridAmountMode: botSettings.gridAmountMode,
+      gridAmountValue: String(gridAmountValue ?? botSettings.gridAmountValue)
+    };
+    setBotSettings(nextSettings);
+    window.localStorage.setItem(botOptionsStorageKey, JSON.stringify(nextSettings));
+    setChartViewVersion((version) => version + 1);
+    setBotGridApplyState("applied");
+    setMessage(t.botGridApplied);
+    setMessageKind("custom");
   };
 
   const refreshBotProcessStatus = useCallback(async () => {
@@ -3224,7 +3807,7 @@ function TradingApp() {
 
   const controlBotProcess = async (action: "start" | "stop" | "reload") => {
     if (action === "start" || action === "reload") {
-      if (botSettings.mode === "live" && (!Number.isFinite(quantity) || quantity <= 0)) {
+      if (botSettings.mode === "live" && !isPhemexGridBotScript && (!Number.isFinite(quantity) || quantity <= 0)) {
         botEnabledRef.current = false;
         setBotSettings((current) => ({ ...current, enabled: false }));
         showExchangeDebug("Live-Bot", t.botLiveMissingQuantity, {
@@ -3310,6 +3893,26 @@ function TradingApp() {
           timeframe: timeframeFromResolution(activePhemexSettings.resolution),
           candle: testCandle,
           openOrders: ordersRef.current.filter((order) => order.status === "pending" || order.status === "active"),
+          gridTriggers: gridTriggerLines.map((line) => ({
+            price: line.price,
+            side: line.side,
+            index: line.index,
+            distancePercent: line.distancePercent
+          })),
+          gridSettings: {
+            priceFrom: numberFrom(botSettings.gridPriceFrom),
+            priceTo: numberFrom(botSettings.gridPriceTo),
+            stepPercent: numberFrom(botSettings.gridStepPercent),
+            takeProfitPercent: numberFrom(botSettings.gridTakeProfitPercent),
+            stopLossPercent: numberFrom(botSettings.gridStopLossPercent),
+            direction: botSettings.gridDirection,
+            gridCount: numberFrom(botSettings.gridCount),
+            investment: numberFrom(botSettings.gridInvestment),
+            amountMode: botSettings.gridAmountMode,
+            amountValue: numberFrom(botSettings.gridAmountValue),
+            quantity,
+            leverage: numberFrom(botSettings.gridLeverage)
+          },
           balance: futuresBalance,
           liveOrdersEnabled: false
         })
@@ -3384,10 +3987,18 @@ function TradingApp() {
     return true;
   };
 
-  const submitOrder = async (forcedSide?: Side, forcedProtection?: { takeProfit?: number; stopLoss?: number }) => {
+  const submitOrder = async (
+    forcedSide?: Side,
+    forcedOptions?: { entry?: number; takeProfit?: number; stopLoss?: number; quantity?: number; allowMissingProtection?: boolean }
+  ) => {
     if (!lastCandle) return;
     const orderSide = forcedSide ?? side;
-    const parsedEntry = isLiveRunning && liveOrderType === "market"
+    const orderQuantity = Number.isFinite(forcedOptions?.quantity) && Number(forcedOptions?.quantity) > 0
+      ? Number(forcedOptions?.quantity)
+      : quantity;
+    const parsedEntry = Number.isFinite(forcedOptions?.entry) && Number(forcedOptions?.entry) > 0
+      ? Number(forcedOptions?.entry)
+      : isLiveRunning && liveOrderType === "market"
       ? liveLastPrice ?? lastCandle.close
       : entry ? Number(entry) : lastCandle.close;
     const liveSubmitRange = chartRef.current?.timeScale().getVisibleLogicalRange() ?? null;
@@ -3411,10 +4022,10 @@ function TradingApp() {
         setMessageKind("custom");
         return;
       }
-      if (!Number.isFinite(quantity) || quantity <= 0) {
+      if (!Number.isFinite(orderQuantity) || orderQuantity <= 0) {
         showExchangeDebug("Live-Order blockiert", t.orderNeedsInput, {
           symbol: activePhemexSettings.symbol,
-          groesse: quantityInput,
+          groesse: forcedOptions?.quantity ?? quantityInput,
           ordertyp: liveOrderType,
           entry: entry || formatPrice(parsedEntry),
           takeProfit: takeProfit || "-",
@@ -3424,11 +4035,11 @@ function TradingApp() {
       }
       const formTp = takeProfit ? Number(takeProfit) : undefined;
       const formSl = stopLoss ? Number(stopLoss) : undefined;
-      const parsedTp = Number.isFinite(forcedProtection?.takeProfit) ? forcedProtection?.takeProfit : formTp;
-      const parsedSl = Number.isFinite(forcedProtection?.stopLoss) ? forcedProtection?.stopLoss : formSl;
+      const parsedTp = Number.isFinite(forcedOptions?.takeProfit) ? forcedOptions?.takeProfit : formTp;
+      const parsedSl = Number.isFinite(forcedOptions?.stopLoss) ? forcedOptions?.stopLoss : formSl;
       const validTp = Number.isFinite(parsedTp) && Number(parsedTp) > 0;
       const validSl = Number.isFinite(parsedSl) && Number(parsedSl) > 0;
-      if (!validTp || !validSl) {
+      if (!forcedOptions?.allowMissingProtection && (!validTp || !validSl)) {
         setBotRuntimeInfo((current) => ({
           ...current,
           lastAction: `blockiert: ${t.botWaitProtection}`
@@ -3440,7 +4051,7 @@ function TradingApp() {
           showExchangeDebug("Live-Order blockiert", "Gewinnziel und Verluststopp müssen vor einer Live-Order gesetzt sein.", {
             symbol: activePhemexSettings.symbol,
             side: orderSide,
-            groesse: quantityInput,
+            groesse: forcedOptions?.quantity ?? quantityInput,
             entry: entry || formatPrice(parsedEntry),
             gewinnziel: validTp ? parsedTp : "-",
             verluststopp: validSl ? parsedSl : "-",
@@ -3489,10 +4100,10 @@ function TradingApp() {
     if (isLiveRunning) {
       const formTp = takeProfit ? Number(takeProfit) : undefined;
       const formSl = stopLoss ? Number(stopLoss) : undefined;
-      const parsedTp = Number.isFinite(forcedProtection?.takeProfit) ? forcedProtection?.takeProfit : formTp;
-      const parsedSl = Number.isFinite(forcedProtection?.stopLoss) ? forcedProtection?.stopLoss : formSl;
-      if (Number.isFinite(forcedProtection?.takeProfit)) setTakeProfit(String(forcedProtection?.takeProfit));
-      if (Number.isFinite(forcedProtection?.stopLoss)) setStopLoss(String(forcedProtection?.stopLoss));
+      const parsedTp = Number.isFinite(forcedOptions?.takeProfit) ? forcedOptions?.takeProfit : formTp;
+      const parsedSl = Number.isFinite(forcedOptions?.stopLoss) ? forcedOptions?.stopLoss : formSl;
+      if (Number.isFinite(forcedOptions?.takeProfit)) setTakeProfit(String(forcedOptions?.takeProfit));
+      if (Number.isFinite(forcedOptions?.stopLoss)) setStopLoss(String(forcedOptions?.stopLoss));
       if (liveSubmitRange) {
         lockedVisibleRangeRef.current = liveSubmitRange;
         chartRangeLockUntilRef.current = Date.now() + 15000;
@@ -3507,7 +4118,7 @@ function TradingApp() {
           body: JSON.stringify({
             symbol: activePhemexSettings.symbol,
             side: orderSide,
-            quantity,
+            quantity: orderQuantity,
             price: parsedEntry,
             orderType: liveOrderType,
             takeProfit: Number.isFinite(parsedTp) ? parsedTp : undefined,
@@ -3532,7 +4143,8 @@ function TradingApp() {
           phemexClOrdId: result.clOrdID,
           status: liveOrderType === "market" ? "active" : "pending",
           takeProfit: Number.isFinite(parsedTp) ? parsedTp : undefined,
-          stopLoss: Number.isFinite(parsedSl) ? parsedSl : undefined
+          stopLoss: Number.isFinite(parsedSl) ? parsedSl : undefined,
+          quantity: orderQuantity
         });
         restoreLiveSubmitRange();
         setMessage(t.phemexOrderPlaced(result.orderID || result.clOrdID || "OK"));
@@ -3579,7 +4191,7 @@ function TradingApp() {
           reason,
           symbol: activePhemexSettings.symbol,
           side: orderSide,
-          quantity,
+          quantity: orderQuantity,
           price: parsedEntry,
           testnet: activePhemexSettings.testnet
         });
@@ -3660,9 +4272,14 @@ function TradingApp() {
     setMessage(t.orderCanceled(orderId));
   };
 
-  const closeActiveOrder = async (orderId: string) => {
+  const closeActiveOrder = async (
+    orderId: string,
+    closeResult: "TP" | "SL" | "CLOSE" = "CLOSE",
+    closePriceOverride?: number,
+    closeTimeOverride?: Time
+  ) => {
     const order = ordersRef.current.find((item) => item.id === orderId);
-    if (!order) return;
+    if (!order) return false;
     if (isLiveRunning && order.status === "active") {
       setExchangeRequestState("loading");
       try {
@@ -3682,7 +4299,13 @@ function TradingApp() {
         setOrders((current) => {
           const nextOrders = current.map((item) =>
             item.id === orderId && item.status === "active"
-              ? { ...item, status: "closed" as OrderStatus, closedAt: lastCandle?.time, result: "CLOSE" as const, closePrice: liveLastPrice ?? lastCandle?.close }
+              ? {
+                  ...item,
+                  status: "closed" as OrderStatus,
+                  closedAt: closeTimeOverride ?? lastCandle?.time,
+                  result: closeResult,
+                  closePrice: closePriceOverride ?? liveLastPrice ?? lastCandle?.close
+                }
               : item
           );
           ordersRef.current = nextOrders;
@@ -3695,7 +4318,7 @@ function TradingApp() {
           syncPhemexPositionStatus(activePhemexSettings).catch(() => undefined);
           syncPhemexOpenOrders(activePhemexSettings, true).catch(() => undefined);
         }, 1500);
-        return;
+        return true;
       } catch (error) {
         const reason = error instanceof Error ? error.message : undefined;
         showExchangeDebug("Position schließen", `Position konnte nicht geschlossen werden: ${reason ?? "Unbekannter Fehler"}`, {
@@ -3708,18 +4331,57 @@ function TradingApp() {
           testnet: activePhemexSettings.testnet
         });
         setExchangeRequestState("error");
-        return;
+        return false;
       }
     }
     setOrders((current) => {
       const nextOrders = current.map((item) =>
         item.id === orderId && item.status === "active"
-          ? { ...item, status: "closed" as OrderStatus, closedAt: lastCandle?.time, result: "CLOSE" as const, closePrice: lastCandle?.close }
+          ? {
+              ...item,
+              status: "closed" as OrderStatus,
+              closedAt: closeTimeOverride ?? lastCandle?.time,
+              result: closeResult,
+              closePrice: closePriceOverride ?? lastCandle?.close
+            }
           : item
       );
       ordersRef.current = nextOrders;
       return nextOrders;
     });
+    return true;
+  };
+
+  const closeLivePositionOnProtectionHit = async (price: number, closeTime?: Time) => {
+    if (!isLiveRunning || !Number.isFinite(price)) return;
+    const activeOrder = ordersRef.current.find((order) =>
+      order.status === "active" &&
+      (order.exchange === activePhemexSettings.exchange ||
+        order.phemexOrderId ||
+        order.phemexClOrdId ||
+        isImportedPositionOrder(order, activePhemexSettings))
+    );
+    if (!activeOrder) return;
+
+    const hitTp =
+      activeOrder.takeProfit !== undefined &&
+      (activeOrder.side === "buy" ? price >= activeOrder.takeProfit : price <= activeOrder.takeProfit);
+    const hitSl =
+      activeOrder.stopLoss !== undefined &&
+      (activeOrder.side === "buy" ? price <= activeOrder.stopLoss : price >= activeOrder.stopLoss);
+    if (!hitTp && !hitSl) return;
+
+    const closeResult: "TP" | "SL" = hitSl ? "SL" : "TP";
+    const closeKey = `${activeOrder.id}:${closeResult}`;
+    if (liveProtectionCloseInFlightRef.current.has(closeKey)) return;
+    liveProtectionCloseInFlightRef.current.add(closeKey);
+    setMessage(`${closeResult} erreicht. Position wird geschlossen: ${displayOrderId(activeOrder)}.`);
+    setMessageKind("custom");
+
+    const closed = await closeActiveOrder(activeOrder.id, closeResult, price, closeTime);
+    if (!closed) {
+      liveProtectionCloseInFlightRef.current.delete(closeKey);
+    }
   };
 
   const recreatePendingPhemexOrder = async (order: TradeOrder) => {
@@ -5053,6 +5715,7 @@ function TradingApp() {
       setMessageKind("custom");
       livePriceBackoffUntilRef.current = 0;
       await syncPhemexOrderStatusThrottled(settings).catch(() => undefined);
+      await closeLivePositionOnProtectionHit(price, botCandle?.time);
       await sendBotTick("live", botCandle, price);
       setExchangeRequestState("idle");
     } catch {
@@ -5073,6 +5736,7 @@ function TradingApp() {
     }
   }, [
     activePhemexSettings,
+    closeLivePositionOnProtectionHit,
     sendBotTick,
     syncPhemexOrderStatusThrottled,
     t
@@ -5825,7 +6489,13 @@ function TradingApp() {
               </div>
             )}
             {showChartOptions && (
-              <div className="chart-style-panel">
+              <div
+                className="chart-style-panel"
+                onClick={(event) => event.stopPropagation()}
+                onMouseDown={(event) => event.stopPropagation()}
+                onPointerDown={(event) => event.stopPropagation()}
+                onWheel={(event) => event.stopPropagation()}
+              >
                 <div className="style-panel-title">
                   <Palette size={16} />
                   {t.chartDesign}
@@ -5963,6 +6633,149 @@ function TradingApp() {
                         </select>
                       </label>
                     </div>
+                    {isGridBotScript && (
+                      <div className="bot-grid-box">
+                        <div className="bot-grid-title">{t.botGrid}</div>
+                        <label className="checkbox-row">
+                          <input
+                            type="checkbox"
+                            checked={botSettings.gridEnabled}
+                            onChange={(event) => updateBotSetting("gridEnabled", event.target.checked)}
+                          />
+                          <span>
+                            <strong>{t.botGridEnabled}</strong>
+                            <small>{t.botGridHint}</small>
+                          </span>
+                        </label>
+                        <div className="api-settings-grid">
+                          {!isPhemexGridBotScript && (
+                            <label>
+                              {t.botGridDirection}
+                              <select
+                                value={botSettings.gridDirection}
+                                onChange={(event) => updateBotSetting("gridDirection", event.target.value as BotSettings["gridDirection"])}
+                              >
+                                <option value="long">{t.botGridDirectionLong}</option>
+                                <option value="short">{t.botGridDirectionShort}</option>
+                                <option value="neutral">{t.botGridDirectionNeutral}</option>
+                              </select>
+                            </label>
+                          )}
+                          {isPhemexGridBotScript ? (
+                            <label>
+                              {t.botGridCount}
+                              <input
+                                inputMode="numeric"
+                                value={botSettings.gridCount}
+                                onChange={(event) => updateBotSetting("gridCount", event.target.value.replace(",", "."))}
+                                placeholder="500"
+                              />
+                            </label>
+                          ) : (
+                            <label>
+                              {t.botGridStepPercent}
+                              <input
+                                inputMode="decimal"
+                                value={botSettings.gridStepPercent}
+                                onChange={(event) => updateBotSetting("gridStepPercent", event.target.value.replace(",", "."))}
+                                placeholder="1"
+                              />
+                            </label>
+                          )}
+                          <label>
+                            {t.botGridPriceFrom}
+                            <input
+                              inputMode="decimal"
+                              value={botSettings.gridPriceFrom}
+                              onChange={(event) => updateBotSetting("gridPriceFrom", event.target.value.replace(",", "."))}
+                              placeholder={liveReferencePrice ? formatPrice(liveReferencePrice) : "0"}
+                            />
+                          </label>
+                          <label>
+                            {t.botGridPriceTo}
+                            <input
+                              inputMode="decimal"
+                              value={botSettings.gridPriceTo}
+                              onChange={(event) => updateBotSetting("gridPriceTo", event.target.value.replace(",", "."))}
+                              placeholder={liveReferencePrice ? formatPrice(liveReferencePrice) : "0"}
+                            />
+                          </label>
+                          {isPhemexGridBotScript ? (
+                            <>
+                              <label>
+                                {t.botGridAmountMode}
+                                <select
+                                  value={botSettings.gridAmountMode}
+                                  onChange={(event) => updateBotSetting("gridAmountMode", event.target.value as BotSettings["gridAmountMode"])}
+                                >
+                                  <option value="asset">{t.botGridAmountModeAsset}</option>
+                                  <option value="usdt">{t.botGridAmountModeUsdt}</option>
+                                </select>
+                              </label>
+                              <label>
+                                {t.botGridAmountValue}
+                                <input
+                                  inputMode="decimal"
+                                  value={botSettings.gridAmountValue}
+                                  onChange={(event) => updateBotSetting("gridAmountValue", event.target.value.replace(",", "."))}
+                                  placeholder={botSettings.gridAmountMode === "asset" ? "0.1" : "10"}
+                                />
+                              </label>
+                            </>
+                          ) : (
+                            <div className="bot-grid-risk-row">
+                              <label>
+                                {t.botGridTakeProfitPercent}
+                                <input
+                                  inputMode="decimal"
+                                  value={botSettings.gridTakeProfitPercent}
+                                  onChange={(event) => updateBotSetting("gridTakeProfitPercent", event.target.value.replace(",", "."))}
+                                  placeholder="1"
+                                />
+                              </label>
+                              <label>
+                                {t.botGridStopLossPercent}
+                                <input
+                                  inputMode="decimal"
+                                  value={botSettings.gridStopLossPercent}
+                                  onChange={(event) => updateBotSetting("gridStopLossPercent", event.target.value.replace(",", "."))}
+                                  placeholder="0.98"
+                                />
+                              </label>
+                            </div>
+                          )}
+                        </div>
+                        {isPhemexGridBotScript && (
+                          <div className="bot-grid-preview">
+                            <div>
+                              <span>{t.botGridProfitPerGrid}</span>
+                              <strong>{phemexGridPreview.profitPerGrid}</strong>
+                            </div>
+                            <div>
+                              <span>{t.botGridAmountPerGrid}</span>
+                              <strong>{phemexGridPreview.amountPerGrid}</strong>
+                            </div>
+                            <div>
+                              <span>{t.botGridEstimatedLiquidation}</span>
+                              <strong>{phemexGridPreview.liquidation}</strong>
+                            </div>
+                          </div>
+                        )}
+                        <div className="bot-grid-actions">
+                          <span className={botGridApplyState === "error" ? "bot-grid-feedback error" : "bot-grid-feedback"}>
+                            {botGridApplyState === "applied" ? t.botGridAppliedShort : botGridApplyState === "error" ? t.botGridInvalid : ""}
+                          </span>
+                          <button
+                            type="button"
+                            className="small primary"
+                            onClick={applyBotGridSettings}
+                          >
+                            <Save size={15} />
+                            {t.botGridApply}
+                          </button>
+                        </div>
+                      </div>
+                    )}
                     <div className="api-actions">
                       <button className="small primary" onClick={() => controlBotProcess("start")} disabled={botProcessStatus.running}>{t.botStart}</button>
                       <button className="small" onClick={() => controlBotProcess("stop")} disabled={!botProcessStatus.running}>{t.botStop}</button>
@@ -6248,17 +7061,26 @@ function TradingApp() {
                 <SkipForward size={18} />
                 {t.step}
               </button>
-              <label>
-                {t.replayDelay}
+              <label className="replay-progress">
+                {t.replayPosition}
                 <input
                   type="range"
-                  min="100"
-                  max="2500"
-                  step="100"
-                  value={speedMs}
-                  onChange={(event) => setSpeedMs(Number(event.target.value))}
+                  min="1"
+                  max={Math.max(1, allCandles.length)}
+                  step="1"
+                  value={Math.min(visibleCount, Math.max(1, allCandles.length))}
+                  onChange={(event) => jumpReplayToCount(Number(event.target.value))}
                 />
-                <span>{speedMs} ms</span>
+              </label>
+              <label className="replay-speed">
+                {t.replayDelay}
+                <select value={speedMs} onChange={(event) => setSpeedMs(Number(event.target.value))}>
+                  {[10, 50, 100, 200].map((value) => (
+                    <option key={value} value={value}>
+                      {value} ms
+                    </option>
+                  ))}
+                </select>
               </label>
               <button type="button" onClick={resetReplay}>
                 <RotateCcw size={18} />

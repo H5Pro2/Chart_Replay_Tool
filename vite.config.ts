@@ -127,6 +127,7 @@ const parseBody = (request: import("node:http").IncomingMessage) =>
 
 const normalizeBotScriptName = (value?: unknown) => {
   const script = basename(String(value || defaultBotScript).trim());
+  if (script === "grid_bot.py" || script === "phemex_grid_bot.py") return "spot_grid_bot.py";
   return /^[a-zA-Z0-9_.-]+\.py$/.test(script) ? script : defaultBotScript;
 };
 
@@ -574,6 +575,8 @@ const phemexSettingsPlugin = () => ({
           livePrice: body.livePrice,
           candle: body.candle,
           openOrders: body.openOrders || [],
+          gridTriggers: body.gridTriggers || [],
+          gridSettings: body.gridSettings || {},
           balance: body.balance,
           liveOrdersEnabled: body.liveOrdersEnabled === true
         };

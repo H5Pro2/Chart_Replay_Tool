@@ -1235,6 +1235,74 @@ button.tab.active {
   overflow-wrap: anywhere;
 }
 
+.bot-grid-box {
+  background: rgba(15, 23, 42, 0.42);
+  border: 1px solid rgba(77, 98, 126, 0.46);
+  border-radius: var(--radius-sm);
+  display: grid;
+  gap: 10px;
+  padding: 10px;
+}
+
+.bot-grid-title {
+  color: #dbeafe;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.bot-grid-risk-row {
+  display: grid;
+  gap: 8px 12px;
+  grid-column: 1 / -1;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+}
+
+.bot-grid-actions {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+  justify-content: flex-end;
+}
+
+.bot-grid-preview {
+  background: rgba(9, 15, 24, 0.52);
+  border: 1px solid rgba(77, 98, 126, 0.46);
+  border-radius: var(--radius-sm);
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  padding: 10px;
+}
+
+.bot-grid-preview div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.bot-grid-preview span {
+  color: #93a4ba;
+  font-size: 11px;
+}
+
+.bot-grid-preview strong {
+  color: #e5edf8;
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bot-grid-feedback {
+  color: #4ade80;
+  font-size: 12px;
+  min-height: 16px;
+}
+
+.bot-grid-feedback.error {
+  color: #f87171;
+}
+
 .chart-style-panel input[type="color"] {
   background: transparent;
   border: 1px solid #344258;
@@ -1440,8 +1508,31 @@ button.switch.active {
   min-width: 170px;
 }
 
-.replay-controls input {
+.replay-controls input[type="range"] {
   flex: 1;
+}
+
+.replay-progress {
+  flex: 1 1 auto;
+}
+
+.replay-speed {
+  flex: 0 0 auto;
+}
+
+.replay-speed select {
+  background: rgba(15, 23, 42, 0.9);
+  border: 1px solid rgba(59, 130, 246, 0.28);
+  border-radius: 7px;
+  color: var(--text);
+  font: inherit;
+  min-height: 38px;
+  min-width: 110px;
+  padding: 0 34px 0 12px;
+}
+
+.replay-speed select:hover {
+  border-color: rgba(125, 211, 252, 0.42);
 }
 
 .live-bot-controls {
@@ -2353,6 +2444,12 @@ button.small.primary {
   background: rgba(56, 189, 248, 0.18);
   border-color: rgba(56, 189, 248, 0.52);
   color: #dff6ff;
+}
+
+button.small.primary:hover:not(:disabled) {
+  background: rgba(56, 189, 248, 0.28);
+  border-color: rgba(125, 211, 252, 0.74);
+  color: #ffffff;
 }
 
 button.danger {
