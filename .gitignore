@@ -2,6 +2,9 @@ node_modules/
 dist/
 .env
 .env.*
+bot_bridge/*_model.json
+bot_bridge/*_config.json
+bot_bridge/__pycache__/
 chart_data/phemex_chart/*.csv
 !chart_data/phemex_chart/.gitkeep
 chart_data/binance_chart/*.csv

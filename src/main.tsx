@@ -1002,6 +1002,7 @@ const translations = {
     botProcessFailed: "Bot-Prozess konnte nicht gesteuert werden.",
     botSignal: (action: string) => `Bot-Signal: ${action}`,
     botTickFailed: "Bot-Tick konnte nicht gesendet werden.",
+    botTickTimeout: "Bot-Tick Timeout. Pruefe, ob der richtige Bot laeuft und schnell antwortet.",
     botLiveMissingQuantity: "Live-Bot kann nicht starten: Bitte zuerst eine Größe in der Live-Ordermaske eintragen.",
     botGrid: "Bot-Grid",
     botGridEnabled: "Triggerlinien anzeigen",
@@ -1268,6 +1269,7 @@ const translations = {
     botProcessFailed: "Bot process could not be controlled.",
     botSignal: (action: string) => `Bot signal: ${action}`,
     botTickFailed: "Bot tick could not be sent.",
+    botTickTimeout: "Bot tick timeout. Check whether the selected bot is running and responding quickly.",
     botLiveMissingQuantity: "Live bot cannot start: enter an amount in the live order panel first.",
     botGrid: "Bot Grid",
     botGridEnabled: "Show trigger lines",
@@ -1488,6 +1490,7 @@ function TradingApp() {
   const botTickInFlightRef = useRef(false);
   const botReplayQueueRef = useRef<Candle[]>([]);
   const botEnabledRef = useRef(storedBotOptions.enabled);
+  const lastBotTickErrorPopupAtRef = useRef(0);
   const lastMissingProtectionPopupAtRef = useRef(0);
   const liveOrderPlacementRef = useRef<{ locked: boolean; orderID?: string; clOrdID?: string; startedAt: number } | null>(null);
   const liveProtectionCloseInFlightRef = useRef<Set<string>>(new Set());
@@ -3300,7 +3303,8 @@ function TradingApp() {
       : activeCandle;
     botTickInFlightRef.current = true;
     const controller = new AbortController();
-    const timer = window.setTimeout(() => controller.abort(), 4500);
+    const botTickTimeoutMs = source === "replay" ? 12000 : 8000;
+    const timer = window.setTimeout(() => controller.abort(), botTickTimeoutMs);
     try {
       const response = await fetch("/api/bot-tick", {
         method: "POST",
@@ -3466,14 +3470,28 @@ function TradingApp() {
       }
     } catch (error) {
       if (!botEnabledRef.current) return;
-      const reason = error instanceof Error ? error.message : t.botTickFailed;
+      const isAbortError = error instanceof Error && (
+        error.name === "AbortError" ||
+        error.message.toLowerCase().includes("aborted")
+      );
+      const reason = isAbortError ? t.botTickTimeout : error instanceof Error ? error.message : t.botTickFailed;
       setBotRuntimeInfo((current) => ({ ...current, lastError: reason }));
-      showExchangeDebug("Bot", reason, {
-        source,
-        url: botSettings.url,
-        mode: botSettings.mode,
-        symbol: activePhemexSettings.symbol
-      });
+      const now = Date.now();
+      if (now - lastBotTickErrorPopupAtRef.current > 8000) {
+        lastBotTickErrorPopupAtRef.current = now;
+        showExchangeDebug("Bot", reason, {
+          source,
+          url: botSettings.url,
+          mode: botSettings.mode,
+          symbol: activePhemexSettings.symbol,
+          script: botSettings.script,
+          timeoutMs: botTickTimeoutMs,
+          errorName: error instanceof Error ? error.name : undefined
+        });
+      } else {
+        setMessage(reason);
+        setMessageKind("custom");
+      }
     } finally {
       window.clearTimeout(timer);
       botTickInFlightRef.current = false;
@@ -3807,7 +3825,7 @@ function TradingApp() {
 
   const controlBotProcess = async (action: "start" | "stop" | "reload") => {
     if (action === "start" || action === "reload") {
-      if (botSettings.mode === "live" && !isPhemexGridBotScript && (!Number.isFinite(quantity) || quantity <= 0)) {
+      if (action === "start" && botSettings.mode === "live" && !isPhemexGridBotScript && (!Number.isFinite(quantity) || quantity <= 0)) {
         botEnabledRef.current = false;
         setBotSettings((current) => ({ ...current, enabled: false }));
         showExchangeDebug("Live-Bot", t.botLiveMissingQuantity, {
@@ -6786,7 +6804,7 @@ function TradingApp() {
                         {t.botOpenFolder}
                       </button>
                     </div>
-                    <div className="live-status-box bot-status-box">
+                    <div className={`live-status-box bot-status-box ${botProcessStatus.running ? "active" : ""}`}>
                       <div className={botProcessStatus.running ? "status-dot live" : "status-dot"} />
                       <div>
                         <strong>{botProcessStatus.running ? t.botRunning : t.botStopped}</strong>

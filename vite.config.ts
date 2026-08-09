@@ -167,7 +167,17 @@ const waitForBotHealth = async (timeoutMs = 3500) => {
   return false;
 };
 
-const fetchWithTimeout = async (url: string, init: RequestInit, timeoutMs = 1800) => {
+const waitForBotShutdown = async (timeoutMs = 2500) => {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const processes = await listProjectBotProcesses();
+    if (!processes.length && !(await isBotHealthy())) return true;
+    await new Promise((resolveWait) => setTimeout(resolveWait, 150));
+  }
+  return false;
+};
+
+const fetchWithTimeout = async (url: string, init: RequestInit, timeoutMs = 8000) => {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -647,6 +657,8 @@ const phemexSettingsPlugin = () => ({
         }
         if (action === "reload") {
           await stopManagedBot();
+          await cleanupProjectBotProcesses();
+          await waitForBotShutdown();
           const status = await startManagedBot(body.script);
           response.setHeader("Content-Type", "application/json");
           response.end(JSON.stringify({ ok: true, ...status }));
