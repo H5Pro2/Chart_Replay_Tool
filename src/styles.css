@@ -300,7 +300,8 @@ p {
   flex: 1;
   gap: 12px;
   grid-template-columns: minmax(0, 1fr) 340px;
-  min-height: 560px;
+  height: clamp(520px, calc(100vh - 210px), 680px);
+  min-height: 0;
 }
 
 .chart-zone,
@@ -313,9 +314,10 @@ p {
 
 .chart-zone {
   display: grid;
-  grid-template-rows: 42px minmax(360px, 1fr) 58px;
+  grid-template-rows: 42px minmax(360px, 1fr) auto;
+  min-height: 0;
   min-width: 0;
-  overflow: visible;
+  overflow: hidden;
   position: relative;
   z-index: 30;
 }
@@ -514,7 +516,9 @@ button.toggle.active {
 }
 
 .chart-wrap {
-  min-height: 360px;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
   position: relative;
 }
 
@@ -788,6 +792,13 @@ button.toggle.active {
   right: 58px;
   transform: translateY(-50%);
   z-index: 11;
+}
+
+.order-line-label.locked {
+  border-color: rgba(52, 66, 88, 0.72);
+  cursor: default;
+  opacity: 0.84;
+  pointer-events: none;
 }
 
 .order-label-connector {
@@ -1292,7 +1303,7 @@ button.tab.active {
   border-radius: var(--radius-sm);
   display: grid;
   gap: 8px;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
   padding: 10px;
 }
 
@@ -1517,8 +1528,13 @@ button.switch.active {
   align-items: center;
   border-top: 1px solid rgba(148, 163, 184, 0.14);
   display: flex;
+  flex-wrap: wrap;
   gap: 10px;
   padding: 8px 12px;
+}
+
+.replay-controls button {
+  flex: 0 0 auto;
 }
 
 .replay-controls label {
@@ -1621,6 +1637,7 @@ button.switch.active {
   display: flex;
   flex-direction: column;
   gap: 12px;
+  min-height: 0;
   overflow: hidden;
   padding: 12px;
   position: relative;
@@ -1696,11 +1713,18 @@ input[type="text"] {
 
 .checkbox-row input {
   accent-color: #38bdf8;
+  flex: 0 0 14px;
+  height: 14px;
+  margin: 0;
+  min-height: 0;
+  padding: 0;
+  width: 14px;
 }
 
 .checkbox-row span {
   display: grid;
   gap: 2px;
+  min-width: 0;
 }
 
 .checkbox-row strong {
@@ -1711,6 +1735,10 @@ input[type="text"] {
 .checkbox-row small {
   color: var(--muted-text);
   font-size: 12px;
+}
+
+.api-settings-grid .checkbox-row input[type="checkbox"] {
+  width: 14px;
 }
 
 .checkbox-row.warning {
@@ -2041,12 +2069,14 @@ input[type="text"] {
 .orderbook {
   border-top: 1px solid rgba(148, 163, 184, 0.14);
   flex: 1;
+  min-height: 0;
   padding-top: 12px;
 }
 
 .book-list {
   display: grid;
   gap: 8px;
+  min-height: 0;
   overflow: auto;
 }
 
@@ -2490,10 +2520,25 @@ button.danger {
     grid-template-columns: 1fr;
   }
 
-  .topbar,
-  .replay-controls {
+  .topbar {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .replay-controls {
+    align-items: stretch;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+
+  .replay-controls button,
+  .replay-controls label {
+    min-width: 0;
+    width: 100%;
+  }
+
+  .replay-progress {
+    grid-column: 1 / -1;
   }
 
   .topbar-bot-status {

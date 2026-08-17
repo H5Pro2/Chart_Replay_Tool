@@ -172,6 +172,7 @@ Mitgelieferte Bot-Scripte:
 ```text
 bot_bridge/long_bot.py
 bot_bridge/short_bot.py
+bot_bridge/spot_grid_bot.py
 ```
 
 Der Bot kann im Bot-Setup mit `Start`, `Pause`, `Stop` und `Reload` gesteuert werden. Es wird nur ein Projekt-Bot-Prozess verwaltet.
@@ -186,9 +187,8 @@ Der Proxy akzeptiert nur lokale Bot-URLs mit `localhost` oder `127.0.0.1`.
 
 ### Bot-Modi
 
-- `Nur Signale`: Bot-Antworten werden nur angezeigt.
-- `Simulation`: Bot darf interne Tool-Orders im Orderbook erzeugen.
-- `Live freigeben`: Bot-Signale bedienen die Live-Oberfläche. Das Tool prüft Menge, Gewinnziel, Verluststopp, Live-Freigabe und Börsenstatus und sendet erst danach die echte Order.
+- `Paper Trading`: Bot darf interne Tool-Orders im Orderbook erzeugen.
+- `Live Trading`: Bot-Signale bedienen die Live-Oberfläche. Das Tool prüft Menge, Gewinnziel, Verluststopp, Live-Freigabe und Börsenstatus und sendet erst danach die echte Order.
 
 Im Live-Modus nutzt der Bot die Einstellungen aus dem Live-Orderpanel:
 

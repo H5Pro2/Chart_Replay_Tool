@@ -5,6 +5,7 @@ import {
   createChart,
   CrosshairMode,
   IChartApi,
+  IPriceLine,
   ISeriesApi,
   LineSeries,
   LineStyle,
@@ -44,6 +45,7 @@ type Candle = {
   close: number;
   volume?: number;
 };
+type BotReplayCandle = Candle & { previousClose?: number };
 
 type Side = "buy" | "sell";
 type OrderStatus = "pending" | "active" | "closed" | "canceled";
@@ -68,8 +70,48 @@ type TradeOrder = {
   closePrice?: number;
   result?: "TP" | "SL" | "CANCEL" | "CLOSE";
   spotGrid?: boolean;
+  gridBot?: boolean;
+  gridMarketType?: "spot" | "future";
   mechanic?: "spot_grid" | string;
   gridIndex?: number;
+};
+
+type SubmitOrderOptions = {
+  entry?: number;
+  takeProfit?: number;
+  stopLoss?: number;
+  quantity?: number;
+  orderType?: "limit" | "market";
+  marginMode?: "cross" | "isolated";
+  leverage?: number;
+  allowMissingProtection?: boolean;
+  clientOrderId?: string;
+  fastGridSubmit?: boolean;
+  gridBot?: boolean;
+  spotGrid?: boolean;
+  gridMarketType?: "spot" | "future";
+  mechanic?: "spot_grid" | "grid_bot" | string;
+  gridIndex?: number;
+};
+
+type BotOverlayPoint = {
+  time: Time;
+  value: number;
+};
+
+type BotOverlayLine = {
+  id: string;
+  label?: string;
+  color?: string;
+  width?: 1 | 2 | 3 | 4;
+  style?: "solid" | "dashed" | "dotted";
+  points: BotOverlayPoint[];
+};
+
+type BotOverlay = {
+  name?: string;
+  version?: number;
+  lines?: BotOverlayLine[];
 };
 
 type CsvRow = Record<string, string | number | undefined>;
@@ -86,7 +128,7 @@ const defaultCandles: Candle[] = [
   { time: "2026-01-08" as Time, open: 108, high: 115, low: 107, close: 114, volume: 1970 }
 ];
 
-const GRID_BOT_STOP_LOSS_ENABLED = true;
+const BOT_CHART_OVERLAY_ENABLED = false;
 
 const numberFrom = (value: unknown) => {
   const normalized = String(value ?? "").replace(",", ".").trim();
@@ -114,7 +156,7 @@ const normalizeTime = (value: unknown, unit?: "ms" | "s"): Time | undefined => {
 };
 
 const rowsToCandles = (rows: CsvRow[]) => {
-  return rows
+  const candles = rows
     .map((row) => {
       const timestampMs = findValue(row, ["timestamp_ms", "timestampms", "open_time_ms"]);
       const timestamp = findValue(row, ["timestamp", "time", "date", "datetime", "open_time"]);
@@ -130,6 +172,15 @@ const rowsToCandles = (rows: CsvRow[]) => {
       return { time, open, high, low, close, volume };
     })
     .filter(Boolean) as Candle[];
+
+  const byTime = new Map<number | string, Candle>();
+  candles.forEach((candle) => {
+    byTime.set(timeToSortableValue(candle.time), candle);
+  });
+
+  return [...byTime.values()].sort((left, right) =>
+    timeToSortableValue(left.time) - timeToSortableValue(right.time)
+  );
 };
 
 const parseCsvCandles = (file: File, onDone: (candles: Candle[]) => void, onError: (message: string) => void) => {
@@ -264,6 +315,83 @@ const chartTimeToLogical = (candles: Candle[], time: Time | undefined) => {
 
 const formatPrice = (value?: number) => (value === undefined ? "-" : value.toFixed(2));
 
+const GRID_CLIENT_ORDER_PREFIX = "crt-grid";
+const GRID_ORDER_SUBMIT_GUARD_MS = 5_000;
+const GRID_ORDER_RETRY_GUARD_MS = 20_000;
+const GRID_ORDER_REORDER_INTERVAL_MS = 4_000;
+
+type GridOrderLevelLockReason = "inflight" | "duplicate";
+type GridOrderLevelLock = {
+  until: number;
+  symbol: string;
+  side: Side;
+  entry: number;
+  gridIndex?: number;
+  reason: GridOrderLevelLockReason;
+};
+
+const sanitizeClientOrderPart = (value: unknown, maxLength = 14) =>
+  String(value ?? "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "")
+    .slice(0, maxLength);
+
+const makeGridClientOrderId = (symbol: string, side: Side, entryPrice: number, gridIndex?: unknown, nonce?: unknown) => {
+  const hasNonce = String(nonce ?? "").trim().length > 0;
+  const symbolPart = sanitizeClientOrderPart(symbol, hasNonce ? 8 : 14) || "SYMBOL";
+  const sidePart = side === "sell" ? "S" : "B";
+  const indexValue = numberFrom(gridIndex);
+  const indexPart = Number.isFinite(indexValue) ? String(Math.trunc(Number(indexValue))).slice(0, hasNonce ? 5 : 6) : "X";
+  const pricePart = String(Math.round(entryPrice * 1_000_000)).replace(/[^0-9]/g, "").slice(0, hasNonce ? 8 : 12);
+  const noncePart = sanitizeClientOrderPart(nonce, 4);
+  const baseId = `${GRID_CLIENT_ORDER_PREFIX}-${symbolPart}-${sidePart}-${indexPart}-${pricePart}`;
+  return `${baseId}${noncePart ? `-${noncePart}` : ""}`.slice(0, 40);
+};
+
+const parseGridClientOrderId = (clientOrderId?: string) => {
+  const value = String(clientOrderId || "").trim();
+  const match = value.match(/^crt-grid-[A-Z0-9]+-([BS])-(X|-?\d+)-\d+(?:-[A-Z0-9]+)?$/i);
+  if (!match) return undefined;
+  const gridIndex = match[2] === "X" ? undefined : Number(match[2]);
+  return {
+    side: match[1].toUpperCase() === "S" ? "sell" as Side : "buy" as Side,
+    gridIndex: Number.isFinite(gridIndex) ? gridIndex : undefined
+  };
+};
+
+const sameGridLevel = (
+  left: TradeOrder,
+  right: { side: Side; entry: number; gridIndex?: number; tolerance?: number },
+  allowAnySide = false
+) => {
+  const leftGridIndex = numberFrom(left.gridIndex) ?? NaN;
+  const rightGridIndex = numberFrom(right.gridIndex) ?? NaN;
+  const leftIndex = Number.isFinite(leftGridIndex) ? Math.trunc(leftGridIndex) : undefined;
+  const rightIndex = Number.isFinite(rightGridIndex) ? Math.trunc(rightGridIndex) : undefined;
+  const sameIndex = leftIndex !== undefined && rightIndex !== undefined && leftIndex === rightIndex;
+
+  if (sameIndex) {
+    return allowAnySide || left.side === right.side;
+  }
+
+  if (!allowAnySide && left.side !== right.side) return false;
+
+  if (
+      left.gridIndex === undefined ||
+      right.gridIndex === undefined ||
+      !Number.isFinite(Number(left.gridIndex)) ||
+      !Number.isFinite(Number(right.gridIndex))
+    )
+  {
+    const tolerance = Number.isFinite(Number(right.tolerance))
+      ? Math.max(0.000001, Number(right.tolerance))
+      : 0.000001;
+    return Math.abs(left.entry - right.entry) <= tolerance;
+  }
+
+  return false;
+};
+
 const timeToSortableValue = (time: Time) => {
   if (typeof time === "number") return time;
   if (typeof time === "string") return Date.parse(time) || 0;
@@ -344,6 +472,7 @@ const phemexOrderToTradeOrder = (row: PhemexOpenOrderRow, fallbackTime: Time): T
   const phemexClOrdId = String(row.clOrdID || "").trim();
   const id = phemexOrderId || phemexClOrdId;
   if (!id || entry === undefined || entry <= 0 || quantity === undefined || quantity <= 0) return undefined;
+  const gridMeta = parseGridClientOrderId(phemexClOrdId) ?? parseGridClientOrderId(id);
   const importedTakeProfit = numberFrom(row.takeProfitRp ?? row.tpPxRp ?? row.tpTriggerPxRp);
   const importedStopLoss = numberFrom(row.stopLossRp ?? row.slPxRp ?? row.slTriggerPxRp);
   const takeProfit = importedTakeProfit !== undefined && importedTakeProfit > 0 ? importedTakeProfit : undefined;
@@ -360,7 +489,11 @@ const phemexOrderToTradeOrder = (row: PhemexOpenOrderRow, fallbackTime: Time): T
     takeProfit,
     stopLoss,
     status: "pending",
-    openedAt: fallbackTime
+    openedAt: fallbackTime,
+    gridBot: gridMeta !== undefined,
+    gridMarketType: gridMeta ? "future" : undefined,
+    mechanic: gridMeta ? "grid_bot" : undefined,
+    gridIndex: gridMeta?.gridIndex
   };
 };
 
@@ -417,7 +550,12 @@ const mergeExchangeOrderWithLocal = (imported: TradeOrder, local?: TradeOrder): 
     takeProfit: imported.takeProfit ?? local.takeProfit,
     stopLoss: imported.stopLoss ?? local.stopLoss,
     openedAt: local.openedAt ?? imported.openedAt,
-    openedIndex: local.openedIndex ?? imported.openedIndex
+    openedIndex: local.openedIndex ?? imported.openedIndex,
+    spotGrid: local.spotGrid ?? imported.spotGrid,
+    gridBot: local.gridBot ?? imported.gridBot,
+    gridMarketType: local.gridMarketType ?? imported.gridMarketType,
+    mechanic: local.mechanic ?? imported.mechanic,
+    gridIndex: local.gridIndex ?? imported.gridIndex
   };
 };
 
@@ -561,6 +699,12 @@ type OrderbookConfirm = {
   message: string;
 };
 
+type GridApplyConfirm = {
+  settings: BotSettings;
+  title: string;
+  message: string;
+};
+
 type CsvBuilderState = {
   coin: string;
   quote: string;
@@ -637,6 +781,10 @@ type BotSettings = {
   gridCount: string;
   gridInvestment: string;
   gridLeverage: string;
+  gridMarketType: "spot" | "future";
+  gridMarginMode: "cross" | "isolated";
+  gridOrderType: "limit" | "market";
+  gridStopLossEnabled: boolean;
   gridAmountMode: "asset" | "usdt";
   gridAmountValue: string;
 };
@@ -678,12 +826,64 @@ const botOptionsStorageKey = "chart-replay-tool-bot-options";
 const liveOrderPanelStorageKey = "chart-replay-tool-live-order-panel";
 const coinFavoritesStorageKey = "chart-replay-tool-coin-favorites";
 const runtimeStateStorageKey = "chart-replay-tool-runtime-state";
+const replaySessionStorageKey = "chart-replay-tool-replay-session";
+const chartViewStorageKey = "chart-replay-tool-chart-view";
+const replayServerSyncEnabled = false;
+const sharedStateKeys = [
+  drawingsStorageKey,
+  pendingOrdersStorageKey,
+  chartThemeStorageKey,
+  appOptionsStorageKey,
+  exchangeOptionsStorageKey,
+  botOptionsStorageKey,
+  liveOrderPanelStorageKey,
+  coinFavoritesStorageKey,
+  runtimeStateStorageKey
+] as const;
+type SharedStateKey = typeof sharedStateKeys[number];
+type SharedStateItem = {
+  value: unknown;
+  updatedAt: number;
+  clientId?: string;
+};
+type SharedStatePayload = Partial<Record<SharedStateKey, SharedStateItem>>;
+type ReplayServerState = {
+  allCandles?: Candle[];
+  visibleCount?: number;
+  isPlaying?: boolean;
+  speedMs?: number;
+  orders?: TradeOrder[];
+  chartRange?: { from: number; to: number } | null;
+  message?: string;
+  messageKind?: "demo" | "chartCsv" | "custom";
+  updatedAt?: number;
+  clientId?: string;
+};
 const defaultDrawingStrokeColor = "#7db8ff";
 const defaultDrawingFillColor = "#7db8ff";
 const rightPriceScaleOffset = 64;
+const MAX_CHART_RENDER_CANDLES = 2000;
 const phemexOrderIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const isOpenTradeOrder = (order: TradeOrder) => order.status === "pending" || order.status === "active";
-const isSpotGridTradeOrder = (order: TradeOrder) => order.spotGrid === true || order.mechanic === "spot_grid";
+const isGridTradeOrder = (order: TradeOrder) =>
+  order.gridBot === true ||
+  order.spotGrid === true ||
+  order.mechanic === "spot_grid" ||
+  order.mechanic === "grid_bot";
+const hasExchangeOrderReference = (order: TradeOrder) =>
+  Boolean(order.phemexOrderId || order.phemexClOrdId || phemexOrderIdPattern.test(order.id));
+const allowedBotScripts = ["long_bot.py", "short_bot.py", "spot_grid_bot.py"] as const;
+const normalizeBotScriptName = (value: unknown) => {
+  const script = typeof value === "string" ? value.trim() : "";
+  if (script === "grid_bot.py" || script === "phemex_grid_bot.py") return "spot_grid_bot.py";
+  return allowedBotScripts.includes(script as typeof allowedBotScripts[number]) ? script : "long_bot.py";
+};
+const botScriptLabel = (script: string) => {
+  if (script === "long_bot.py") return "Long Bot";
+  if (script === "short_bot.py") return "Short Bot";
+  if (script === "spot_grid_bot.py") return "Gridbot";
+  return script;
+};
 const keepSingleOpenOrder = (orders: TradeOrder[]) => {
   let hasOpenOrder = false;
   return orders.filter((order) => {
@@ -735,13 +935,13 @@ const loadStoredBotOptions = (): BotSettings => {
   try {
     const raw = window.localStorage.getItem(botOptionsStorageKey);
     const parsed = raw ? JSON.parse(raw) : {};
-    const storedScript = typeof parsed.script === "string" && parsed.script.trim() ? parsed.script : "long_bot.py";
+    const storedScript = normalizeBotScriptName(parsed.script);
     return {
       enabled: Boolean(parsed.enabled),
       url: typeof parsed.url === "string" && parsed.url.trim() ? parsed.url : "http://127.0.0.1:8790/tick",
-      mode: parsed.mode === "paper" || parsed.mode === "live" ? parsed.mode : "signals",
+      mode: parsed.mode === "live" ? "live" : "paper",
       orderType: parsed.orderType === "market" ? "market" : "limit",
-      script: storedScript === "phemex_grid_bot.py" || storedScript === "grid_bot.py" ? "spot_grid_bot.py" : storedScript,
+      script: storedScript,
       gridEnabled: Boolean(parsed.gridEnabled),
       gridPriceFrom: typeof parsed.gridPriceFrom === "string"
         ? parsed.gridPriceFrom.replace(",", ".")
@@ -756,6 +956,10 @@ const loadStoredBotOptions = (): BotSettings => {
       gridCount: typeof parsed.gridCount === "string" ? parsed.gridCount.replace(",", ".") : "500",
       gridInvestment: typeof parsed.gridInvestment === "string" ? parsed.gridInvestment.replace(",", ".") : "",
       gridLeverage: typeof parsed.gridLeverage === "string" ? parsed.gridLeverage.replace(",", ".") : "10",
+      gridMarketType: parsed.gridMarketType === "future" ? "future" : "spot",
+      gridMarginMode: parsed.gridMarginMode === "isolated" ? "isolated" : "cross",
+      gridOrderType: parsed.gridOrderType === "market" ? "market" : "limit",
+      gridStopLossEnabled: Boolean(parsed.gridStopLossEnabled),
       gridAmountMode: parsed.gridAmountMode === "asset" ? "asset" : "usdt",
       gridAmountValue: typeof parsed.gridAmountValue === "string"
         ? parsed.gridAmountValue.replace(",", ".")
@@ -767,7 +971,7 @@ const loadStoredBotOptions = (): BotSettings => {
     return {
       enabled: false,
       url: "http://127.0.0.1:8790/tick",
-      mode: "signals",
+      mode: "paper",
       orderType: "limit",
       script: "long_bot.py",
       gridEnabled: false,
@@ -780,6 +984,10 @@ const loadStoredBotOptions = (): BotSettings => {
       gridCount: "500",
       gridInvestment: "",
       gridLeverage: "10",
+      gridMarketType: "spot",
+      gridMarginMode: "cross",
+      gridOrderType: "limit",
+      gridStopLossEnabled: false,
       gridAmountMode: "asset",
       gridAmountValue: ""
     };
@@ -973,8 +1181,8 @@ const translations = {
     botScript: "Bot-Script",
     botMode: "Bot-Modus",
     botModeSignals: "Nur Signale",
-    botModePaper: "Simulation",
-    botModeLive: "Live freigeben",
+    botModePaper: "Paper Trading",
+    botModeLive: "Live Trading",
     botTest: "Bot testen",
     botTestOk: "Bot-Verbindung ok.",
     botTestFailed: "Bot-Verbindung konnte nicht geprüft werden.",
@@ -1004,9 +1212,9 @@ const translations = {
     botTickFailed: "Bot-Tick konnte nicht gesendet werden.",
     botTickTimeout: "Bot-Tick Timeout. Pruefe, ob der richtige Bot laeuft und schnell antwortet.",
     botLiveMissingQuantity: "Live-Bot kann nicht starten: Bitte zuerst eine Größe in der Live-Ordermaske eintragen.",
-    botGrid: "Bot-Grid",
+    botGrid: "Gridbot",
     botGridEnabled: "Triggerlinien anzeigen",
-    botGridHint: "Zeigt nur Grid-Trigger im Chart. Es wird dadurch keine Order gesetzt.",
+    botGridHint: "Zeigt Grid-Level im Chart. Orders entstehen erst, wenn der Gridbot aktiv ist.",
     botGridPriceFrom: "Preis von",
     botGridPriceTo: "Preis bis",
     botGridPriceRange: "Preisklasse",
@@ -1014,15 +1222,27 @@ const translations = {
     botGridTakeProfitPercent: "TP %",
     botGridStopLossPercent: "SL %",
     botGridCount: "Gitter",
-    botGridInvestment: "Spot-Kapital",
+    botGridInvestment: "Kapital",
     botGridAmountMode: "Mengenmodus",
     botGridAmountModeAsset: "Asset pro Grid",
     botGridAmountModeUsdt: "USDT pro Grid",
     botGridAmountValue: "Menge pro Grid",
     botGridLeverage: "Hebel",
-    botGridProfitPerGrid: "Gewinn pro Netz",
+    botGridMarketType: "Handelsart",
+    botGridMarketSpot: "Spot",
+    botGridMarketFuture: "Future",
+    botGridMarginMode: "Margin-Modus",
+    botGridOrderType: "Ordertyp",
+    botGridStopLossConfig: "SL-Config",
+    botGridNoStopLoss: "Kein SL",
+    botGridStopLossEnabled: "SL verwenden",
+    botGridStopLossHint: "",
+    botGridProfitPerGrid: "Gewinn pro Grid",
     botGridAmountPerGrid: "Menge pro Grid",
-    botGridEstimatedLiquidation: "Future-Schutz",
+    botGridTotalAmount: "Gesamtmenge",
+    botGridPositionValue: "Positionswert",
+    botGridRequiredCapital: "Kapitalbedarf",
+    botGridEstimatedLiquidation: "Schutz",
     botGridDirection: "Richtung",
     botGridDirectionLong: "Long",
     botGridDirectionShort: "Short",
@@ -1031,6 +1251,9 @@ const translations = {
     botGridApplied: "Grid-Einstellungen übernommen.",
     botGridAppliedShort: "Übernommen",
     botGridInvalid: "Grid-Einstellungen sind unvollständig oder ungültig.",
+    botGridLiveConfirmTitle: "Live-Grid erstellen?",
+    botGridLiveConfirm: "Du bist im Bot-Modus Live Trading. Soll dieser Gridbereich jetzt als aktive Live-Grid-Konfiguration übernommen werden? Nach dem Start setzt der Bot daraus Live-Limit-Orders.",
+    botGridLiveConfirmAction: "Gridbereich erstellen",
     phemexConnection: "Phemex-Anbindung",
     connectionSection: "Verbindung",
     dataModeSection: "Datenmodus",
@@ -1064,8 +1287,8 @@ const translations = {
     syncExchange: "Abgleich",
     syncExchangeDone: "Phemex-Abgleich abgeschlossen.",
     syncExchangeFailed: "Phemex-Abgleich fehlgeschlagen.",
-    liveOrders: "Phemex Live-Order",
-    liveOrdersHint: "Erlaubt dem Orderpanel und dem Live-Bot, echte Orders an die Börse zu senden.",
+    liveOrders: "Live-Order",
+    liveOrdersHint: "Echte Orders werden ueber den Live-Modus gesteuert.",
     marginMode: "Margin-Modus",
     cross: "Cross",
     isolated: "Isoliert",
@@ -1089,9 +1312,9 @@ const translations = {
     connectionFailed: "Phemex-Verbindung konnte nicht geprüft werden.",
     phemexChartLoaded: (count: number, path: string) => `${count} Phemex-Kerzen geladen und in ${path} gespeichert.`,
     phemexChartFailed: "Phemex-Chart konnte nicht geladen werden.",
-    phemexOrderPlaced: (id: string) => `Phemex Live-Order gesendet: ${id}.`,
-    phemexOrderFailed: (reason?: string) => `Phemex Live-Order konnte nicht gesendet werden${reason ? `: ${reason}` : "."}`,
-    phemexLiveOrdersDisabled: "Phemex Live-Order ist aus. Aktiviere den Schalter, bevor du eine echte Order sendest.",
+    phemexOrderPlaced: (id: string) => `Live-Order gesendet: ${id}.`,
+    phemexOrderFailed: (reason?: string) => `Live-Order konnte nicht gesendet werden${reason ? `: ${reason}` : "."}`,
+    phemexLiveOrdersDisabled: "Live-Order ist nicht freigegeben.",
     phemexOrdersSynced: (count: number) => `${count} offene Phemex-Orders übernommen.`,
     phemexOrderAmended: (id: string) => `Phemex Order ${id} aktualisiert.`,
     phemexOrderAmendFailed: (reason?: string) => `Phemex Order konnte nicht aktualisiert werden${reason ? `: ${reason}` : "."}`,
@@ -1240,8 +1463,8 @@ const translations = {
     botScript: "Bot Script",
     botMode: "Bot Mode",
     botModeSignals: "Signals only",
-    botModePaper: "Paper simulation",
-    botModeLive: "Allow live",
+    botModePaper: "Paper Trading",
+    botModeLive: "Live Trading",
     botTest: "Test Bot",
     botTestOk: "Bot connection ok.",
     botTestFailed: "Bot connection could not be checked.",
@@ -1271,9 +1494,9 @@ const translations = {
     botTickFailed: "Bot tick could not be sent.",
     botTickTimeout: "Bot tick timeout. Check whether the selected bot is running and responding quickly.",
     botLiveMissingQuantity: "Live bot cannot start: enter an amount in the live order panel first.",
-    botGrid: "Bot Grid",
+    botGrid: "Gridbot",
     botGridEnabled: "Show trigger lines",
-    botGridHint: "Shows grid triggers in the chart only. This does not place an order.",
+    botGridHint: "Shows grid levels in the chart. Orders are placed only when the gridbot is active.",
     botGridPriceFrom: "Price From",
     botGridPriceTo: "Price To",
     botGridPriceRange: "Price Range",
@@ -1281,15 +1504,27 @@ const translations = {
     botGridTakeProfitPercent: "TP %",
     botGridStopLossPercent: "SL %",
     botGridCount: "Grid",
-    botGridInvestment: "Spot Capital",
+    botGridInvestment: "Capital",
     botGridAmountMode: "Amount Mode",
     botGridAmountModeAsset: "Asset per Grid",
     botGridAmountModeUsdt: "USDT per Grid",
     botGridAmountValue: "Amount per Grid",
     botGridLeverage: "Leverage",
+    botGridMarketType: "Market Type",
+    botGridMarketSpot: "Spot",
+    botGridMarketFuture: "Future",
+    botGridMarginMode: "Margin Mode",
+    botGridOrderType: "Order Type",
+    botGridStopLossConfig: "SL Config",
+    botGridNoStopLoss: "No SL",
+    botGridStopLossEnabled: "Use SL",
+    botGridStopLossHint: "",
     botGridProfitPerGrid: "Profit per Grid",
     botGridAmountPerGrid: "Amount per Grid",
-    botGridEstimatedLiquidation: "Future Guard",
+    botGridTotalAmount: "Total Amount",
+    botGridPositionValue: "Position Value",
+    botGridRequiredCapital: "Required Capital",
+    botGridEstimatedLiquidation: "Protection",
     botGridDirection: "Direction",
     botGridDirectionLong: "Long",
     botGridDirectionShort: "Short",
@@ -1298,6 +1533,9 @@ const translations = {
     botGridApplied: "Grid settings applied.",
     botGridAppliedShort: "Applied",
     botGridInvalid: "Grid settings are incomplete or invalid.",
+    botGridLiveConfirmTitle: "Create live grid?",
+    botGridLiveConfirm: "Bot mode is Live Trading. Should this grid range now be applied as the active live grid configuration? After start, the bot will create live limit orders from it.",
+    botGridLiveConfirmAction: "Create grid range",
     phemexConnection: "Phemex Connection",
     connectionSection: "Connection",
     dataModeSection: "Data Mode",
@@ -1331,8 +1569,8 @@ const translations = {
     syncExchange: "Sync",
     syncExchangeDone: "Phemex sync complete.",
     syncExchangeFailed: "Phemex sync failed.",
-    liveOrders: "Phemex Live Order",
-    liveOrdersHint: "Allows the order panel and live bot to send real orders to the exchange.",
+    liveOrders: "Live Order",
+    liveOrdersHint: "Real orders are controlled by Live mode.",
     marginMode: "Margin Mode",
     cross: "Cross",
     isolated: "Isolated",
@@ -1358,7 +1596,7 @@ const translations = {
     phemexChartFailed: "Phemex chart could not be loaded.",
     phemexOrderPlaced: (id: string) => `Phemex live order sent: ${id}.`,
     phemexOrderFailed: (reason?: string) => `Phemex live order could not be sent${reason ? `: ${reason}` : "."}`,
-    phemexLiveOrdersDisabled: "Phemex live order is off. Enable the switch before sending a real order.",
+    phemexLiveOrdersDisabled: "Live order is not enabled.",
     phemexOrdersSynced: (count: number) => `${count} open Phemex orders imported.`,
     phemexOrderAmended: (id: string) => `Phemex order ${id} updated.`,
     phemexOrderAmendFailed: (reason?: string) => `Phemex order could not be updated${reason ? `: ${reason}` : "."}`,
@@ -1464,6 +1702,8 @@ function TradingApp() {
   const chartRef = useRef<IChartApi | null>(null);
   const candleSeriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
   const lineSeriesRef = useRef<Map<string, ISeriesApi<"Line">>>(new Map());
+  const gridPriceLinesRef = useRef<Map<string, IPriceLine>>(new Map());
+  const botOverlaySeriesRef = useRef<Map<string, ISeriesApi<"Line">>>(new Map());
   const shouldFitContentRef = useRef(true);
   const shouldFitPriceRef = useRef(true);
   const shouldJumpToLatestRef = useRef(false);
@@ -1471,11 +1711,25 @@ function TradingApp() {
   const chartRangeLockUntilRef = useRef(0);
   const previousVisibleCountRef = useRef(0);
   const previousCandleSetRef = useRef<Candle[] | null>(null);
+  const lastChartSizeRef = useRef({ width: 0, height: 0 });
   const overlayRefreshFrameRef = useRef(0);
   const overlayRefreshFollowUpFrameRef = useRef(0);
   const lastLiveSubmitRestoreAtRef = useRef(0);
   const updateDrawingDomRef = useRef<() => void>(() => undefined);
   const storageWriteTimersRef = useRef<Record<string, number>>({});
+  const sharedStateClientIdRef = useRef(`crt-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`);
+  const sharedStateReadyRef = useRef(false);
+  const applyingSharedStateRef = useRef(false);
+  const isPrimaryInstanceRef = useRef(true);
+  const sharedReplayLoadedRef = useRef(false);
+  const replayStateReadyRef = useRef(false);
+  const applyingReplayStateRef = useRef(false);
+  const replayStateUpdatedAtRef = useRef(0);
+  const replayStateWriteTimerRef = useRef(0);
+  const replayDatasetSignatureRef = useRef("");
+  const lastReplayPositionWriteAtRef = useRef(0);
+  const sharedStateWriteTimersRef = useRef<Record<string, number>>({});
+  const sharedStateKnownAtRef = useRef<Record<string, number>>({});
   const drawingDragFrameRef = useRef(0);
   const orderDragFrameRef = useRef(0);
   const pendingDrawingMoveRef = useRef<{
@@ -1488,8 +1742,19 @@ function TradingApp() {
   const hasChartOverlaysRef = useRef(false);
   const ordersRef = useRef<TradeOrder[]>([]);
   const botTickInFlightRef = useRef(false);
-  const botReplayQueueRef = useRef<Candle[]>([]);
+  const gridOrderSuppressionUntilRef = useRef<Map<string, number>>(new Map());
+  const gridOrderLevelSuppressionRef = useRef<Map<string, GridOrderLevelLock>>(new Map());
+  const botOverlayInFlightRef = useRef(false);
+  const botOverlayPendingCandleRef = useRef<Candle | null>(null);
+  const lastBotOverlayAppliedTimeRef = useRef<number | null>(null);
+  const lastBotOverlayRequestAtRef = useRef(0);
+  const botReplayQueueRef = useRef<BotReplayCandle[]>([]);
+  const botReplayGenerationRef = useRef(0);
+  const lastBotReplayCandleTimeRef = useRef<number | null>(null);
+  const lastBotReplayCloseRef = useRef<number | null>(null);
+  const lastBotRuntimeUiAtRef = useRef(0);
   const botEnabledRef = useRef(storedBotOptions.enabled);
+  const botRunGenerationRef = useRef(0);
   const lastBotTickErrorPopupAtRef = useRef(0);
   const lastMissingProtectionPopupAtRef = useRef(0);
   const liveOrderPlacementRef = useRef<{ locked: boolean; orderID?: string; clOrdID?: string; startedAt: number } | null>(null);
@@ -1497,17 +1762,20 @@ function TradingApp() {
   const lastLiveOrderSubmitAtRef = useRef(0);
   const restoreLiveAfterReloadRef = useRef(storedRuntimeState.liveRunning);
   const liveRestoreInFlightRef = useRef(false);
+  const gridReorderMonitorInFlightRef = useRef(false);
+  const lastGridReorderRunAtRef = useRef(0);
   const submitOrderRef = useRef<(
     forcedSide?: Side,
-    forcedOptions?: { entry?: number; takeProfit?: number; stopLoss?: number; quantity?: number; allowMissingProtection?: boolean }
+    forcedOptions?: SubmitOrderOptions
   ) => Promise<void>>(async () => undefined);
   const canceledPhemexOrderKeysRef = useRef<Set<string>>(new Set());
   const openPhemexOrderKeysRef = useRef<Set<string>>(new Set());
+  const openGridLevelKeysFromExchangeRef = useRef<Set<string>>(new Set());
   const phemexOpenOrderRowsRef = useRef<PhemexOpenOrderRow[]>([]);
   const lastPhemexOrderStatusSyncAtRef = useRef(0);
   const lastLivePriceErrorPopupAtRef = useRef(0);
   const livePriceBackoffUntilRef = useRef(0);
-  const refreshLivePhemexPriceRef = useRef<(settingsOverride?: PhemexSettings) => Promise<void>>(async () => undefined);
+  const refreshLivePhemexPriceRef = useRef<(settingsOverride?: PhemexSettings) => Promise<number | undefined>>(async () => undefined);
   const draggedLineRef = useRef<DraggedOrderLine | null>(null);
   const draggedChipRef = useRef<{ orderId: string; field: "takeProfit" | "stopLoss" } | null>(null);
   const draggedProtectionOriginalRef = useRef<{ orderId: string; entry: number; takeProfit?: number; stopLoss?: number } | null>(null);
@@ -1518,14 +1786,18 @@ function TradingApp() {
   const chipDragFinishedRef = useRef(false);
   const [lineControls, setLineControls] = useState<Array<{ order: TradeOrder; y: number; x: number; controlsX: number }>>([]);
   const [orderLineLabels, setOrderLineLabels] = useState<
-    Array<{ order: TradeOrder; field: DraggableOrderField; y: number; price: number; x?: number }>
+    Array<{ id: string; field: DraggableOrderField; label: string; y: number; price: number; x?: number; locked?: boolean }>
   >([]);
 
   const [allCandles, setAllCandles] = useState<Candle[]>(defaultCandles);
   const [visibleCount, setVisibleCount] = useState(4);
+  const visibleCountRef = useRef(visibleCount);
+  const allCandlesLengthRef = useRef(allCandles.length);
   const [isPlaying, setIsPlaying] = useState(false);
+  const [isPrimaryInstance, setIsPrimaryInstance] = useState(true);
   const [speedMs, setSpeedMs] = useState(100);
   const [orders, setOrders] = useState<TradeOrder[]>(() => loadStoredPendingOrders());
+  const [botOverlay, setBotOverlay] = useState<BotOverlay | null>(null);
   const [side, setSide] = useState<Side>("buy");
   const [quantity, setQuantity] = useState(storedLiveOrderPanelOptions.quantity);
   const [quantityInput, setQuantityInput] = useState(storedLiveOrderPanelOptions.quantityInput);
@@ -1565,6 +1837,7 @@ function TradingApp() {
   const [protectionConfirm, setProtectionConfirm] = useState<ProtectionConfirm | null>(null);
   const [exchangeDebugPopup, setExchangeDebugPopup] = useState<ExchangeDebugPopup | null>(null);
   const [orderbookConfirm, setOrderbookConfirm] = useState<OrderbookConfirm | null>(null);
+  const [gridApplyConfirm, setGridApplyConfirm] = useState<GridApplyConfirm | null>(null);
   const [showCsvBuilder, setShowCsvBuilder] = useState(false);
   const [phemexSettings, setPhemexSettings] = useState<PhemexSettings>({
     exchange: storedExchangeOptions.exchange === "binance" ? "binance" : "phemex",
@@ -1583,7 +1856,9 @@ function TradingApp() {
     brokerFeePercent: storedExchangeOptions.brokerFeePercent || "0.07"
   });
   const [botSettings, setBotSettings] = useState<BotSettings>(storedBotOptions);
+  const [appliedBotSettings, setAppliedBotSettings] = useState<BotSettings>(storedBotOptions);
   const [botProcessStatus, setBotProcessStatus] = useState<BotProcessStatus>({ running: false });
+  const gridBotChartOrdersLocked = botSettings.enabled || botProcessStatus.running;
   const [botScripts, setBotScripts] = useState<string[]>([storedBotOptions.script || "long_bot.py"]);
   const [botRuntimeInfo, setBotRuntimeInfo] = useState<{ lastTick?: number; lastAction?: string; lastError?: string; lastPayload?: unknown }>({});
   const [botGridApplyState, setBotGridApplyState] = useState<"idle" | "applied" | "error">("idle");
@@ -1622,6 +1897,19 @@ function TradingApp() {
   const showLiveStatus = isExchangeLive && isLiveRunning;
   const showPhemexConnected = showLiveStatus && futuresBalance !== null;
   const isExchangeBusy = exchangeRequestState === "loading";
+  useEffect(() => {
+    isPrimaryInstanceRef.current = isPrimaryInstance;
+  }, [isPrimaryInstance]);
+
+  useEffect(() => {
+    try {
+      const raw = window.localStorage.getItem(replaySessionStorageKey);
+      if (raw && raw.length > 200_000) window.localStorage.removeItem(replaySessionStorageKey);
+    } catch {
+      // local replay can run without persisted replay metadata
+    }
+  }, []);
+
   const exchangeStatusText =
     exchangeRequestState === "loading"
       ? t.exchangeLoading
@@ -1631,17 +1919,178 @@ function TradingApp() {
           ? t.liveRunning
           : t.liveInactive;
 
-  const visibleCandles = useMemo(() => allCandles.slice(0, visibleCount), [allCandles, visibleCount]);
+  const applySharedStateItem = useCallback((key: SharedStateKey, value: unknown) => {
+    try {
+      window.localStorage.setItem(key, JSON.stringify(value));
+    } catch {
+      return;
+    }
+
+    if (key === drawingsStorageKey) {
+      setDrawings(loadStoredDrawings());
+      return;
+    }
+
+    if (key === pendingOrdersStorageKey) {
+      const nextOrders = loadStoredPendingOrders();
+      ordersRef.current = nextOrders;
+      setOrders(nextOrders);
+      return;
+    }
+
+    if (key === chartThemeStorageKey) {
+      setChartTheme(loadStoredChartTheme());
+      return;
+    }
+
+    if (key === appOptionsStorageKey) {
+      const options = loadStoredAppOptions();
+      setLanguage(options.language);
+      setAutoScalePrice(options.autoScalePrice);
+      setAutoFocusChart(options.autoFocusChart);
+      return;
+    }
+
+    if (key === exchangeOptionsStorageKey) {
+      const options = loadStoredExchangeOptions();
+      const nextSettings = {
+        exchange: options.exchange === "binance" ? "binance" as const : "phemex" as const,
+        apiKey: "",
+        apiSecret: "",
+        testnet: options.testnet ?? true,
+        symbol: options.symbol || "SOLUSDT",
+        pollSeconds: options.pollSeconds || "10",
+        resolution: options.resolution || "300",
+        limit: options.limit || "500",
+        mode: options.mode === "live" ? "live" as const : "replay" as const,
+        liveOrdersEnabled: Boolean(options.liveOrdersEnabled),
+        allowMainnetOrders: Boolean(options.allowMainnetOrders),
+        marginMode: options.marginMode === "isolated" ? "isolated" as const : "cross" as const,
+        leverage: options.leverage || "10",
+        brokerFeePercent: options.brokerFeePercent || "0.07"
+      };
+      setPhemexSettings((current) => ({ ...current, ...nextSettings }));
+      setActivePhemexSettings((current) => ({ ...current, ...nextSettings }));
+      return;
+    }
+
+    if (key === botOptionsStorageKey) {
+      const nextBotSettings = loadStoredBotOptions();
+      botEnabledRef.current = nextBotSettings.enabled;
+      setBotSettings(nextBotSettings);
+      setAppliedBotSettings(nextBotSettings);
+      return;
+    }
+
+    if (key === liveOrderPanelStorageKey) {
+      const options = loadStoredLiveOrderPanelOptions();
+      setQuantity(options.quantity);
+      setQuantityInput(options.quantityInput);
+      setLiveOrderType(options.liveOrderType);
+      setEntry(options.entry);
+      setTakeProfit(options.takeProfit);
+      setStopLoss(options.stopLoss);
+      setLiveCapitalPercent(options.liveCapitalPercent);
+      return;
+    }
+
+    if (key === coinFavoritesStorageKey) {
+      setCoinFavorites(loadStoredCoinFavorites());
+      return;
+    }
+
+    if (key === runtimeStateStorageKey) {
+      const runtime = loadStoredRuntimeState();
+      restoreLiveAfterReloadRef.current = runtime.liveRunning;
+      if (typeof runtime.liveRunning === "boolean") {
+        setIsLiveRunning(runtime.liveRunning);
+      }
+      if (typeof runtime.botTicksActive === "boolean") {
+        botEnabledRef.current = runtime.botTicksActive;
+        setBotSettings((current) => ({ ...current, enabled: runtime.botTicksActive }));
+      }
+      return;
+    }
+
+    if (key === replaySessionStorageKey) {
+      sharedReplayLoadedRef.current = true;
+      const parsed = value && typeof value === "object" ? value as Record<string, unknown> : {};
+      const candles = Array.isArray(parsed.allCandles) ? parsed.allCandles as Candle[] : undefined;
+      const nextVisibleCount = Number(parsed.visibleCount);
+      const nextSpeedMs = Number(parsed.speedMs);
+      const nextIsPlaying = Boolean(parsed.isPlaying);
+
+      if (candles?.length) {
+        setAllCandles(candles);
+        setVisibleCount(Number.isFinite(nextVisibleCount) ? Math.min(Math.max(1, nextVisibleCount), candles.length) : Math.min(60, candles.length));
+      } else if (Number.isFinite(nextVisibleCount)) {
+        setVisibleCount((current) => Math.max(1, Math.min(nextVisibleCount, allCandles.length || current)));
+      }
+      if (Number.isFinite(nextSpeedMs) && nextSpeedMs > 0) {
+        setSpeedMs(nextSpeedMs);
+      }
+      setIsPlaying(nextIsPlaying);
+      return;
+    }
+
+    if (key === chartViewStorageKey) {
+      const parsed = value && typeof value === "object" ? value as Record<string, unknown> : {};
+      const range = parsed.range && typeof parsed.range === "object" ? parsed.range as Record<string, unknown> : undefined;
+      const from = Number(range?.from);
+      const to = Number(range?.to);
+      if (Number.isFinite(from) && Number.isFinite(to) && to > from) {
+        lockedVisibleRangeRef.current = { from: from as Logical, to: to as Logical };
+        chartRangeLockUntilRef.current = Date.now() + 1200;
+        shouldFitContentRef.current = false;
+        chartRef.current?.timeScale().setVisibleLogicalRange({
+          from: from as Logical,
+          to: to as Logical
+        });
+        setChartViewVersion((version) => version + 1);
+      }
+    }
+  }, [allCandles.length, isPrimaryInstance]);
+
+  const visibleWindowStart = Math.max(0, Math.min(visibleCount, allCandles.length) - MAX_CHART_RENDER_CANDLES);
+  const visibleCandles = useMemo(
+    () => allCandles.slice(visibleWindowStart, Math.min(visibleCount, allCandles.length)),
+    [allCandles, visibleCount, visibleWindowStart]
+  );
+  const makeCandleDatasetSignature = useCallback((candles: Candle[]) => {
+    const firstTime = candles[0]?.time ?? "";
+    const lastTime = candles.at(-1)?.time ?? "";
+    return `${candles.length}:${String(firstTime)}:${String(lastTime)}`;
+  }, []);
   const makeReplayWindowRange = useCallback((count: number) => {
     const windowSize = 72;
     const rightPadding = 12;
-    const lastLogical = Math.max(0, count - 1);
-    const from = lastLogical - windowSize + rightPadding;
+    const renderedCount = Math.min(Math.max(1, count), MAX_CHART_RENDER_CANDLES);
+    const lastLogical = Math.max(0, renderedCount - 1);
+    const from = Math.max(0, lastLogical - windowSize + 1);
+    const to = Math.max(windowSize, lastLogical + rightPadding);
     return {
       from: from as Logical,
-      to: (from + windowSize) as Logical
+      to: to as Logical
     };
   }, []);
+  const normalizeReplayChartRange = useCallback((range: unknown, count: number) => {
+    const lastLogical = Math.max(0, count - 1);
+    if (range && typeof range === "object") {
+      const candidate = range as { from?: unknown; to?: unknown };
+      const from = Number(candidate.from);
+      const to = Number(candidate.to);
+      if (
+        Number.isFinite(from) &&
+        Number.isFinite(to) &&
+        to > from &&
+        to >= lastLogical &&
+        from <= lastLogical
+      ) {
+        return { from: from as Logical, to: to as Logical };
+      }
+    }
+    return makeReplayWindowRange(count);
+  }, [makeReplayWindowRange]);
   const applyReplayWindowRange = useCallback((count: number) => {
     const timeScale = chartRef.current?.timeScale();
     if (!timeScale) return;
@@ -1656,6 +2105,49 @@ function TradingApp() {
     () => orders.filter((order) => order.status === "pending" || order.status === "active"),
     [orders]
   );
+  const latestOpenOrder = openOrders[0];
+  const chartOverlayOrders = useMemo(() => {
+    const maxOverlayOrders = 100;
+    if (openOrders.length <= maxOverlayOrders) return openOrders;
+
+    const visiblePrices = visibleCandles.flatMap((candle) => [candle.high, candle.low]);
+    const visibleMin = visiblePrices.length ? Math.min(...visiblePrices) : lastCandle?.close;
+    const visibleMax = visiblePrices.length ? Math.max(...visiblePrices) : lastCandle?.close;
+    const priceRange = visibleMin !== undefined && visibleMax !== undefined ? Math.max(visibleMax - visibleMin, 0.0001) : 0;
+    const padding = Math.max(priceRange * 0.5, Number(lastCandle?.close ?? 0) * 0.015, 0.5);
+    const rangeMin = visibleMin !== undefined ? visibleMin - padding : undefined;
+    const rangeMax = visibleMax !== undefined ? visibleMax + padding : undefined;
+    const referencePrice = lastCandle?.close ?? visibleMax ?? visibleMin ?? 0;
+    const orderPrices = (order: TradeOrder) => [order.entry, order.takeProfit, order.stopLoss]
+      .filter((price): price is number => price !== undefined && Number.isFinite(price));
+    const isInVisiblePriceRange = (order: TradeOrder) => {
+      if (rangeMin === undefined || rangeMax === undefined) return false;
+      return orderPrices(order).some((price) => price >= rangeMin && price <= rangeMax);
+    };
+    const distanceToReference = (order: TradeOrder) =>
+      Math.min(...orderPrices(order).map((price) => Math.abs(price - referencePrice)));
+    const byId = new Map<string, TradeOrder>();
+
+    openOrders
+      .filter(isInVisiblePriceRange)
+      .sort((left, right) => distanceToReference(left) - distanceToReference(right))
+      .slice(0, maxOverlayOrders)
+      .forEach((order) => byId.set(order.id, order));
+
+    if (byId.size < maxOverlayOrders) {
+      openOrders
+        .filter((order) => !byId.has(order.id))
+        .sort((left, right) => {
+          const statusWeight = (order: TradeOrder) => order.status === "active" ? 0 : 1;
+          return statusWeight(left) - statusWeight(right) || distanceToReference(left) - distanceToReference(right);
+        })
+        .slice(0, maxOverlayOrders - byId.size)
+        .forEach((order) => byId.set(order.id, order));
+    }
+
+    return [...byId.values()];
+  }, [lastCandle?.close, openOrders, visibleCandles]);
+  const chartLabelOrders = chartOverlayOrders;
   const closedOrders = useMemo(() => orders.filter((order) => order.status === "closed"), [orders]);
   const canceledOrders = useMemo(() => orders.filter((order) => order.status === "canceled"), [orders]);
   const historyOrders = useMemo(() => [...closedOrders, ...canceledOrders], [canceledOrders, closedOrders]);
@@ -1700,24 +2192,43 @@ function TradingApp() {
       .join(" ");
   }, [pnlCurve]);
   const openRisk = useMemo(() =>
-    openOrders.reduce((sum, order) => order.stopLoss === undefined ? sum : sum + Math.abs(order.entry - order.stopLoss) * order.quantity, 0),
+    openOrders.reduce((sum, order) =>
+      order.status !== "active" || order.stopLoss === undefined
+        ? sum
+        : sum + Math.abs(order.entry - order.stopLoss) * order.quantity,
+      0
+    ),
     [openOrders]
   );
   const openReward = useMemo(() =>
-    openOrders.reduce((sum, order) => order.takeProfit === undefined ? sum : sum + Math.abs(order.takeProfit - order.entry) * order.quantity, 0),
+    openOrders.reduce((sum, order) =>
+      order.status !== "active" || order.takeProfit === undefined
+        ? sum
+        : sum + Math.abs(order.takeProfit - order.entry) * order.quantity,
+      0
+    ),
     [openOrders]
   );
   const liveReferencePrice = liveLastPrice ?? lastCandle?.close;
   const liveOrderPrice = liveOrderType === "market" ? liveReferencePrice : entry ? Number(entry) : liveReferencePrice;
-  const effectiveBotOrderType = botSettings.mode === "live" ? liveOrderType : botSettings.orderType;
   const isGridBotScript = botSettings.script.toLowerCase().includes("grid_bot");
   const isPhemexGridBotScript = botSettings.script.toLowerCase() === "spot_grid_bot.py";
+  const appliedGridSettings = appliedBotSettings;
+  const effectiveBotOrderType = isGridBotScript
+    ? appliedGridSettings.gridOrderType
+    : botSettings.mode === "live"
+      ? liveOrderType
+      : botSettings.orderType;
+  const gridBotMarketType = appliedGridSettings.gridMarketType === "future" ? "future" : "spot";
+  const gridBotStopLossRequired = gridBotMarketType === "future" && appliedGridSettings.gridStopLossEnabled;
+  const draftGridBotMarketType = botSettings.gridMarketType === "future" ? "future" : "spot";
+  const draftGridBotStopLossRequired = draftGridBotMarketType === "future" && botSettings.gridStopLossEnabled;
   const gridTriggerLines = useMemo<GridTriggerLine[]>(() => {
     if (!isGridBotScript) return [];
-    const fromPrice = numberFrom(botSettings.gridPriceFrom);
-    const toPrice = numberFrom(botSettings.gridPriceTo);
-    const rawStepPercent = numberFrom(botSettings.gridStepPercent);
-    const gridCount = Math.max(1, Math.floor(numberFrom(botSettings.gridCount) ?? 0));
+    const fromPrice = numberFrom(appliedGridSettings.gridPriceFrom);
+    const toPrice = numberFrom(appliedGridSettings.gridPriceTo);
+    const rawStepPercent = numberFrom(appliedGridSettings.gridStepPercent);
+    const gridCount = Math.max(1, Math.floor(numberFrom(appliedGridSettings.gridCount) ?? 0));
     const referencePrice = liveReferencePrice ?? fromPrice ?? toPrice;
     const minPrice = fromPrice !== undefined && toPrice !== undefined ? Math.min(fromPrice, toPrice) : undefined;
     const maxPrice = fromPrice !== undefined && toPrice !== undefined ? Math.max(fromPrice, toPrice) : undefined;
@@ -1743,16 +2254,19 @@ function TradingApp() {
     }
 
     const step = Math.max(minPrice * (stepPercent / 100), 0.000001);
+    const neutralReferencePrice = (minPrice + maxPrice) / 2;
     const maxLines = isPhemexGridBotScript ? Math.min(gridCount, 1000) : 120;
     const lines: GridTriggerLine[] = [];
     for (let price = minPrice, index = 0; price <= maxPrice && index < maxLines; price += step, index += 1) {
       const normalizedPrice = Number(price.toFixed(6));
       const side: Side =
-        botSettings.gridDirection === "long"
+        isPhemexGridBotScript && appliedGridSettings.gridMarketType === "future"
           ? "buy"
-          : botSettings.gridDirection === "short"
+          : appliedGridSettings.gridDirection === "long"
+          ? "buy"
+          : appliedGridSettings.gridDirection === "short"
             ? "sell"
-            : normalizedPrice < referencePrice
+            : normalizedPrice < neutralReferencePrice
               ? "buy"
               : "sell";
       lines.push({
@@ -1764,10 +2278,21 @@ function TradingApp() {
       });
     }
     return lines.filter((line) => line.price > 0);
-  }, [botSettings.gridCount, botSettings.gridDirection, botSettings.gridPriceFrom, botSettings.gridPriceTo, botSettings.gridStepPercent, isGridBotScript, isPhemexGridBotScript, liveReferencePrice]);
+  }, [
+    appliedGridSettings.gridCount,
+    appliedGridSettings.gridPriceFrom,
+    appliedGridSettings.gridPriceTo,
+    appliedGridSettings.gridStepPercent,
+    appliedGridSettings.gridDirection,
+    appliedGridSettings.gridMarketType,
+    isGridBotScript,
+    isPhemexGridBotScript,
+    liveReferencePrice
+  ]);
   const visibleGridTriggerLines = useMemo(() => {
-    if (!botSettings.gridEnabled || !gridTriggerLines.length) return [];
-    const maxVisualLines = 120;
+    if (!appliedGridSettings.gridEnabled || !gridTriggerLines.length) return [];
+    if (isPlaying) return [];
+    const maxVisualLines = 80;
     if (gridTriggerLines.length <= maxVisualLines) return gridTriggerLines;
 
     const step = Math.ceil(gridTriggerLines.length / maxVisualLines);
@@ -1783,7 +2308,7 @@ function TradingApp() {
     return [...byId.values()]
       .sort((left, right) => left.price - right.price)
       .slice(0, maxVisualLines);
-  }, [botSettings.gridEnabled, gridTriggerLines, liveReferencePrice]);
+  }, [appliedGridSettings.gridEnabled, gridTriggerLines, isPlaying, liveReferencePrice]);
   const getGridProtectionForOrder = useCallback((side: Side, entryPrice: number, gridIndex?: unknown) => {
     if (!isGridBotScript || !Number.isFinite(entryPrice) || entryPrice <= 0 || gridTriggerLines.length < 2) {
       return { takeProfit: undefined as number | undefined, stopLoss: undefined as number | undefined };
@@ -1805,8 +2330,8 @@ function TradingApp() {
 
     const lowerLine = [...sortedLines].reverse().find((line) => line.price < triggerLine.price);
     const upperLine = sortedLines.find((line) => line.price > triggerLine.price);
-    const tpPercent = (numberFrom(botSettings.gridTakeProfitPercent) ?? 1) / 100;
-    const slPercent = (numberFrom(botSettings.gridStopLossPercent) ?? 0.98) / 100;
+    const tpPercent = (numberFrom(appliedGridSettings.gridTakeProfitPercent) ?? 1) / 100;
+    const slPercent = (numberFrom(appliedGridSettings.gridStopLossPercent) ?? 0.98) / 100;
     const fallbackTakeProfit = side === "buy"
       ? entryPrice * (1 + tpPercent)
       : entryPrice * (1 - tpPercent);
@@ -1815,7 +2340,7 @@ function TradingApp() {
       : entryPrice * (1 + slPercent);
 
     const takeProfit = side === "buy" ? upperLine?.price ?? fallbackTakeProfit : lowerLine?.price ?? fallbackTakeProfit;
-    const stopLoss = GRID_BOT_STOP_LOSS_ENABLED
+    const stopLoss = gridBotStopLossRequired
       ? side === "buy"
         ? lowerLine?.price ?? fallbackStopLoss
         : upperLine?.price ?? fallbackStopLoss
@@ -1825,11 +2350,382 @@ function TradingApp() {
       stopLoss: stopLoss !== undefined ? Number(stopLoss.toFixed(6)) : undefined
     };
   }, [
-    botSettings.gridStopLossPercent,
-    botSettings.gridTakeProfitPercent,
+    appliedGridSettings.gridStopLossPercent,
+    appliedGridSettings.gridTakeProfitPercent,
     gridTriggerLines,
+    gridBotStopLossRequired,
     isGridBotScript
   ]);
+  const getGridOrderQuantity = useCallback((entryPrice: number) => {
+    if (!isGridBotScript || !Number.isFinite(entryPrice) || entryPrice <= 0) return undefined;
+    const amountValue = numberFrom(appliedGridSettings.gridAmountValue);
+    if (typeof amountValue !== "number" || !Number.isFinite(amountValue) || amountValue <= 0) return undefined;
+    const amountPerGrid = appliedGridSettings.gridAmountMode === "asset"
+      ? amountValue
+      : amountValue / entryPrice;
+    if (!Number.isFinite(amountPerGrid) || amountPerGrid <= 0) return undefined;
+    return amountPerGrid;
+  }, [appliedGridSettings.gridAmountMode, appliedGridSettings.gridAmountValue, isGridBotScript]);
+  const deriveGridLevelTolerance = useCallback((entryPrice: number, gridIndex?: number) => {
+    const sortedLines = [...gridTriggerLines]
+      .filter((line) => Number.isFinite(line.price) && line.price > 0)
+      .sort((left, right) => left.price - right.price);
+    if (sortedLines.length < 2) {
+      return Math.max(entryPrice * 0.0005, 0.001, 0.000001);
+    }
+
+    const targetIndex = sortedLines.findIndex((line) => Number(line.index) === Number(gridIndex));
+    const normalizedEntry = Number(entryPrice);
+    const targetLine =
+      targetIndex >= 0
+        ? sortedLines[targetIndex]
+        : sortedLines.reduce((closest, line) =>
+          Math.abs(line.price - normalizedEntry) < Math.abs(closest.price - normalizedEntry) ? line : closest,
+          sortedLines[0]
+        );
+    const targetPos = sortedLines.findIndex((line) => line.id === targetLine.id);
+    const prevLine = sortedLines[targetPos - 1];
+    const nextLine = sortedLines[targetPos + 1];
+    const downDistance = prevLine ? Math.abs(targetLine.price - prevLine.price) : Infinity;
+    const upDistance = nextLine ? Math.abs(nextLine.price - targetLine.price) : Infinity;
+    const span = Math.min(downDistance, upDistance);
+    if (!Number.isFinite(span) || span <= 0) {
+      const fallbackDistance = sortedLines.length > 1
+        ? Math.min(...sortedLines.slice(1).map((line, index) => Math.abs(line.price - sortedLines[index].price))
+          .filter((distance) => distance > 0))
+        : 0;
+      if (!Number.isFinite(fallbackDistance) || fallbackDistance <= 0) {
+        return Math.max(0.001, normalizedEntry * 0.0005, 0.000001);
+      }
+      return Math.max(fallbackDistance / 2, 0.001, normalizedEntry * 0.0005, 0.000001);
+    }
+    return Math.max(span / 2, 0.001, normalizedEntry * 0.0005, 0.000001);
+  }, [gridTriggerLines]);
+
+  const resolveGridOrderIndex = useCallback((order: TradeOrder, fallbackIndex?: unknown) => {
+    const explicitIndex = numberFrom(order.gridIndex);
+    if (typeof explicitIndex === "number" && Number.isFinite(explicitIndex)) return Math.trunc(explicitIndex);
+    const parsedClOrdMeta = parseGridClientOrderId(order.phemexClOrdId);
+    if (parsedClOrdMeta?.gridIndex !== undefined && Number.isFinite(parsedClOrdMeta.gridIndex)) return Math.trunc(parsedClOrdMeta.gridIndex);
+    const parsedOrderMeta = parseGridClientOrderId(order.id);
+    if (parsedOrderMeta?.gridIndex !== undefined && Number.isFinite(parsedOrderMeta.gridIndex)) return Math.trunc(parsedOrderMeta.gridIndex);
+    const fallbackGridIndex = numberFrom(fallbackIndex);
+    if (typeof fallbackGridIndex === "number" && Number.isFinite(fallbackGridIndex)) return Math.trunc(fallbackGridIndex);
+
+    const normalizedEntry = Number(order.entry);
+    if (!Number.isFinite(normalizedEntry)) return undefined;
+    const nearestLine = [...gridTriggerLines]
+      .filter((line) => line.side === order.side && Number.isFinite(line.price) && line.price > 0)
+      .sort((left, right) => Math.abs(left.price - normalizedEntry) - Math.abs(right.price - normalizedEntry))[0];
+    return nearestLine?.index;
+  }, [gridTriggerLines]);
+
+  const makeGridLevelKey = (side: Side, gridIndex: number) => `${side}|${Math.trunc(gridIndex)}`;
+
+  const resolveGridLineForQuery = useCallback((side: Side, entryPrice: number, gridIndex?: unknown) => {
+    const normalizedEntry = Number(entryPrice);
+    if (!Number.isFinite(normalizedEntry) || normalizedEntry <= 0) return undefined;
+
+    const linesBySide = [...gridTriggerLines]
+      .filter((line) => line.side === side && Number.isFinite(line.price) && line.price > 0)
+      .sort((left, right) => left.index - right.index);
+    if (!linesBySide.length) return undefined;
+
+    const normalizedGridIndex = numberFrom(gridIndex);
+    if (normalizedGridIndex !== undefined && Number.isFinite(normalizedGridIndex)) {
+      const targetIndex = Math.trunc(normalizedGridIndex);
+      const directMatch = linesBySide.find((line) => Math.trunc(line.index) === targetIndex);
+      if (directMatch) return directMatch;
+    }
+
+    const exactDistance = linesBySide.reduce(
+      (closest, line) =>
+        Math.abs(line.price - normalizedEntry) < Math.abs(closest.price - normalizedEntry) ? line : closest,
+      linesBySide[0] as GridTriggerLine
+    );
+    const tolerance = deriveGridLevelTolerance(exactDistance.price, exactDistance.index);
+    const closeMatch = linesBySide.find((line) => Math.abs(line.price - normalizedEntry) <= tolerance);
+    return closeMatch ?? exactDistance;
+  }, [deriveGridLevelTolerance, gridTriggerLines]);
+
+  const resolveGridLevelKeyForQuery = useCallback((side: Side, entryPrice: number, gridIndex?: unknown) => {
+    const normalizedGridIndex = numberFrom(gridIndex);
+    if (typeof normalizedGridIndex === "number" && Number.isFinite(normalizedGridIndex)) {
+      return makeGridLevelKey(side, Math.trunc(normalizedGridIndex));
+    }
+    const exactLine = resolveGridLineForQuery(side, entryPrice, gridIndex);
+    if (!exactLine) return undefined;
+    return makeGridLevelKey(side, Math.trunc(exactLine.index));
+  }, [resolveGridLineForQuery]);
+
+  const resolveGridLineForOrder = useCallback((order: TradeOrder): GridTriggerLine | undefined => {
+    const orderLineIndex = resolveGridOrderIndex(order);
+    return resolveGridLineForQuery(order.side, order.entry, orderLineIndex);
+  }, [resolveGridLineForQuery, resolveGridOrderIndex]);
+
+  const resolveGridLevelKeyForOrder = useCallback((order: TradeOrder): string | undefined => {
+    const resolvedGridIndex = resolveGridOrderIndex(order);
+    if (Number.isFinite(resolvedGridIndex)) {
+      return makeGridLevelKey(order.side, Math.trunc(Number(resolvedGridIndex)));
+    }
+    const orderLine = resolveGridLineForOrder(order);
+    return orderLine ? makeGridLevelKey(order.side, Math.trunc(orderLine.index)) : undefined;
+  }, [resolveGridOrderIndex, resolveGridLineForOrder]);
+
+  const resolveGridLineFromExchangeOrder = useCallback((order: TradeOrder, fallbackGridIndex?: unknown) => {
+    if (!isGridBotScript) return undefined;
+    const normalizedEntry = Number(order.entry);
+    if (!Number.isFinite(normalizedEntry) || normalizedEntry <= 0) return undefined;
+    if (order.side !== "buy" && order.side !== "sell") return undefined;
+    const normalizedIndex = numberFrom(fallbackGridIndex ?? order.gridIndex);
+    const matchedLine = resolveGridLineForQuery(order.side, order.entry, normalizedIndex);
+    if (!matchedLine) return undefined;
+    const tolerance = deriveGridLevelTolerance(matchedLine.price, matchedLine.index);
+    if (Math.abs(matchedLine.price - normalizedEntry) > tolerance) return undefined;
+    return matchedLine;
+  }, [deriveGridLevelTolerance, isGridBotScript, resolveGridLineForQuery]);
+
+  const enrichGridMetaFromExchangeOrder = useCallback((order: TradeOrder): TradeOrder => {
+    if (!isGridBotScript) return order;
+    if (order.gridBot || order.spotGrid || order.mechanic || order.gridMarketType || Number.isFinite(numberFrom(order.gridIndex) ?? NaN)) {
+      return order;
+    }
+    const matchedLine = resolveGridLineFromExchangeOrder(order);
+    if (!matchedLine) return order;
+    const gridIndex = Math.trunc(
+      Number.isFinite(numberFrom(order.gridIndex))
+        ? Number(order.gridIndex)
+        : Number(matchedLine.index)
+    );
+    return {
+      ...order,
+      gridBot: true,
+      spotGrid: gridBotMarketType === "spot",
+      gridMarketType: gridBotMarketType,
+      mechanic: gridBotMarketType === "spot" ? "spot_grid" : "grid_bot",
+      gridIndex
+    };
+  }, [gridBotMarketType, isGridBotScript, resolveGridLineFromExchangeOrder]);
+
+  const getOpenGridLevelKeys = useCallback((liveOnly = false) => {
+    const keys = new Set<string>();
+    for (const order of ordersRef.current) {
+      if (!isOpenTradeOrder(order) || !isGridTradeOrder(order)) continue;
+      if (liveOnly && !hasExchangeOrderReference(order)) continue;
+      const key = resolveGridLevelKeyForOrder(order);
+      if (key) keys.add(key);
+    }
+    return keys;
+  }, [resolveGridLevelKeyForOrder]);
+
+  const isGridLevelOccupied = useCallback((side: Side, entryPrice: number, gridIndex?: unknown, liveOnly = false) => {
+    const targetKey = resolveGridLevelKeyForQuery(side, entryPrice, gridIndex);
+    if (!targetKey) return false;
+    return getOpenGridLevelKeys(liveOnly).has(targetKey);
+  }, [getOpenGridLevelKeys, resolveGridLevelKeyForQuery]);
+
+  const hasOpenGridLiveOrder = useCallback((
+    side: Side,
+    entryPrice: number,
+    gridIndex?: unknown,
+    clientOrderId?: string,
+    liveOnly = false,
+    allowAnySide = false
+  ) => {
+    const sameClientId =
+      clientOrderId &&
+      ordersRef.current.some((order) =>
+        isOpenTradeOrder(order) &&
+        (order.id === clientOrderId || order.phemexClOrdId === clientOrderId || order.phemexOrderId === clientOrderId)
+      );
+    if (sameClientId) return true;
+
+    const openKeys = getOpenGridLevelKeys(liveOnly);
+    const targetKey = resolveGridLevelKeyForQuery(side, entryPrice, gridIndex);
+    if (targetKey && openKeys.has(targetKey)) return true;
+
+    const fallbackGridIndex = numberFrom(gridIndex);
+    const fallbackIndex = Number.isFinite(fallbackGridIndex) ? Math.trunc(Number(fallbackGridIndex)) : undefined;
+    if (allowAnySide && fallbackIndex !== undefined) {
+      return openKeys.has(`buy|${fallbackIndex}`) || openKeys.has(`sell|${fallbackIndex}`);
+    }
+
+    return false;
+  }, [getOpenGridLevelKeys, resolveGridLevelKeyForQuery]);
+  const isGridDirectionAllowed = useCallback((side: Side) => {
+    if (isPhemexGridBotScript && gridBotMarketType === "future") return side === "buy";
+    if (appliedGridSettings.gridDirection === "long") return side === "buy";
+    if (appliedGridSettings.gridDirection === "short") return side === "sell";
+    return true;
+  }, [appliedGridSettings.gridDirection, gridBotMarketType, isPhemexGridBotScript]);
+const makeGridLevelLockKey = (symbol: string, side: Side, entryPrice: number, gridIndex?: unknown) => {
+  const normalizedGridIndex = numberFrom(gridIndex);
+  const normalizedEntry = Number.isFinite(Number(entryPrice)) ? Number(entryPrice) : 0;
+  const indexPart = Number.isFinite(normalizedGridIndex ?? NaN)
+    ? `idx-${Math.trunc(normalizedGridIndex ?? 0)}`
+    : `entry-${normalizedEntry.toFixed(6)}`;
+  return `${symbol.toUpperCase()}|${side}|${indexPart}`;
+};
+  const isGridLevelSuppressed = (symbol: string, side: Side, entryPrice: number, gridIndex?: unknown) => {
+    const key = makeGridLevelLockKey(symbol, side, entryPrice, gridIndex);
+    const lock = gridOrderLevelSuppressionRef.current.get(key);
+    if (!lock) return false;
+    if (lock.until <= Date.now()) {
+      gridOrderLevelSuppressionRef.current.delete(key);
+      return false;
+    }
+    return true;
+  };
+  const suppressGridLevel = (
+    symbol: string,
+    side: Side,
+    entryPrice: number,
+    gridIndex: unknown,
+    ttlMs: number,
+    reason: GridOrderLevelLockReason
+  ) => {
+    const normalizedGridIndex = numberFrom(gridIndex);
+    if (!Number.isFinite(Number(entryPrice)) || !Number.isFinite(ttlMs) || ttlMs <= 0) return;
+    const key = makeGridLevelLockKey(symbol, side, entryPrice, normalizedGridIndex);
+    gridOrderLevelSuppressionRef.current.set(key, {
+      until: Date.now() + ttlMs,
+      symbol: symbol.toUpperCase(),
+      side,
+      entry: Number(entryPrice),
+      gridIndex: normalizedGridIndex,
+      reason
+    });
+  };
+  const clearGridLevelSuppression = (symbol: string, side: Side, entryPrice: number, gridIndex?: unknown) => {
+    const key = makeGridLevelLockKey(symbol, side, entryPrice, gridIndex);
+    gridOrderLevelSuppressionRef.current.delete(key);
+  };
+  const clearGridLevelSuppressionForOrder = (order: TradeOrder) => {
+    if (!isGridTradeOrder(order)) return;
+    const resolvedSymbol = activePhemexSettings.symbol.toUpperCase();
+    const normalizedEntry = Number(order.entry);
+    if (!Number.isFinite(normalizedEntry)) return;
+    const directIndex = numberFrom(order.gridIndex);
+    const parsedIndex = parseGridClientOrderId(order.phemexClOrdId)?.gridIndex;
+    const idParsedIndex = parseGridClientOrderId(order.id)?.gridIndex;
+    const fallbackIndex = resolveGridOrderIndex(order);
+    const indexCandidates = [
+      directIndex,
+      parsedIndex,
+      idParsedIndex,
+      fallbackIndex
+    ].map((value) => numberFrom(value))
+      .filter((value) => Number.isFinite(value))
+      .map((value) => Math.trunc(Number(value)));
+
+    const seen = new Set<number>();
+    for (const indexValue of indexCandidates) {
+      if (seen.has(indexValue)) continue;
+      seen.add(indexValue);
+      clearGridLevelSuppression(resolvedSymbol, order.side, normalizedEntry, indexValue);
+    }
+
+    // Also clear stale level locks that may have been stored with slightly different metadata.
+    for (const [lockKey, lock] of gridOrderLevelSuppressionRef.current.entries()) {
+      if (lock.symbol !== resolvedSymbol) continue;
+      if (lock.side !== order.side) continue;
+      if (Math.abs(lock.entry - normalizedEntry) > 0.01) continue;
+      const lockIndex = numberFrom(lock.gridIndex);
+      if (typeof lockIndex !== "number" || !Number.isFinite(lockIndex)) continue;
+      const normalizedLockIndex = Math.trunc(lockIndex);
+      if (seen.has(normalizedLockIndex)) {
+        gridOrderLevelSuppressionRef.current.delete(lockKey);
+      }
+    }
+  };
+  const cleanupGridLevelLocks = useCallback(() => {
+    const now = Date.now();
+    for (const [key, lock] of gridOrderLevelSuppressionRef.current.entries()) {
+      if (!Number.isFinite(lock.until) || lock.until <= now) {
+        gridOrderLevelSuppressionRef.current.delete(key);
+        continue;
+      }
+      // Keep in-flight and duplicate locks until their time window is over.
+      // This avoids parallel submits at the same grid level while exchange confirm
+      // and local sync are still catching up.
+      if (lock.reason === "duplicate" || lock.reason === "inflight") {
+        continue;
+      }
+      gridOrderLevelSuppressionRef.current.delete(key);
+    }
+  }, []);
+
+  const isGridLevelBlocked = useCallback(
+    (symbol: string, side: Side, entryPrice: number, gridIndex?: unknown, liveOnly = false) => {
+      if (!isGridLevelSuppressed(symbol, side, entryPrice, gridIndex)) return false;
+      return true;
+    },
+    [isGridLevelSuppressed]
+  );
+  const isGridOrderSuppressed = (clientOrderId?: string) => {
+    if (!clientOrderId) return false;
+    const until = gridOrderSuppressionUntilRef.current.get(clientOrderId);
+    if (until === undefined) return false;
+    if (!Number.isFinite(until)) return false;
+    if (Date.now() > until) {
+      gridOrderSuppressionUntilRef.current.delete(clientOrderId);
+      return false;
+    }
+    return true;
+  };
+  const suppressGridOrder = (clientOrderId: string | undefined, ttlMs: number) => {
+    if (!clientOrderId) return;
+    gridOrderSuppressionUntilRef.current.set(clientOrderId, Date.now() + ttlMs);
+  };
+  const clearGridOrderSuppression = (clientOrderId?: string) => {
+    if (!clientOrderId) return;
+    gridOrderSuppressionUntilRef.current.delete(clientOrderId);
+  };
+  const clearGridSuppressionForOrder = (order: TradeOrder) => {
+    if (!isGridTradeOrder(order)) return;
+    const orderClientOrderId = makeGridClientOrderId(activePhemexSettings.symbol, order.side, order.entry, order.gridIndex);
+    clearGridOrderSuppression(orderClientOrderId);
+    clearGridLevelSuppressionForOrder(order);
+  };
+  const isGridDuplicateError = (reason?: string) => {
+    const text = String(reason || "").toLowerCase();
+    return (
+      text.includes("duplicate") ||
+      text.includes("te_cl_ord_id_duplicate") ||
+      text.includes("already exists") ||
+      text.includes("already in use") ||
+      text.includes("order id already") ||
+      text.includes("clordid duplicate") ||
+      text.includes("order already")
+    );
+  };
+  const cleanupGridOrderSuppression = () => {
+    const now = Date.now();
+    for (const [key, value] of gridOrderSuppressionUntilRef.current.entries()) {
+      if (!Number.isFinite(value) || value <= now) {
+        gridOrderSuppressionUntilRef.current.delete(key);
+      }
+    }
+  };
+  const withAppliedGridSettings = useCallback((settings: BotSettings, gridSettings = appliedBotSettings): BotSettings => ({
+    ...settings,
+    gridEnabled: gridSettings.gridEnabled,
+    gridPriceFrom: gridSettings.gridPriceFrom,
+    gridPriceTo: gridSettings.gridPriceTo,
+    gridStepPercent: gridSettings.gridStepPercent,
+    gridTakeProfitPercent: gridSettings.gridTakeProfitPercent,
+    gridStopLossPercent: gridSettings.gridStopLossPercent,
+    gridDirection: gridSettings.gridDirection,
+    gridCount: gridSettings.gridCount,
+    gridInvestment: gridSettings.gridInvestment,
+    gridLeverage: gridSettings.gridLeverage,
+    gridMarketType: gridSettings.gridMarketType,
+    gridMarginMode: gridSettings.gridMarginMode,
+    gridOrderType: gridSettings.gridOrderType,
+    gridStopLossEnabled: gridSettings.gridStopLossEnabled,
+    gridAmountMode: gridSettings.gridAmountMode,
+    gridAmountValue: gridSettings.gridAmountValue
+  }), [appliedBotSettings]);
   const phemexGridPreview = useMemo(() => {
     const fromPrice = numberFrom(botSettings.gridPriceFrom);
     const toPrice = numberFrom(botSettings.gridPriceTo);
@@ -1847,33 +2743,71 @@ function TradingApp() {
       return {
         profitPerGrid: "--",
         amountPerGrid: "--",
+        totalAmount: "--",
+        positionValue: "--",
+        requiredCapital: "--",
         liquidation: "--"
       };
     }
     const minPrice = Math.min(fromPrice, toPrice);
     const maxPrice = Math.max(fromPrice, toPrice);
-    const gridStepPercent = ((maxPrice - minPrice) / Math.max(gridCount - 1, 1) / minPrice) * 100;
+    const gridStepPrice = (maxPrice - minPrice) / Math.max(gridCount - 1, 1);
+    const gridStepPercent = (gridStepPrice / minPrice) * 100;
     const averagePrice = (minPrice + maxPrice) / 2;
     const amountPerGrid = botSettings.gridAmountMode === "asset" ? amountValue : amountValue / averagePrice;
+    const leverageValue = Math.max(1, numberFrom(botSettings.gridLeverage) ?? 1);
+    const totalAmount = amountPerGrid * gridCount;
+    const positionValue = totalAmount * averagePrice;
+    const requiredCapital = draftGridBotMarketType === "future" ? positionValue / leverageValue : positionValue;
+    const baseSymbol = activePhemexSettings.symbol.replace(/USDT$/i, "") || "Coin";
+    const protectionLabel =
+      draftGridBotMarketType === "spot"
+        ? "Spot"
+        : draftGridBotStopLossRequired
+          ? `Future SL ${(numberFrom(botSettings.gridStopLossPercent) ?? 0.98).toFixed(2)}% | ${leverageValue}x`
+          : `Future ohne SL | ${leverageValue}x`;
     return {
-      profitPerGrid: `${gridStepPercent.toFixed(2)}%`,
-      amountPerGrid: `${amountPerGrid.toFixed(4)} ${activePhemexSettings.symbol.replace(/USDT$/i, "") || "Coin"}`,
-      liquidation: "Spot only"
+      profitPerGrid: `${gridStepPercent.toFixed(2)}% / ${gridStepPrice.toFixed(2)} USDT`,
+      amountPerGrid: `${amountPerGrid.toFixed(4)} ${baseSymbol}`,
+      totalAmount: `${totalAmount.toFixed(4)} ${baseSymbol}`,
+      positionValue: `${positionValue.toFixed(2)} USDT`,
+      requiredCapital: `${requiredCapital.toFixed(2)} USDT`,
+      liquidation: protectionLabel
     };
-  }, [activePhemexSettings.symbol, botSettings.gridAmountMode, botSettings.gridAmountValue, botSettings.gridCount, botSettings.gridPriceFrom, botSettings.gridPriceTo]);
+  }, [activePhemexSettings.symbol, botSettings.gridAmountMode, botSettings.gridAmountValue, botSettings.gridCount, botSettings.gridLeverage, botSettings.gridPriceFrom, botSettings.gridPriceTo, botSettings.gridStopLossPercent, draftGridBotMarketType, draftGridBotStopLossRequired]);
+  const gridDraftDirty = useMemo(() => {
+    const keys: Array<keyof BotSettings> = [
+      "gridEnabled",
+      "gridPriceFrom",
+      "gridPriceTo",
+      "gridStepPercent",
+      "gridTakeProfitPercent",
+      "gridStopLossPercent",
+      "gridDirection",
+      "gridCount",
+      "gridInvestment",
+      "gridLeverage",
+      "gridMarketType",
+      "gridMarginMode",
+      "gridOrderType",
+      "gridStopLossEnabled",
+      "gridAmountMode",
+      "gridAmountValue"
+    ];
+    return keys.some((key) => botSettings[key] !== appliedBotSettings[key]);
+  }, [appliedBotSettings, botSettings]);
   const botNoTradeReason = useMemo(() => {
     if (!botProcessStatus.running) return t.botWaitProcess;
     if (!botSettings.enabled) return t.botWaitTicks;
     if (botSettings.mode === "live" && !isLiveRunning) return t.botWaitLive;
-    if (botSettings.mode === "live" && !activePhemexSettings.liveOrdersEnabled) return t.botWaitLiveOrders;
     if (botSettings.mode === "live" && !isPhemexGridBotScript && (!Number.isFinite(quantity) || quantity <= 0)) return t.botWaitQuantity;
-    if (openOrders.length > 0) return t.botWaitOpenOrder;
+    if (!isGridBotScript && openOrders.length > 0) return t.botWaitOpenOrder;
     return t.botTradeReady;
   }, [
-    activePhemexSettings.liveOrdersEnabled,
     botProcessStatus.running,
     botSettings.enabled,
     botSettings.mode,
+    isGridBotScript,
     isPhemexGridBotScript,
     isLiveRunning,
     openOrders.length,
@@ -2154,22 +3088,318 @@ function TradingApp() {
       window.cancelAnimationFrame(drawingDragFrameRef.current);
       window.cancelAnimationFrame(orderDragFrameRef.current);
       Object.values(storageWriteTimersRef.current).forEach((timer) => window.clearTimeout(timer));
+      Object.values(sharedStateWriteTimersRef.current).forEach((timer) => window.clearTimeout(timer));
+      window.clearTimeout(replayStateWriteTimerRef.current);
     };
   }, []);
+
+  const scheduleSharedStateWrite = useCallback((key: SharedStateKey, value: unknown) => {
+    if (!sharedStateReadyRef.current || applyingSharedStateRef.current) return;
+    window.clearTimeout(sharedStateWriteTimersRef.current[key]);
+    sharedStateWriteTimersRef.current[key] = window.setTimeout(() => {
+      const updatedAt = Date.now();
+      sharedStateKnownAtRef.current[key] = updatedAt;
+      void fetch("/api/shared-state", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          items: {
+            [key]: {
+              value,
+              updatedAt,
+              clientId: sharedStateClientIdRef.current
+            }
+          }
+        })
+      }).catch(() => undefined);
+      delete sharedStateWriteTimersRef.current[key];
+    }, 220);
+  }, []);
+
+  const writeSharedStateNow = useCallback((key: SharedStateKey, value: unknown) => {
+    const updatedAt = Date.now();
+    sharedStateKnownAtRef.current[key] = updatedAt;
+    try {
+      window.localStorage.setItem(key, JSON.stringify(value));
+    } catch {
+      return;
+    }
+    void fetch("/api/shared-state", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        items: {
+          [key]: {
+            value,
+            updatedAt,
+            clientId: sharedStateClientIdRef.current
+          }
+        }
+      })
+    }).catch(() => undefined);
+  }, []);
+
+  const applyReplayServerState = useCallback((state: ReplayServerState) => {
+    const updatedAt = Number(state.updatedAt || 0);
+    if (!updatedAt || updatedAt <= replayStateUpdatedAtRef.current) return;
+    replayStateUpdatedAtRef.current = updatedAt;
+    applyingReplayStateRef.current = true;
+    sharedReplayLoadedRef.current = true;
+
+    try {
+      const candles = Array.isArray(state.allCandles) ? state.allCandles : undefined;
+      const nextVisibleCount = Number(state.visibleCount);
+      const nextSpeedMs = Number(state.speedMs);
+      const nextOrders = Array.isArray(state.orders) ? state.orders : undefined;
+      const incomingDatasetSignature = candles?.length ? makeCandleDatasetSignature(candles) : "";
+      const resolvedVisibleCount = candles?.length
+        ? (Number.isFinite(nextVisibleCount) ? Math.min(Math.max(1, nextVisibleCount), candles.length) : Math.min(60, candles.length))
+        : (Number.isFinite(nextVisibleCount) ? Math.max(1, Math.min(nextVisibleCount, allCandles.length || visibleCount)) : visibleCount);
+
+      if (candles?.length) {
+        if (incomingDatasetSignature !== replayDatasetSignatureRef.current) {
+          replayDatasetSignatureRef.current = incomingDatasetSignature;
+          setAllCandles(candles);
+        }
+        setVisibleCount(resolvedVisibleCount);
+      } else if (Number.isFinite(nextVisibleCount)) {
+        setVisibleCount(resolvedVisibleCount);
+      }
+
+      if (Number.isFinite(nextSpeedMs) && nextSpeedMs > 0) {
+        setSpeedMs(nextSpeedMs);
+      }
+
+      if (nextOrders) {
+        ordersRef.current = nextOrders;
+        setOrders(nextOrders);
+      }
+
+      setIsPlaying(Boolean(state.isPlaying));
+
+      if (state.messageKind === "demo" || state.messageKind === "chartCsv" || state.messageKind === "custom") {
+        setMessageKind(state.messageKind);
+      }
+      if (typeof state.message === "string" && state.message) {
+        setMessage(state.message);
+      }
+
+      const range = normalizeReplayChartRange(state.chartRange, resolvedVisibleCount);
+      if (range) {
+        lockedVisibleRangeRef.current = range;
+        chartRangeLockUntilRef.current = Date.now() + 160;
+        shouldFitContentRef.current = false;
+        chartRef.current?.timeScale().setVisibleLogicalRange(range);
+      }
+    } finally {
+      window.setTimeout(() => {
+        applyingReplayStateRef.current = false;
+      }, 80);
+    }
+  }, [allCandles.length, makeCandleDatasetSignature, normalizeReplayChartRange, visibleCount]);
+
+  const writeReplayStateNow = useCallback((override: Partial<ReplayServerState> = {}) => {
+    if (!replayServerSyncEnabled) return;
+    if (applyingReplayStateRef.current) return;
+    if (!isPrimaryInstanceRef.current) return;
+    const range = chartRef.current?.timeScale().getVisibleLogicalRange();
+    const nextVisibleCount = Number(override.visibleCount ?? visibleCount);
+    const chartRange = override.chartRange ?? normalizeReplayChartRange(
+      range ? { from: Number(range.from), to: Number(range.to) } : null,
+      Number.isFinite(nextVisibleCount) ? nextVisibleCount : visibleCount
+    );
+    const overrideCandles = Array.isArray(override.allCandles) ? override.allCandles : undefined;
+    const candlesForSignature = overrideCandles ?? allCandles;
+    const datasetSignature = makeCandleDatasetSignature(candlesForSignature);
+    const shouldSendCandles = candlesForSignature.length > 0 && (Boolean(overrideCandles) || datasetSignature !== replayDatasetSignatureRef.current);
+    const updatedAt = Date.now();
+    replayStateUpdatedAtRef.current = updatedAt;
+    replayDatasetSignatureRef.current = datasetSignature;
+    const state: Partial<ReplayServerState> = {
+      visibleCount,
+      isPlaying,
+      speedMs,
+      orders: ordersRef.current,
+      message,
+      messageKind,
+      ...override,
+      chartRange,
+      updatedAt,
+      clientId: sharedStateClientIdRef.current
+    };
+    if (shouldSendCandles) state.allCandles = candlesForSignature;
+
+    void fetch("/api/replay-state", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(state)
+    }).catch(() => undefined);
+  }, [allCandles, isPlaying, makeCandleDatasetSignature, message, messageKind, normalizeReplayChartRange, speedMs, visibleCount]);
+
+  const scheduleReplayStateWrite = useCallback((override: Partial<ReplayServerState> = {}) => {
+    if (!replayServerSyncEnabled) return;
+    if (!isPrimaryInstanceRef.current) return;
+    if (!replayStateReadyRef.current || applyingReplayStateRef.current) return;
+    window.clearTimeout(replayStateWriteTimerRef.current);
+    replayStateWriteTimerRef.current = window.setTimeout(() => {
+      writeReplayStateNow(override);
+    }, 180);
+  }, [writeReplayStateNow]);
 
   const scheduleStorageWrite = useCallback((key: string, value: unknown) => {
     window.clearTimeout(storageWriteTimersRef.current[key]);
     storageWriteTimersRef.current[key] = window.setTimeout(() => {
-      window.localStorage.setItem(key, JSON.stringify(value));
+      try {
+        window.localStorage.setItem(key, JSON.stringify(value));
+      } catch {
+        if (key === replaySessionStorageKey) {
+          window.localStorage.removeItem(key);
+        }
+      }
+      if ((sharedStateKeys as readonly string[]).includes(key)) {
+        scheduleSharedStateWrite(key as SharedStateKey, value);
+      }
       delete storageWriteTimersRef.current[key];
     }, 180);
-  }, []);
+  }, [scheduleSharedStateWrite]);
+
+  useEffect(() => {
+    let canceled = false;
+
+    const applySharedState = (state: SharedStatePayload) => {
+      applyingSharedStateRef.current = true;
+      try {
+        sharedStateKeys.forEach((key) => {
+          const item = state[key];
+          if (!item) return;
+          const updatedAt = Number(item.updatedAt || 0);
+          if (updatedAt <= (sharedStateKnownAtRef.current[key] || 0)) return;
+          sharedStateKnownAtRef.current[key] = updatedAt;
+          applySharedStateItem(key, item.value);
+        });
+      } finally {
+        window.setTimeout(() => {
+          applyingSharedStateRef.current = false;
+        }, 500);
+      }
+    };
+
+    const load = async () => {
+      try {
+        const response = await fetch("/api/shared-state", { cache: "no-store" });
+        const payload = await response.json();
+        if (canceled) return;
+        const state = (payload?.state || {}) as SharedStatePayload;
+        applySharedState(state);
+        sharedStateReadyRef.current = true;
+
+        sharedStateKeys.forEach((key) => {
+          if (state[key]) return;
+          const raw = window.localStorage.getItem(key);
+          if (!raw) return;
+          try {
+            scheduleSharedStateWrite(key, JSON.parse(raw));
+          } catch {
+            // ignore invalid local storage value
+          }
+        });
+      } catch {
+        sharedStateReadyRef.current = true;
+      }
+    };
+
+    void load();
+
+    const interval = window.setInterval(async () => {
+      if (!sharedStateReadyRef.current || applyingSharedStateRef.current) return;
+      try {
+        const response = await fetch("/api/shared-state", { cache: "no-store" });
+        const payload = await response.json();
+        if (!canceled) applySharedState((payload?.state || {}) as SharedStatePayload);
+      } catch {
+        // localStorage remains the fallback when the shared server state is unavailable
+      }
+    }, 1000);
+
+    return () => {
+      canceled = true;
+      window.clearInterval(interval);
+    };
+  }, [applySharedStateItem, scheduleSharedStateWrite]);
+
+  useEffect(() => {
+    let canceled = false;
+    let eventSource: EventSource | null = null;
+
+    if (!replayServerSyncEnabled) {
+      replayStateReadyRef.current = true;
+      return () => {
+        canceled = true;
+      };
+    }
+
+    const loadReplayState = async () => {
+      try {
+        const response = await fetch("/api/replay-state", { cache: "no-store" });
+        const payload = await response.json();
+        if (canceled) return;
+        const state = (payload?.state || {}) as ReplayServerState;
+        if (Array.isArray(state.allCandles) && state.allCandles.length) {
+          applyReplayServerState(state);
+        }
+      } catch {
+        // local default CSV remains fallback
+      } finally {
+        if (!canceled) replayStateReadyRef.current = true;
+      }
+    };
+
+    void loadReplayState();
+
+    try {
+      eventSource = new EventSource("/api/replay-events");
+      eventSource.addEventListener("replay-state", (event) => {
+        if (canceled) return;
+        try {
+          const payload = JSON.parse((event as MessageEvent).data);
+          applyReplayServerState((payload?.state || {}) as ReplayServerState);
+        } catch {
+          // polling fallback keeps sync alive
+        }
+      });
+      eventSource.onerror = () => {
+        eventSource?.close();
+        eventSource = null;
+      };
+    } catch {
+      eventSource = null;
+    }
+
+    const interval = window.setInterval(async () => {
+      if (!replayStateReadyRef.current || applyingReplayStateRef.current) return;
+      try {
+        const response = await fetch("/api/replay-state", { cache: "no-store" });
+        const payload = await response.json();
+        if (!canceled) applyReplayServerState((payload?.state || {}) as ReplayServerState);
+      } catch {
+        // keep current local state if server polling fails
+      }
+    }, 2000);
+
+    return () => {
+      canceled = true;
+      eventSource?.close();
+      window.clearInterval(interval);
+    };
+  }, [applyReplayServerState]);
 
   const applyPendingOrderMove = useCallback((pending: PendingOrderMove) => {
     blockedProtectionDragRef.current = false;
     setOrders((current) => {
       const nextOrders = current.map((order) =>
-        order.id === pending.target.orderId && (order.status === "pending" || order.status === "active")
+        order.id === pending.target.orderId &&
+        (order.status === "pending" || order.status === "active") &&
+        !(gridBotChartOrdersLocked && isGridTradeOrder(order))
           ? {
               ...(pending.target.field === "entry"
                 ? normalizeProtectionAfterEntryMove(order, Number(pending.price.toFixed(4)))
@@ -2195,7 +3425,7 @@ function TradingApp() {
       ordersRef.current = nextOrders;
       return nextOrders;
     });
-  }, []);
+  }, [gridBotChartOrdersLocked]);
 
   useEffect(() => {
     scheduleStorageWrite(drawingsStorageKey, drawings);
@@ -2222,7 +3452,6 @@ function TradingApp() {
       resolution: phemexSettings.resolution,
       limit: phemexSettings.limit,
       mode: phemexSettings.mode,
-      liveOrdersEnabled: phemexSettings.liveOrdersEnabled,
       allowMainnetOrders: phemexSettings.allowMainnetOrders,
       marginMode: phemexSettings.marginMode,
       leverage: phemexSettings.leverage,
@@ -2232,7 +3461,6 @@ function TradingApp() {
     phemexSettings.exchange,
     phemexSettings.limit,
     phemexSettings.mode,
-    phemexSettings.liveOrdersEnabled,
     phemexSettings.allowMainnetOrders,
     phemexSettings.marginMode,
     phemexSettings.leverage,
@@ -2245,8 +3473,8 @@ function TradingApp() {
   ]);
 
   useEffect(() => {
-    scheduleStorageWrite(botOptionsStorageKey, botSettings);
-  }, [botSettings, scheduleStorageWrite]);
+    scheduleStorageWrite(botOptionsStorageKey, withAppliedGridSettings(botSettings));
+  }, [botSettings, scheduleStorageWrite, withAppliedGridSettings]);
 
   useEffect(() => {
     scheduleStorageWrite(liveOrderPanelStorageKey, {
@@ -2284,14 +3512,14 @@ function TradingApp() {
   ]);
 
   useEffect(() => {
-    const openOrders = orders.filter((order) => isOpenTradeOrder(order) && !isSpotGridTradeOrder(order));
+    const openOrders = orders.filter((order) => isOpenTradeOrder(order) && !isGridTradeOrder(order));
     if (openOrders.length <= 1) {
       ordersRef.current = orders;
       return;
     }
     setOrders((current) => {
-      const spotGridOrders = current.filter((order) => isOpenTradeOrder(order) && isSpotGridTradeOrder(order));
-      const otherOrders = current.filter((order) => !isOpenTradeOrder(order) || !isSpotGridTradeOrder(order));
+      const spotGridOrders = current.filter((order) => isOpenTradeOrder(order) && isGridTradeOrder(order));
+      const otherOrders = current.filter((order) => !isOpenTradeOrder(order) || !isGridTradeOrder(order));
       const nextOrders = [...spotGridOrders, ...keepSingleOpenOrder(otherOrders)];
       ordersRef.current = nextOrders;
       return nextOrders;
@@ -2301,6 +3529,106 @@ function TradingApp() {
   useEffect(() => {
     scheduleStorageWrite(coinFavoritesStorageKey, coinFavorites);
   }, [coinFavorites, scheduleStorageWrite]);
+
+  useEffect(() => {
+    if (!isPrimaryInstance) return;
+    scheduleStorageWrite(replaySessionStorageKey, {
+      visibleCount,
+      isPlaying: isPrimaryInstance && isPlaying,
+      speedMs,
+      savedAt: Date.now()
+    });
+  }, [isPlaying, isPrimaryInstance, scheduleStorageWrite, speedMs, visibleCount]);
+
+  useEffect(() => {
+    scheduleReplayStateWrite();
+  }, [allCandles, isPlaying, orders, scheduleReplayStateWrite, speedMs, visibleCount]);
+
+  useEffect(() => {
+    if (isPrimaryInstance) scheduleReplayStateWrite();
+  }, [isPrimaryInstance, scheduleReplayStateWrite]);
+
+  const claimPrimaryInstance = useCallback(async () => {
+    if (!replayServerSyncEnabled) {
+      setIsPrimaryInstance(true);
+      isPrimaryInstanceRef.current = true;
+      applyingReplayStateRef.current = false;
+      return true;
+    }
+    try {
+      const response = await fetch("/api/instance-lock", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          clientId: sharedStateClientIdRef.current,
+          takeover: true
+        })
+      });
+      const result = await response.json();
+      const active = Boolean(result?.active);
+      setIsPrimaryInstance(active);
+      isPrimaryInstanceRef.current = active;
+      if (active) applyingReplayStateRef.current = false;
+      return active;
+    } catch {
+      setIsPrimaryInstance(true);
+      isPrimaryInstanceRef.current = true;
+      return true;
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!replayServerSyncEnabled) {
+      setIsPrimaryInstance(true);
+      isPrimaryInstanceRef.current = true;
+      return;
+    }
+    let canceled = false;
+
+    const heartbeat = async () => {
+      try {
+        const response = await fetch("/api/instance-lock", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ clientId: sharedStateClientIdRef.current })
+        });
+        const result = await response.json();
+        if (canceled) return;
+        const active = Boolean(result?.active);
+        setIsPrimaryInstance(active);
+        isPrimaryInstanceRef.current = active;
+      } catch {
+        if (!canceled) {
+          setIsPrimaryInstance(true);
+          isPrimaryInstanceRef.current = true;
+        }
+      }
+    };
+
+    void heartbeat();
+    const interval = window.setInterval(heartbeat, 1500);
+
+    const release = () => {
+      if (!isPrimaryInstance) return;
+      navigator.sendBeacon?.(
+        "/api/instance-lock",
+        new Blob([
+          JSON.stringify({
+            clientId: sharedStateClientIdRef.current,
+            release: true
+          })
+        ], { type: "application/json" })
+      );
+    };
+
+    window.addEventListener("beforeunload", release);
+
+    return () => {
+      canceled = true;
+      window.clearInterval(interval);
+      window.removeEventListener("beforeunload", release);
+    };
+  }, [isPrimaryInstance]);
 
   useEffect(() => {
     fetch("/api/coin-list")
@@ -2358,8 +3686,9 @@ function TradingApp() {
 
   useEffect(() => {
     if (!chartElement.current) return;
+    const chartNode = chartElement.current;
 
-    const chart = createChart(chartElement.current, {
+    const chart = createChart(chartNode, {
       layout: { background: { color: defaultTheme.backgroundColor }, textColor: defaultTheme.textColor },
       grid: { vertLines: { color: defaultTheme.gridColor }, horzLines: { color: defaultTheme.gridColor } },
       crosshair: { mode: CrosshairMode.Normal },
@@ -2378,12 +3707,12 @@ function TradingApp() {
         vertTouchDrag: true
       },
       rightPriceScale: {
-        autoScale: false,
+        autoScale: storedAppOptions.autoScalePrice,
         borderColor: "#2d3748"
       },
       timeScale: { borderColor: "#2d3748", timeVisible: true },
-      width: chartElement.current.clientWidth,
-      height: chartElement.current.clientHeight
+      width: chartNode.clientWidth,
+      height: chartNode.clientHeight
     });
 
     const candleSeries = chart.addSeries(CandlestickSeries, {
@@ -2399,24 +3728,62 @@ function TradingApp() {
     candleSeriesRef.current = candleSeries;
 
     const observer = new ResizeObserver(() => {
-      if (chartElement.current) {
-        chart.resize(chartElement.current.clientWidth, chartElement.current.clientHeight);
+      if (chartNode) {
+        chart.resize(chartNode.clientWidth, chartNode.clientHeight);
+        lastChartSizeRef.current = { width: chartNode.clientWidth, height: chartNode.clientHeight };
         if (hasChartOverlaysRef.current) scheduleOverlayRefresh(true);
       }
     });
-    observer.observe(chartElement.current);
+    observer.observe(chartNode);
+    const claimChartControl = () => {
+      if (!replayServerSyncEnabled) return;
+      if (!isPrimaryInstanceRef.current) void claimPrimaryInstance();
+    };
+    chartNode.addEventListener("pointerdown", claimChartControl);
+    chartNode.addEventListener("wheel", claimChartControl, { passive: true });
     const handleVisibleRangeChange = () => {
       if (hasChartOverlaysRef.current) scheduleOverlayRefresh(false, true);
+      if (applyingSharedStateRef.current || applyingReplayStateRef.current) return;
+      if (!replayServerSyncEnabled) return;
+      if (!isPrimaryInstanceRef.current) {
+        void claimPrimaryInstance();
+        return;
+      }
+      const range = chart.timeScale().getVisibleLogicalRange();
+      if (!range) return;
+      scheduleStorageWrite(chartViewStorageKey, {
+        range: {
+          from: Number(range.from),
+          to: Number(range.to)
+        },
+        savedAt: Date.now()
+      });
+      scheduleReplayStateWrite({
+        chartRange: {
+          from: Number(range.from),
+          to: Number(range.to)
+        }
+      });
     };
     chart.timeScale().subscribeVisibleLogicalRangeChange(handleVisibleRangeChange);
 
     return () => {
       observer.disconnect();
+      chartNode.removeEventListener("pointerdown", claimChartControl);
+      chartNode.removeEventListener("wheel", claimChartControl);
       chart.timeScale().unsubscribeVisibleLogicalRangeChange(handleVisibleRangeChange);
+      const candleSeries = candleSeriesRef.current;
+      if (candleSeries) {
+        gridPriceLinesRef.current.forEach((line) => candleSeries.removePriceLine(line));
+      }
+      gridPriceLinesRef.current.clear();
       lineSeriesRef.current.clear();
+      botOverlaySeriesRef.current.clear();
+      candleSeriesRef.current = null;
+      chartRef.current = null;
       chart.remove();
     };
-  }, [scheduleOverlayRefresh]);
+  }, []);
 
   useEffect(() => {
     chartRef.current?.applyOptions({
@@ -2465,6 +3832,7 @@ function TradingApp() {
         return response.text();
       })
       .then((text) => {
+        if (sharedReplayLoadedRef.current) return;
         const candles = parseCsvTextCandles(text);
         if (!candles.length) {
           setMessage(t.chartCsvInvalid);
@@ -2499,7 +3867,11 @@ function TradingApp() {
     const chart = chartRef.current;
     const candleSetChanged = previousCandleSetRef.current !== allCandles;
     const previousCandles = previousCandleSetRef.current;
-    const canAppendSingleCandle = !candleSetChanged && visibleCount === previousVisibleCountRef.current + 1;
+    const visibleCountChanged = visibleCount !== previousVisibleCountRef.current;
+    const canAppendSingleCandle =
+      !candleSetChanged &&
+      visibleCount === previousVisibleCountRef.current + 1 &&
+      visibleCount <= MAX_CHART_RENDER_CANDLES;
     const canUpdateLastLiveCandle =
       candleSetChanged &&
       previousCandles !== null &&
@@ -2510,17 +3882,34 @@ function TradingApp() {
       candleSetChanged &&
       previousCandles !== null &&
       allCandles.length === previousCandles.length + 1 &&
+      allCandles.length <= MAX_CHART_RENDER_CANDLES &&
       visibleCount >= previousVisibleCountRef.current &&
       previousCandles.length > 0 &&
       previousCandles.at(-1)?.time !== allCandles.at(-1)?.time;
     const lockedVisibleRange = chartRangeLockUntilRef.current > Date.now() ? lockedVisibleRangeRef.current : null;
     const keepManualRange = Boolean(lockedVisibleRange) || (!autoFocusChart && !shouldFitContentRef.current);
     const visibleRange = lockedVisibleRange ?? (keepManualRange ? chart?.timeScale().getVisibleLogicalRange() : null);
+    const chartNode = chartElement.current;
+
+    if (chart && chartNode?.clientWidth && chartNode.clientHeight) {
+      const nextWidth = chartNode.clientWidth;
+      const nextHeight = chartNode.clientHeight;
+      const lastSize = lastChartSizeRef.current;
+      if (lastSize.width !== nextWidth || lastSize.height !== nextHeight) {
+        chart.resize(nextWidth, nextHeight);
+        lastChartSizeRef.current = { width: nextWidth, height: nextHeight };
+      }
+    }
 
     if (candleSeries) {
-      if (canAppendSingleCandle && autoFocusChart) {
+      if (!visibleCandles.length) {
+        previousCandleSetRef.current = allCandles;
+        previousVisibleCountRef.current = visibleCount;
+      } else if (canAppendSingleCandle) {
         const nextCandle = allCandles[visibleCount - 1];
         if (nextCandle) candleSeries.update(nextCandle);
+      } else if (!isLiveRunning && (candleSetChanged || previousVisibleCountRef.current <= 0)) {
+        candleSeries.setData(visibleCandles);
       } else if (canUpdateLastLiveCandle) {
         const nextCandle = allCandles.at(-1);
         if (nextCandle) candleSeries.update(nextCandle);
@@ -2532,6 +3921,10 @@ function TradingApp() {
       }
       previousCandleSetRef.current = allCandles;
       previousVisibleCountRef.current = visibleCount;
+    }
+
+    if (!isLiveRunning && autoScalePrice && visibleCandles.length && (candleSetChanged || visibleCountChanged)) {
+      chart?.priceScale("right").setAutoScale(true);
     }
 
     if (visibleRange && keepManualRange) {
@@ -2588,9 +3981,11 @@ function TradingApp() {
 
   useEffect(() => {
     const chart = chartRef.current;
-    if (!chart || !visibleCandles.length) return;
+    const candleSeries = candleSeriesRef.current;
+    if (!chart || !candleSeries || !visibleCandles.length) return;
 
     const activeKeys = new Set<string>();
+    const activeGridKeys = new Set<string>();
     const start = visibleCandles[0].time;
     const end = visibleCandles.at(-1)?.time ?? start;
 
@@ -2609,12 +4004,22 @@ function TradingApp() {
           lineWidth,
           lineStyle: style,
           priceLineVisible: false,
+          lastValueVisible: false,
+          crosshairMarkerVisible: false,
           title: "",
           autoscaleInfoProvider: () => null
         });
         lineSeriesRef.current.set(key, series);
       } else {
-        series.applyOptions({ color, lineStyle: style, lineWidth, autoscaleInfoProvider: () => null });
+        series.applyOptions({
+          color,
+          lineStyle: style,
+          lineWidth,
+          priceLineVisible: false,
+          lastValueVisible: false,
+          crosshairMarkerVisible: false,
+          autoscaleInfoProvider: () => null
+        });
       }
       series.setData([
         { time: start, value: price },
@@ -2622,26 +4027,52 @@ function TradingApp() {
       ]);
     };
 
-    openOrders.forEach((order) => {
-      const entryColor = order.status === "active" ? "#facc15" : order.side === "buy" ? "#38bdf8" : "#fb923c";
-      upsertLine(`${order.id}-entry`, order.entry, entryColor, order.status === "active" ? LineStyle.LargeDashed : LineStyle.Solid);
-      if (order.takeProfit !== undefined) upsertLine(`${order.id}-takeProfit`, order.takeProfit, "#2fbf71", LineStyle.Dashed);
-      if (order.stopLoss !== undefined) upsertLine(`${order.id}-stopLoss`, order.stopLoss, "#e05252", LineStyle.Dashed);
+    chartOverlayOrders.forEach((order) => {
+      const isGridOrder = isGridTradeOrder(order);
+      const isPendingGridOrder = isGridOrder && order.status === "pending";
+      const entryColor = isPendingGridOrder
+        ? "rgba(56, 189, 248, 0.24)"
+        : order.status === "active"
+          ? "#facc15"
+          : order.side === "buy"
+            ? "#38bdf8"
+            : "#fb923c";
+      const entryStyle = isPendingGridOrder
+        ? LineStyle.Dotted
+        : order.status === "active"
+          ? LineStyle.LargeDashed
+          : LineStyle.Solid;
+      upsertLine(`${order.id}-entry`, order.entry, entryColor, entryStyle, isPendingGridOrder ? 1 : 2);
+      if (order.status === "active" && order.takeProfit !== undefined) upsertLine(`${order.id}-takeProfit`, order.takeProfit, "#2fbf71", LineStyle.Dashed);
+      if (order.status === "active" && order.stopLoss !== undefined) upsertLine(`${order.id}-stopLoss`, order.stopLoss, "#e05252", LineStyle.Dashed);
     });
 
+    const activeOrderPrices = new Set<string>();
+    chartOverlayOrders.forEach((order) => {
+      if (!isGridTradeOrder(order) || order.status === "active") {
+        activeOrderPrices.add(order.entry.toFixed(6));
+      }
+      if (order.status === "active") {
+        [order.takeProfit, order.stopLoss].forEach((price) => {
+          if (price !== undefined) activeOrderPrices.add(price.toFixed(6));
+        });
+      }
+    });
     visibleGridTriggerLines.forEach((line) => {
-      const isActiveGridLine = openOrders.some((order) =>
-        [order.entry, order.takeProfit, order.stopLoss].some((price) =>
-          price !== undefined && Math.abs(price - line.price) <= Math.max(line.price * 0.000001, 0.000001)
-        )
-      );
-      upsertLine(
-        `grid-trigger-${line.id}`,
-        line.price,
-        isActiveGridLine ? "rgba(250, 204, 21, 0.95)" : line.side === "buy" ? "rgba(47, 191, 113, 0.78)" : "rgba(251, 146, 60, 0.78)",
-        LineStyle.Dashed,
-        isActiveGridLine ? 2 : 1
-      );
+      const key = `grid-trigger-${line.id}`;
+      activeGridKeys.add(key);
+      const isActiveGridLine = activeOrderPrices.has(line.price.toFixed(6));
+      const existing = gridPriceLinesRef.current.get(key);
+      if (existing) candleSeries.removePriceLine(existing);
+      const priceLine = candleSeries.createPriceLine({
+        price: line.price,
+        color: isActiveGridLine ? "rgba(250, 204, 21, 0.95)" : line.side === "buy" ? "rgba(47, 191, 113, 0.78)" : "rgba(251, 146, 60, 0.78)",
+        lineStyle: LineStyle.Dashed,
+        lineWidth: isActiveGridLine ? 2 : 1,
+        axisLabelVisible: false,
+        title: ""
+      });
+      gridPriceLinesRef.current.set(key, priceLine);
     });
 
     lineSeriesRef.current.forEach((series, key) => {
@@ -2649,7 +4080,62 @@ function TradingApp() {
       chart.removeSeries(series);
       lineSeriesRef.current.delete(key);
     });
-  }, [chartViewVersion, visibleGridTriggerLines, openOrders, visibleCandles]);
+    gridPriceLinesRef.current.forEach((priceLine, key) => {
+      if (activeGridKeys.has(key)) return;
+      candleSeries.removePriceLine(priceLine);
+      gridPriceLinesRef.current.delete(key);
+    });
+  }, [chartOverlayOrders, chartViewVersion, visibleGridTriggerLines, visibleCandles]);
+
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart) return;
+    if (!BOT_CHART_OVERLAY_ENABLED) {
+      botOverlaySeriesRef.current.forEach((series) => {
+        chart.removeSeries(series);
+      });
+      botOverlaySeriesRef.current.clear();
+      return;
+    }
+
+    const styleFromOverlay = (style?: BotOverlayLine["style"]) => {
+      if (style === "dashed") return LineStyle.Dashed;
+      if (style === "dotted") return LineStyle.Dotted;
+      return LineStyle.Solid;
+    };
+    const activeKeys = new Set<string>();
+
+    (botOverlay?.lines ?? []).forEach((line) => {
+      const cleanPoints = line.points
+        .filter((point) => point && Number.isFinite(Number(point.value)))
+        .map((point) => ({ time: point.time, value: Number(point.value) }));
+      if (!line.id || cleanPoints.length < 2) return;
+      const key = `bot-overlay-${line.id}`;
+      activeKeys.add(key);
+      let series = botOverlaySeriesRef.current.get(key);
+      const options = {
+        color: line.color || "#facc15",
+        lineWidth: line.width || 1,
+        lineStyle: styleFromOverlay(line.style),
+        priceLineVisible: false,
+        autoscaleInfoProvider: () => null,
+        title: line.label || "",
+      };
+      if (!series) {
+        series = chart.addSeries(LineSeries, options);
+        botOverlaySeriesRef.current.set(key, series);
+      } else {
+        series.applyOptions(options);
+      }
+      series.setData(cleanPoints);
+    });
+
+    botOverlaySeriesRef.current.forEach((series, key) => {
+      if (activeKeys.has(key)) return;
+      chart.removeSeries(series);
+      botOverlaySeriesRef.current.delete(key);
+    });
+  }, [botOverlay]);
 
   useEffect(() => {
     const updateLineControls = () => {
@@ -2658,13 +4144,19 @@ function TradingApp() {
       const chartWidth = chartElement.current?.clientWidth ?? 0;
       const chartHeight = chartElement.current?.clientHeight ?? 0;
       const isVisibleY = (value: number) => value >= 0 && value <= chartHeight;
-      const controls = openOrders
-        .filter((order) => order.status === "pending" && (order.takeProfit === undefined || order.stopLoss === undefined))
+      const controls = chartOverlayOrders
+        .filter((order) =>
+          order.status === "pending" &&
+          !isGridTradeOrder(order) &&
+          (order.takeProfit === undefined || order.stopLoss === undefined)
+        )
         .map((order) => {
           const y = series.priceToCoordinate(order.entry);
           if (y === null || !isVisibleY(y)) return undefined;
           const orderIndex = allCandles.findIndex((candle) => candle.time === order.openedAt);
-          const logical = (orderIndex >= 0 ? orderIndex : visibleCandles.length - 1) as Logical;
+          const windowLogical = orderIndex >= 0 ? orderIndex - visibleWindowStart : visibleCandles.length - 1;
+          if (windowLogical < 0 || windowLogical > visibleCandles.length - 1) return undefined;
+          const logical = windowLogical as Logical;
           const coordinate = chartRef.current?.timeScale().logicalToCoordinate(logical);
           const x = coordinate === null || coordinate === undefined ? chartWidth * 0.58 : coordinate;
           const paneWidth = Math.max(0, chartWidth - rightPriceScaleOffset);
@@ -2675,12 +4167,12 @@ function TradingApp() {
         .filter(Boolean) as Array<{ order: TradeOrder; y: number; x: number; controlsX: number }>;
       setLineControls(controls);
 
-      const labels = openOrders.flatMap((order) => {
+      const rawLabels = chartLabelOrders.flatMap((order) => {
         const rows: Array<{ order: TradeOrder; field: DraggableOrderField; y: number; price: number; x?: number }> = [];
         const candidates: Array<[DraggableOrderField, number | undefined]> = [
-          ["entry", order.entry],
-          ["takeProfit", order.takeProfit],
-          ["stopLoss", order.stopLoss]
+          ["entry", order.status === "pending" && isGridTradeOrder(order) ? undefined : order.entry],
+          ["takeProfit", order.status === "active" ? order.takeProfit : undefined],
+          ["stopLoss", order.status === "active" ? order.stopLoss : undefined]
         ];
         candidates.forEach(([field, price]) => {
           if (price === undefined) return;
@@ -2696,24 +4188,45 @@ function TradingApp() {
         });
         return rows;
       });
+      const labelGroups = new Map<string, Array<{ order: TradeOrder; field: DraggableOrderField; y: number; price: number; x?: number }>>();
+      rawLabels.forEach((row) => {
+        const key = row.price.toFixed(6);
+        labelGroups.set(key, [...(labelGroups.get(key) ?? []), row]);
+      });
+      const labels = [...labelGroups.entries()].map(([priceKey, rows]) => {
+        const hasEntry = rows.some((row) => row.field === "entry");
+        const hasTp = rows.some((row) => row.field === "takeProfit");
+        const hasSl = rows.some((row) => row.field === "stopLoss");
+        const field: DraggableOrderField = hasSl ? "stopLoss" : hasTp ? "takeProfit" : "entry";
+        const label = [
+          hasEntry ? "ENTRY" : "",
+          hasTp ? "TP" : "",
+          hasSl ? "SL" : ""
+        ].filter(Boolean).join("/");
+        const anchor = rows.find((row) => row.field === "entry") ?? rows[0];
+        const locked = gridBotChartOrdersLocked && rows.some((row) => isGridTradeOrder(row.order));
+        return {
+          id: priceKey,
+          field,
+          label,
+          y: anchor.y,
+          price: anchor.price,
+          x: anchor.x,
+          locked
+        };
+      });
       setOrderLineLabels(labels);
     };
 
     updateLineControls();
     const frame = window.requestAnimationFrame(updateLineControls);
     return () => window.cancelAnimationFrame(frame);
-  }, [allCandles, chartTheme.orderControlsSide, chartViewVersion, openOrders, visibleCandles]);
+  }, [allCandles, chartLabelOrders, chartOverlayOrders, chartTheme.orderControlsSide, chartViewVersion, gridBotChartOrdersLocked, visibleCandles, visibleWindowStart]);
 
   useEffect(() => {
-    if (!isPlaying) return;
-    if (visibleCount >= allCandles.length) {
-      setIsPlaying(false);
-      return;
-    }
-
-    const timer = window.setTimeout(() => stepForward(), speedMs);
-    return () => window.clearTimeout(timer);
-  }, [isPlaying, visibleCount, allCandles.length, speedMs]);
+    visibleCountRef.current = visibleCount;
+    allCandlesLengthRef.current = allCandles.length;
+  }, [allCandles.length, visibleCount]);
 
   useEffect(() => {
     const handleMouseMove = (event: MouseEvent) => {
@@ -2830,6 +4343,7 @@ function TradingApp() {
 
       for (const order of ordersRef.current) {
         if (order.status !== "pending" && order.status !== "active") continue;
+        if (gridBotChartOrdersLocked && isGridTradeOrder(order)) continue;
         const candidates: Array<[DraggableOrderField, number | undefined]> = [
           ["takeProfit", order.takeProfit],
           ["stopLoss", order.stopLoss]
@@ -3004,7 +4518,7 @@ function TradingApp() {
               ordersRef.current = nextOrders;
               return nextOrders;
             });
-          } else if (original?.orderId === orderId) {
+          } else if (original?.orderId === orderId && changedOrder && isLiveRunning && hasExchangeOrderReference(changedOrder)) {
             const rect = chartNode.getBoundingClientRect();
             setProtectionConfirm({
               orderId,
@@ -3014,6 +4528,8 @@ function TradingApp() {
               originalTakeProfit: original.takeProfit,
               originalStopLoss: original.stopLoss
             });
+          } else if (original?.orderId === orderId) {
+            delete protectionEditOriginalsRef.current[orderId];
           }
         }
       }
@@ -3063,7 +4579,7 @@ function TradingApp() {
       window.removeEventListener("click", closeMenu);
       window.removeEventListener("keydown", closeMenu);
     };
-  }, [applyPendingOrderMove, scheduleOverlayRefresh, t]);
+  }, [applyPendingOrderMove, chartTheme.allowDrag, chartTheme.allowMouseWheel, gridBotChartOrdersLocked, scheduleOverlayRefresh, t]);
 
   const evaluateOrdersForCandle = useCallback((currentOrders: TradeOrder[], candle: Candle): TradeOrder[] =>
     currentOrders.map((order) => {
@@ -3077,9 +4593,6 @@ function TradingApp() {
             ...order,
             status: "active" as OrderStatus
           };
-          if (isSpotGridTradeOrder(evaluatedOrder)) {
-            return evaluatedOrder;
-          }
         }
 
         const hitTp =
@@ -3130,8 +4643,10 @@ function TradingApp() {
     if (botSettings.mode !== "paper") return false;
     const action = String(botData.action || "").toLowerCase();
     if (action !== "place_orders" && action !== "place_order" && action !== "buy" && action !== "sell" && action !== "signal_buy" && action !== "signal_sell") return false;
-    const isSpotGridPayload = botData.spotGrid === true || String(botData.mechanic || "").toLowerCase() === "spot_grid";
-    if (!isSpotGridPayload && ordersRef.current.some((order) => order.status === "pending" || order.status === "active")) {
+    const payloadMechanic = String(botData.mechanic || "").toLowerCase();
+    const isGridPayload = botData.gridBot === true || botData.spotGrid === true || payloadMechanic === "spot_grid" || payloadMechanic === "grid_bot";
+    const isSpotGridPayload = botData.spotGrid === true || payloadMechanic === "spot_grid";
+    if (!isGridPayload && ordersRef.current.some((order) => order.status === "pending" || order.status === "active")) {
       showExchangeDebug("Bot", "Bot-Order wurde blockiert, weil bereits eine offene Order vorhanden ist.", {
         symbol: activePhemexSettings.symbol,
         action
@@ -3147,12 +4662,15 @@ function TradingApp() {
       const quantityValue = Number(data.quantity ?? data.qty ?? data.size ?? quantity);
       const takeProfitValue = Number(data.takeProfit ?? data.tp);
       const stopLossValue = Number(data.stopLoss ?? data.sl);
-      const isSpotGridOrder = data.spotGrid === true || String(data.mechanic || "").toLowerCase() === "spot_grid";
+      const dataMechanic = String(data.mechanic || "").toLowerCase();
+      const isGridOrder = data.gridBot === true || data.spotGrid === true || dataMechanic === "spot_grid" || dataMechanic === "grid_bot";
+      const isSpotGridOrder = data.spotGrid === true || dataMechanic === "spot_grid";
+      const dataOrderType = data.orderType === "market" ? "market" : data.orderType === "limit" ? "limit" : undefined;
       const requestedStatus = String(data.status || "").toLowerCase();
       const orderStatus: OrderStatus =
         requestedStatus === "active" || requestedStatus === "pending"
           ? requestedStatus
-          : effectiveBotOrderType === "market"
+          : (dataOrderType ?? effectiveBotOrderType) === "market"
             ? "active"
             : "pending";
 
@@ -3160,23 +4678,27 @@ function TradingApp() {
         return undefined;
       }
 
-      const gridProtection = isSpotGridOrder
-        ? { takeProfit: Number.isFinite(takeProfitValue) ? takeProfitValue : undefined, stopLoss: undefined as number | undefined }
-        : getGridProtectionForOrder(orderSide, entryValue, data.gridIndex);
+      const gridProtection = isGridOrder
+        ? getGridProtectionForOrder(orderSide, entryValue, data.gridIndex)
+        : { takeProfit: undefined as number | undefined, stopLoss: undefined as number | undefined };
       const botCandleIndex = allCandles.findIndex((item) => item.time === candle.time);
       const gridIndexValue = numberFrom(data.gridIndex);
       return {
         id: `BOT-${Date.now()}-${index}`,
+        exchange: "replay",
         side: orderSide,
+        orderType: dataOrderType ?? effectiveBotOrderType,
         quantity: quantityValue,
         entry: entryValue,
         takeProfit: gridProtection.takeProfit ?? (Number.isFinite(takeProfitValue) ? takeProfitValue : undefined),
-        stopLoss: isSpotGridOrder ? undefined : gridProtection.stopLoss ?? (Number.isFinite(stopLossValue) ? stopLossValue : undefined),
+        stopLoss: gridProtection.stopLoss ?? (Number.isFinite(stopLossValue) ? stopLossValue : undefined),
         status: orderStatus,
         openedAt: candle.time,
         openedIndex: botCandleIndex >= 0 ? Math.max(-1, botCandleIndex - 1) : undefined,
         spotGrid: isSpotGridOrder,
-        mechanic: isSpotGridOrder ? "spot_grid" : undefined,
+        gridBot: isGridOrder,
+        gridMarketType: data.gridMarketType === "future" ? "future" : isSpotGridOrder ? "spot" : undefined,
+        mechanic: isSpotGridOrder ? "spot_grid" : isGridOrder ? "grid_bot" : undefined,
         gridIndex: gridIndexValue
       };
     };
@@ -3186,18 +4708,19 @@ function TradingApp() {
       const createdOrders = nestedOrders
         .map((item, index) => createOrderFromBotData({ ...botData, ...item }, index))
         .filter(Boolean) as TradeOrder[];
+      const firstOrder = createdOrders[0];
 
-      if (!createdOrders.length) {
+      if (!firstOrder) {
         showExchangeDebug("Bot", t.orderNeedsInput, { action, orders: nestedOrders });
         return true;
       }
 
       setOrders((current) => {
-        const newOrders = createdOrders.filter((order) => {
-          if (!isSpotGridTradeOrder(order)) return true;
+        const newOrders = [firstOrder].filter((order) => {
+          if (!isGridTradeOrder(order)) return true;
           return !current.some((existing) =>
             isOpenTradeOrder(existing) &&
-            isSpotGridTradeOrder(existing) &&
+            isGridTradeOrder(existing) &&
             existing.side === order.side &&
             Math.abs(existing.entry - order.entry) <= 0.000001
           );
@@ -3206,11 +4729,11 @@ function TradingApp() {
           ordersRef.current = current;
           return current;
         }
-        const nextOrders = [...newOrders, ...current];
+        const nextOrders = evaluateOrdersForCandle([...newOrders, ...current], candle);
         ordersRef.current = nextOrders;
         return nextOrders;
       });
-      setMessage(`Spot-Grid: ${createdOrders.length} Kauf-Level gesetzt.`);
+      setMessage("Gridbot: 1 Kauf-Level gesetzt.");
       setMessageKind("custom");
       return true;
     }
@@ -3221,11 +4744,12 @@ function TradingApp() {
     const quantityValue = Number(botData.quantity ?? botData.qty ?? botData.size ?? quantity);
     const takeProfitValue = Number(botData.takeProfit ?? botData.tp);
     const stopLossValue = Number(botData.stopLoss ?? botData.sl);
+    const botDataOrderType = botData.orderType === "market" ? "market" : botData.orderType === "limit" ? "limit" : undefined;
     const requestedStatus = String(botData.status || "").toLowerCase();
     const orderStatus: OrderStatus =
       requestedStatus === "active" || requestedStatus === "pending"
         ? requestedStatus
-        : effectiveBotOrderType === "market"
+        : (botDataOrderType ?? effectiveBotOrderType) === "market"
           ? "active"
           : "pending";
 
@@ -3239,34 +4763,39 @@ function TradingApp() {
     }
 
     const id = `BOT-${Date.now()}`;
+    const isGridOrder = isGridPayload;
     const isSpotGridOrder = isSpotGridPayload;
-    const gridProtection = isSpotGridOrder
-      ? { takeProfit: Number.isFinite(takeProfitValue) ? takeProfitValue : undefined, stopLoss: undefined as number | undefined }
-      : getGridProtectionForOrder(orderSide, entryValue, botData.gridIndex);
+    const gridProtection = isGridOrder
+      ? getGridProtectionForOrder(orderSide, entryValue, botData.gridIndex)
+      : { takeProfit: undefined as number | undefined, stopLoss: undefined as number | undefined };
     const botCandleIndex = allCandles.findIndex((item) => item.time === candle.time);
     const order: TradeOrder = {
       id,
+      exchange: "replay",
       side: orderSide,
+      orderType: botDataOrderType ?? effectiveBotOrderType,
       quantity: quantityValue,
       entry: entryValue,
       takeProfit: gridProtection.takeProfit ?? (Number.isFinite(takeProfitValue) ? takeProfitValue : undefined),
-      stopLoss: isSpotGridOrder ? undefined : gridProtection.stopLoss ?? (Number.isFinite(stopLossValue) ? stopLossValue : undefined),
+      stopLoss: gridProtection.stopLoss ?? (Number.isFinite(stopLossValue) ? stopLossValue : undefined),
       status: orderStatus,
       openedAt: candle.time,
       openedIndex: botCandleIndex >= 0 ? Math.max(-1, botCandleIndex - 1) : undefined,
       spotGrid: isSpotGridOrder,
-      mechanic: isSpotGridOrder ? "spot_grid" : undefined,
+      gridBot: isGridOrder,
+      gridMarketType: botData.gridMarketType === "future" ? "future" : isSpotGridOrder ? "spot" : undefined,
+      mechanic: isSpotGridOrder ? "spot_grid" : isGridOrder ? "grid_bot" : undefined,
       gridIndex: numberFrom(botData.gridIndex)
     };
     setOrders((current) => {
-      if (isSpotGridOrder) {
+      if (isGridOrder) {
         const hasSameGridOrder = current.some((existing) =>
           isOpenTradeOrder(existing) &&
-          isSpotGridTradeOrder(existing) &&
+          isGridTradeOrder(existing) &&
           existing.side === order.side &&
           Math.abs(existing.entry - order.entry) <= 0.000001
         );
-        const nextOrders = hasSameGridOrder ? current : [order, ...current];
+        const nextOrders = hasSameGridOrder ? current : evaluateOrdersForCandle([order, ...current], candle);
         ordersRef.current = nextOrders;
         return nextOrders;
       }
@@ -3281,26 +4810,167 @@ function TradingApp() {
     setMessage(t.orderPlaced(id, orderSide, formatPrice(entryValue)));
     setMessageKind("custom");
     return true;
-  }, [activePhemexSettings.symbol, allCandles, botSettings.mode, effectiveBotOrderType, getGridProtectionForOrder, quantity, t]);
+  }, [activePhemexSettings.symbol, allCandles, botSettings.mode, effectiveBotOrderType, evaluateOrdersForCandle, getGridProtectionForOrder, quantity, t]);
 
-  const sendBotTick = useCallback(async (source: "replay" | "live", candle?: Candle, livePrice?: number) => {
+  const refreshBotOverlay = useCallback(async (candle?: Candle, force = false) => {
+    if (!BOT_CHART_OVERLAY_ENABLED) {
+      botOverlayPendingCandleRef.current = null;
+      lastBotOverlayAppliedTimeRef.current = null;
+      if (botOverlay !== null) setBotOverlay(null);
+      return;
+    }
+    if (!botSettings.url.trim()) {
+      return;
+    }
+    const requestedCandle = candle ?? lastCandle;
+    if (botOverlayInFlightRef.current) {
+      if (requestedCandle) {
+        const requestedTime = timeToSortableValue(requestedCandle.time);
+        const pendingTime = botOverlayPendingCandleRef.current ? timeToSortableValue(botOverlayPendingCandleRef.current.time) : null;
+        if (Number.isFinite(requestedTime) && (pendingTime === null || requestedTime >= pendingTime)) {
+          botOverlayPendingCandleRef.current = requestedCandle;
+        }
+      }
+      return;
+    }
+    const activeCandle = requestedCandle;
+    if (!activeCandle) {
+      return;
+    }
+    const activeCandleTime = timeToSortableValue(activeCandle.time);
+    const now = Date.now();
+    if (!force && now - lastBotOverlayRequestAtRef.current < 250) {
+      botOverlayPendingCandleRef.current = activeCandle;
+      return;
+    }
+    const activeCandleIndex = allCandles.findIndex((item) => item.time === activeCandle.time);
+    if (activeCandleIndex < 0) {
+      return;
+    }
+    botOverlayInFlightRef.current = true;
+    lastBotOverlayRequestAtRef.current = now;
+    try {
+      const response = await fetch(botSettings.url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          overlayOnly: true,
+          mode: "replay",
+          botMode: "signals",
+          exchange: activePhemexSettings.exchange,
+          symbol: activePhemexSettings.symbol,
+          timeframe: timeframeFromResolution(activePhemexSettings.resolution),
+          candle: activeCandle,
+          history: allCandles.slice(0, activeCandleIndex)
+        })
+      });
+      const result = await response.json().catch(() => undefined);
+      if (!response.ok || result?.ok === false) {
+        console.warn("Bot overlay request failed", result);
+        return;
+      }
+      const overlay = result?.overlay ?? result?.data?.overlay;
+      const nextOverlay = overlay && typeof overlay === "object" ? overlay as BotOverlay : null;
+      const lastAppliedTime = lastBotOverlayAppliedTimeRef.current;
+      if (Number.isFinite(activeCandleTime) && (lastAppliedTime === null || activeCandleTime >= lastAppliedTime)) {
+        lastBotOverlayAppliedTimeRef.current = activeCandleTime;
+      } else {
+        return;
+      }
+      setBotOverlay(nextOverlay);
+    } catch (error) {
+      console.warn("Bot overlay request failed", error);
+      // Overlay is diagnostic only; trade ticks must not depend on it.
+    } finally {
+      botOverlayInFlightRef.current = false;
+      const pendingCandle = botOverlayPendingCandleRef.current;
+      botOverlayPendingCandleRef.current = null;
+      if (pendingCandle && pendingCandle.time !== activeCandle.time) {
+        window.setTimeout(() => {
+          void refreshBotOverlay(pendingCandle, true);
+        }, 0);
+      }
+    }
+  }, [
+    activePhemexSettings.exchange,
+    activePhemexSettings.resolution,
+    activePhemexSettings.symbol,
+    allCandles,
+    botSettings.script,
+    botSettings.url,
+    lastCandle
+  ]);
+
+  const clearBotOverlay = useCallback(() => {
+    botOverlayPendingCandleRef.current = null;
+    lastBotOverlayAppliedTimeRef.current = null;
+    setBotOverlay(null);
+  }, []);
+
+  useEffect(() => {
+    if ((!botSettings.enabled && !botProcessStatus.running) || !lastCandle) {
+      return;
+    }
+    void refreshBotOverlay(lastCandle, true);
+  }, [botProcessStatus.running, botSettings.enabled, lastCandle, refreshBotOverlay]);
+
+  const sendBotTick = useCallback(async (source: "replay" | "live", candle?: Candle, livePrice?: number, orderSnapshot?: TradeOrder[]) => {
     if (!botEnabledRef.current || !botSettings.url.trim()) return;
+    const tickGeneration = botRunGenerationRef.current;
     if (botTickInFlightRef.current) {
       if (source === "replay" && candle) {
-        botReplayQueueRef.current.push(candle);
-        if (botReplayQueueRef.current.length > 1000) {
-          botReplayQueueRef.current = botReplayQueueRef.current.slice(-1000);
+        const queuedTime = timeToSortableValue(candle.time);
+        const queued = botReplayQueueRef.current;
+        const lastQueuedTime = queued.length ? timeToSortableValue(queued[queued.length - 1].time) : lastBotReplayCandleTimeRef.current;
+        if (
+          Number.isFinite(queuedTime) &&
+          (lastQueuedTime === null || queuedTime > lastQueuedTime)
+        ) {
+          const pending = queued[0];
+          const previousClose = pending?.previousClose ?? lastBotReplayCloseRef.current ?? candle.open;
+          botReplayQueueRef.current = [{
+            ...candle,
+            open: pending?.open ?? candle.open,
+            high: Math.max(pending?.high ?? candle.high, candle.high),
+            low: Math.min(pending?.low ?? candle.low, candle.low),
+            close: candle.close,
+            volume: (pending?.volume ?? 0) + (candle.volume ?? 0),
+            previousClose
+          }];
         }
       }
       return;
     }
     const activeCandle = candle ?? lastCandle;
     if (!activeCandle) return;
+    cleanupGridOrderSuppression();
+    const replayGeneration = source === "replay" ? botReplayGenerationRef.current : 0;
     const activeCandleIndex = allCandles.findIndex((item) => item.time === activeCandle.time);
+    const replayHistoryPayload =
+      source === "replay" &&
+      !isGridBotScript &&
+      lastBotReplayCandleTimeRef.current === null &&
+      activeCandleIndex > 0
+        ? allCandles.slice(0, activeCandleIndex)
+        : undefined;
+    if (source === "replay") {
+      const activeTime = timeToSortableValue(activeCandle.time);
+      const lastTime = lastBotReplayCandleTimeRef.current;
+      if (!Number.isFinite(activeTime) || (lastTime !== null && activeTime <= lastTime)) return;
+      lastBotReplayCandleTimeRef.current = activeTime;
+      lastBotReplayCloseRef.current = activeCandle.close;
+    }
     const previousCandle = activeCandleIndex > 0 ? allCandles[activeCandleIndex - 1] : undefined;
-    const botCandlePayload = previousCandle
+    const queuedPreviousClose = source === "replay" ? (activeCandle as BotReplayCandle).previousClose : undefined;
+    const botCandlePayload = queuedPreviousClose !== undefined
+      ? { ...activeCandle, previousClose: queuedPreviousClose }
+      : previousCandle
       ? { ...activeCandle, previousClose: previousCandle.close }
       : activeCandle;
+    const rawOpenOrders = (orderSnapshot ?? ordersRef.current).filter(isOpenTradeOrder);
+    const activeOpenOrders = botSettings.mode === "live"
+      ? rawOpenOrders.filter(hasExchangeOrderReference)
+      : rawOpenOrders.filter((order) => !hasExchangeOrderReference(order));
     botTickInFlightRef.current = true;
     const controller = new AbortController();
     const botTickTimeoutMs = source === "replay" ? 12000 : 8000;
@@ -3321,7 +4991,8 @@ function TradingApp() {
           timeframe: timeframeFromResolution(activePhemexSettings.resolution),
           livePrice,
           candle: botCandlePayload,
-          openOrders: ordersRef.current.filter((order) => order.status === "pending" || order.status === "active"),
+          history: replayHistoryPayload,
+          openOrders: activeOpenOrders,
           gridTriggers: gridTriggerLines.map((line) => ({
             price: line.price,
             side: line.side,
@@ -3329,36 +5000,54 @@ function TradingApp() {
             distancePercent: line.distancePercent
           })),
           gridSettings: {
-            priceFrom: numberFrom(botSettings.gridPriceFrom),
-            priceTo: numberFrom(botSettings.gridPriceTo),
-            stepPercent: numberFrom(botSettings.gridStepPercent),
-            takeProfitPercent: numberFrom(botSettings.gridTakeProfitPercent),
-            stopLossPercent: numberFrom(botSettings.gridStopLossPercent),
-            direction: botSettings.gridDirection,
-            gridCount: numberFrom(botSettings.gridCount),
-            investment: numberFrom(botSettings.gridInvestment),
-            amountMode: botSettings.gridAmountMode,
-            amountValue: numberFrom(botSettings.gridAmountValue),
-            quantity,
-            leverage: numberFrom(botSettings.gridLeverage)
+            priceFrom: numberFrom(appliedGridSettings.gridPriceFrom),
+            priceTo: numberFrom(appliedGridSettings.gridPriceTo),
+            stepPercent: numberFrom(appliedGridSettings.gridStepPercent),
+            takeProfitPercent: numberFrom(appliedGridSettings.gridTakeProfitPercent),
+            stopLossPercent: numberFrom(appliedGridSettings.gridStopLossPercent),
+            direction: appliedGridSettings.gridDirection,
+            gridCount: numberFrom(appliedGridSettings.gridCount),
+            investment: numberFrom(appliedGridSettings.gridInvestment),
+            amountMode: appliedGridSettings.gridAmountMode,
+            amountValue: numberFrom(appliedGridSettings.gridAmountValue),
+            marketType: gridBotMarketType,
+            marginMode: appliedGridSettings.gridMarginMode,
+            orderType: appliedGridSettings.gridOrderType,
+            stopLossEnabled: gridBotStopLossRequired,
+            leverage: numberFrom(appliedGridSettings.gridLeverage)
           },
           balance: futuresBalance,
-          liveOrdersEnabled: activePhemexSettings.liveOrdersEnabled && botSettings.mode === "live"
+          liveOrdersEnabled: botSettings.mode === "live"
         })
       });
       const result = await response.json().catch(() => undefined);
+      if (tickGeneration !== botRunGenerationRef.current) return;
+      if (source === "replay" && replayGeneration !== botReplayGenerationRef.current) return;
       if (!botEnabledRef.current) return;
       if (!response.ok || result?.ok === false) {
         throw new Error(result?.message || t.botTickFailed);
       }
-      setBotRuntimeInfo({
-        lastTick: Date.now(),
-        lastAction: result?.data?.action ? String(result.data.action) : "hold",
-        lastError: undefined,
-        lastPayload: result?.data
-      });
+      const botActionForRuntime = result?.data?.action ? String(result.data.action) : "hold";
+      const nowForRuntime = Date.now();
+      if (botActionForRuntime !== "hold" || nowForRuntime - lastBotRuntimeUiAtRef.current >= 250) {
+        lastBotRuntimeUiAtRef.current = nowForRuntime;
+        setBotRuntimeInfo({
+          lastTick: nowForRuntime,
+          lastAction: botActionForRuntime,
+          lastError: undefined,
+          lastPayload: result?.data
+        });
+      }
       if (result?.data && typeof result.data === "object") {
         const botData = result.data as Record<string, unknown>;
+        if (BOT_CHART_OVERLAY_ENABLED) {
+          const overlay = botData.overlay;
+          setBotOverlay(
+            overlay && typeof overlay === "object"
+              ? overlay as BotOverlay
+              : null
+          );
+        }
         const botAction = String(botData.action || "").toLowerCase();
         const botSideValue = String(botData.side || botAction).toLowerCase();
         const isLiveOrderSignal =
@@ -3372,8 +5061,160 @@ function TradingApp() {
             : botSideValue.includes("buy") || botSideValue === "long"
               ? "buy"
               : undefined;
+        const liveGridBatchOrders = Array.isArray(botData.orders) ? botData.orders as Record<string, unknown>[] : [];
+        if (botSettings.mode === "live" && isPhemexGridBotScript) {
+          setBotRuntimeInfo((current) => ({
+            ...current,
+            lastAction: "Gridbot Live-Tick ignoriert: Orders laufen nur ueber 4s-Orderpruefung",
+            lastPayload: {
+              action: botAction,
+              signalSide: botSide,
+              orderCount: liveGridBatchOrders.length
+            }
+          }));
+          return;
+        }
+        if (
+          botSettings.mode === "live" &&
+          isGridBotScript &&
+          (botAction === "place_orders" || botAction === "place_order") &&
+          liveGridBatchOrders.length
+        ) {
+          if (!isLiveRunning) {
+            showExchangeDebug("Gridbot Live", "Gridbot-Live-Batch blockiert, weil Live-Modus aus ist.", {
+              source,
+              botMode: botSettings.mode,
+              liveRunning: isLiveRunning,
+              symbol: activePhemexSettings.symbol,
+              action: botAction,
+              orderCount: liveGridBatchOrders.length
+            });
+            return;
+          }
+          if (isPhemexGridBotScript && gridBotMarketType === "spot") {
+            showExchangeDebug("Gridbot", "Spot-Grid ist gegen Future-Orders gesperrt. Nutze Future im Gridbot oder binde spaeter eine Spot-API an.", {
+              source,
+              symbol: activePhemexSettings.symbol,
+              action: botAction,
+              botScript: botSettings.script,
+              blockedReason: "spotGridFutureGuard"
+            });
+            return;
+          }
+
+          await syncPhemexOrderStatusThrottled(activePhemexSettings, true).catch(() => undefined);
+          let submittedCount = 0;
+          let skippedCount = 0;
+          let placedInBatch = false;
+        for (const item of liveGridBatchOrders) {
+            const orderData = { ...botData, ...item };
+            const itemAction = String(orderData.action || botAction || "").toLowerCase();
+            const sideValue = String(orderData.side || itemAction.replace("signal_", "")).toLowerCase();
+            const orderSide: Side | undefined =
+              sideValue.includes("sell") || sideValue === "short"
+                ? "sell"
+                : sideValue.includes("buy") || sideValue === "long"
+                  ? "buy"
+                  : undefined;
+            const orderEntry = numberFrom(orderData.entry ?? orderData.price);
+            const orderQuantity = numberFrom(orderData.quantity ?? orderData.qty ?? orderData.size);
+            const gridIndexValue = numberFrom(orderData.gridIndex);
+            if (!orderSide || orderEntry === undefined || orderEntry <= 0 || orderQuantity === undefined || orderQuantity <= 0) {
+              skippedCount += 1;
+              continue;
+            }
+            if (isGridBotScript && !isGridDirectionAllowed(orderSide)) {
+              skippedCount += 1;
+              continue;
+            }
+            const clientOrderId = makeGridClientOrderId(activePhemexSettings.symbol, orderSide, orderEntry, gridIndexValue);
+            if (hasOpenGridLiveOrder(orderSide, orderEntry, gridIndexValue, clientOrderId, true, true)) {
+              skippedCount += 1;
+              continue;
+            }
+            if (isGridLevelBlocked(activePhemexSettings.symbol, orderSide, orderEntry, gridIndexValue, true)) {
+              skippedCount += 1;
+              continue;
+            }
+            if (isGridOrderSuppressed(clientOrderId)) {
+              skippedCount += 1;
+              continue;
+            }
+            if (isGridBotScript) {
+              suppressGridOrder(clientOrderId, GRID_ORDER_SUBMIT_GUARD_MS);
+              suppressGridLevel(
+                activePhemexSettings.symbol,
+                orderSide,
+                orderEntry,
+                gridIndexValue,
+                GRID_ORDER_SUBMIT_GUARD_MS,
+                "inflight"
+              );
+            }
+            if (!botEnabledRef.current) {
+              skippedCount += 1;
+              clearGridOrderSuppression(clientOrderId);
+              continue;
+            }
+            const botTakeProfit = numberFrom(orderData.takeProfit ?? orderData.take_profit ?? orderData.tp);
+            const botStopLoss = numberFrom(orderData.stopLoss ?? orderData.stop_loss ?? orderData.sl);
+            const gridProtection = getGridProtectionForOrder(orderSide, orderEntry, gridIndexValue);
+            await submitOrderRef.current(orderSide, {
+              entry: orderEntry,
+              quantity: orderQuantity,
+              takeProfit: gridProtection.takeProfit ?? botTakeProfit,
+              stopLoss: gridProtection.stopLoss ?? botStopLoss,
+              orderType: appliedGridSettings.gridOrderType,
+              marginMode: appliedGridSettings.gridMarginMode,
+              leverage: Math.max(1, numberFrom(appliedGridSettings.gridLeverage) ?? 1),
+              allowMissingProtection: !gridBotStopLossRequired,
+              clientOrderId,
+              fastGridSubmit: true,
+              gridBot: true,
+              spotGrid: gridBotMarketType === "spot",
+              gridMarketType: gridBotMarketType,
+              mechanic: gridBotMarketType === "spot" ? "spot_grid" : "grid_bot",
+              gridIndex: gridIndexValue
+            });
+            submittedCount += 1;
+            placedInBatch = true;
+            break;
+          }
+          setBotRuntimeInfo((current) => ({
+            ...current,
+            lastAction: `Gridbot Live-Batch: ${submittedCount} gesendet`,
+            lastPayload: {
+              ...botData,
+              submittedCount,
+              skippedCount
+            }
+          }));
+          setMessage(`Gridbot Live-Batch: ${submittedCount} Orders gesendet${skippedCount ? `, ${skippedCount} übersprungen` : ""}.`);
+          setMessageKind("custom");
+          if (placedInBatch) {
+            await syncPhemexOrderStatusThrottled(activePhemexSettings, true).catch(() => undefined);
+          }
+          botReplayQueueRef.current = [];
+          return;
+        }
         if (botSettings.mode === "live" && isLiveOrderSignal) {
-          const liveOrderCooldownMs = Math.max(15000, pollMsFromSettings(activePhemexSettings));
+          if (isGridBotScript && botSide && !isGridDirectionAllowed(botSide)) {
+            setBotRuntimeInfo((current) => ({
+              ...current,
+              lastAction: "blockiert: Grid-Order ignoriert (Richtung)",
+              lastPayload: {
+                blockedReason: "gridDirectionBlocked",
+                orderSide: botSide,
+                direction: appliedGridSettings.gridDirection,
+                action: botAction,
+                actionSide: botSideValue
+              }
+            }));
+            setMessage(`Grid-Signal ${botSide.toUpperCase()} blockiert: Richtung ${appliedGridSettings.gridDirection}.`);
+            setMessageKind("custom");
+            return;
+          }
+          const liveOrderCooldownMs = isGridBotScript ? 0 : Math.max(15000, pollMsFromSettings(activePhemexSettings));
           const liveOrderRecentlySent = Date.now() - lastLiveOrderSubmitAtRef.current < liveOrderCooldownMs;
           if (liveOrderPlacementRef.current?.locked || liveOrderRecentlySent) {
             setBotRuntimeInfo((current) => ({
@@ -3399,27 +5240,14 @@ function TradingApp() {
             });
             return;
           }
-          if (isPhemexGridBotScript) {
-            showExchangeDebug("Spot-Grid", "Spot-Grid ist gegen Future-Orders gesperrt. Live-Spot-Orders werden erst gesendet, wenn eine Spot-API angebunden ist.", {
+          if (isPhemexGridBotScript && gridBotMarketType === "spot") {
+            showExchangeDebug("Gridbot", "Spot-Grid ist gegen Future-Orders gesperrt. Nutze Future im Gridbot oder binde spaeter eine Spot-API an.", {
               source,
               symbol: activePhemexSettings.symbol,
               action: botAction,
               botScript: botSettings.script,
               blockedReason: "spotGridFutureGuard"
             });
-            return;
-          }
-          if (!activePhemexSettings.liveOrdersEnabled) {
-            setBotRuntimeInfo((current) => ({
-              ...current,
-              lastAction: `blockiert: ${t.liveOrders} aus`,
-              lastPayload: {
-                ...botData,
-                blockedReason: "liveOrdersDisabled"
-              }
-            }));
-            setMessage(`${t.botSignal(botAction)} blockiert: ${t.liveOrders} aus.`);
-            setMessageKind("custom");
             return;
           }
           if (!botSide) {
@@ -3448,20 +5276,75 @@ function TradingApp() {
           }
           const botTakeProfit = numberFrom(botData.takeProfit ?? botData.take_profit ?? botData.tp);
           const botStopLoss = numberFrom(botData.stopLoss ?? botData.stop_loss ?? botData.sl);
-          const gridProtection = getGridProtectionForOrder(botSide, botEntry ?? activeCandle.close, botData.gridIndex);
+          const liveGridEntry = botEntry ?? activeCandle.close;
+          const gridIndexValue = numberFrom(botData.gridIndex);
+          const liveGridClientOrderId = isGridBotScript
+            ? makeGridClientOrderId(activePhemexSettings.symbol, botSide, liveGridEntry, gridIndexValue)
+            : undefined;
+          if (isGridBotScript && hasOpenGridLiveOrder(botSide, liveGridEntry, gridIndexValue, liveGridClientOrderId, botSettings.mode === "live")) {
+            setBotRuntimeInfo((current) => ({
+              ...current,
+              lastAction: "blockiert: Grid-Level offen",
+              lastPayload: {
+                ...botData,
+                blockedReason: "gridLevelAlreadyOpen",
+                clientOrderId: liveGridClientOrderId,
+                gridIndex: gridIndexValue,
+                entry: liveGridEntry
+              }
+            }));
+            return;
+          }
+          if (isGridBotScript && isGridLevelBlocked(activePhemexSettings.symbol, botSide, liveGridEntry, gridIndexValue, botSettings.mode === "live")) {
+            setBotRuntimeInfo((current) => ({
+              ...current,
+              lastAction: "blockiert: Grid-Level-Sperre aktiv",
+              lastPayload: {
+                ...botData,
+                blockedReason: "gridLevelSuppressed",
+                clientOrderId: liveGridClientOrderId,
+                gridIndex: gridIndexValue,
+                entry: liveGridEntry
+              }
+            }));
+            return;
+          }
+          if (isGridBotScript && isGridOrderSuppressed(liveGridClientOrderId)) {
+            setBotRuntimeInfo((current) => ({
+              ...current,
+              lastAction: "blockiert: Grid-Level-Sperre aktiv",
+              lastPayload: {
+                ...botData,
+                blockedReason: "gridLevelSuppressed",
+                clientOrderId: liveGridClientOrderId,
+                gridIndex: gridIndexValue,
+                entry: liveGridEntry
+              }
+            }));
+            return;
+          }
+          const gridProtection = getGridProtectionForOrder(botSide, liveGridEntry, gridIndexValue);
           await submitOrderRef.current(botSide, {
-            entry: botEntry,
+            entry: isGridBotScript ? liveGridEntry : botEntry,
             quantity: effectiveBotQuantity,
             takeProfit: gridProtection.takeProfit ?? botTakeProfit,
             stopLoss: gridProtection.stopLoss ?? botStopLoss,
-            allowMissingProtection: isGridBotScript && !GRID_BOT_STOP_LOSS_ENABLED
+            orderType: isGridBotScript ? appliedGridSettings.gridOrderType : undefined,
+            marginMode: isGridBotScript ? appliedGridSettings.gridMarginMode : undefined,
+            leverage: isGridBotScript ? Math.max(1, numberFrom(appliedGridSettings.gridLeverage) ?? 1) : undefined,
+            allowMissingProtection: isGridBotScript && !gridBotStopLossRequired,
+            clientOrderId: liveGridClientOrderId,
+            gridBot: isGridBotScript,
+            spotGrid: isGridBotScript && gridBotMarketType === "spot",
+            gridMarketType: isGridBotScript ? gridBotMarketType : undefined,
+            mechanic: isGridBotScript ? (gridBotMarketType === "spot" ? "spot_grid" : "grid_bot") : undefined,
+            gridIndex: gridIndexValue
           });
           botReplayQueueRef.current = [];
           return;
         }
       }
       if (result?.data && typeof result.data === "object" && createBotPaperOrder(result.data, activeCandle)) {
-        botReplayQueueRef.current = [];
         return;
       }
       if (result?.data?.action && result.data.action !== "hold") {
@@ -3495,18 +5378,18 @@ function TradingApp() {
     } finally {
       window.clearTimeout(timer);
       botTickInFlightRef.current = false;
-      if (source === "replay" && botReplayQueueRef.current.length && botEnabledRef.current) {
-        const nextQueuedCandle = botReplayQueueRef.current.shift();
-        if (nextQueuedCandle) {
+      if (source === "replay") {
+        const queuedCandle = botReplayQueueRef.current.shift();
+        botReplayQueueRef.current = [];
+        if (queuedCandle && botEnabledRef.current && replayGeneration === botReplayGenerationRef.current) {
           window.setTimeout(() => {
-            void sendBotTick("replay", nextQueuedCandle);
+            void sendBotTick("replay", queuedCandle);
           }, 0);
         }
       }
     }
   }, [
     activePhemexSettings.exchange,
-    activePhemexSettings.liveOrdersEnabled,
     activePhemexSettings.resolution,
     activePhemexSettings.symbol,
     allCandles,
@@ -3514,20 +5397,25 @@ function TradingApp() {
     effectiveBotOrderType,
     botSettings.script,
     botSettings.url,
-    botSettings.gridPriceFrom,
-    botSettings.gridPriceTo,
-    botSettings.gridStepPercent,
-    botSettings.gridTakeProfitPercent,
-    botSettings.gridStopLossPercent,
-    botSettings.gridDirection,
-    botSettings.gridCount,
-    botSettings.gridInvestment,
-    botSettings.gridAmountMode,
-    botSettings.gridAmountValue,
-    botSettings.gridLeverage,
+    appliedGridSettings.gridPriceFrom,
+    appliedGridSettings.gridPriceTo,
+    appliedGridSettings.gridStepPercent,
+    appliedGridSettings.gridTakeProfitPercent,
+    appliedGridSettings.gridStopLossPercent,
+    appliedGridSettings.gridDirection,
+    appliedGridSettings.gridCount,
+    appliedGridSettings.gridInvestment,
+    appliedGridSettings.gridAmountMode,
+    appliedGridSettings.gridAmountValue,
+    appliedGridSettings.gridLeverage,
+    appliedGridSettings.gridMarginMode,
+    appliedGridSettings.gridOrderType,
     createBotPaperOrder,
     futuresBalance,
     getGridProtectionForOrder,
+    hasOpenGridLiveOrder,
+    gridBotMarketType,
+    gridBotStopLossRequired,
     gridTriggerLines,
     isGridBotScript,
     isPhemexGridBotScript,
@@ -3540,30 +5428,105 @@ function TradingApp() {
   const stepForward = useCallback(() => {
     setVisibleCount((count) => {
       const next = Math.min(count + 1, allCandles.length);
+      visibleCountRef.current = next;
+      allCandlesLengthRef.current = allCandles.length;
       const nextCandle = allCandles[next - 1];
       if (nextCandle) {
-        const nextVisibleCandles = allCandles.slice(0, next);
-        const nextOrders = evaluateOrdersSinceOpened(ordersRef.current, nextVisibleCandles);
+        const nextOrders = evaluateOrdersForCandle(ordersRef.current, nextCandle);
         ordersRef.current = nextOrders;
         setOrders(nextOrders);
-        void sendBotTick("replay", nextCandle);
+        const now = Date.now();
+        if (isPrimaryInstanceRef.current && (now - lastReplayPositionWriteAtRef.current >= 90 || next >= allCandles.length)) {
+          lastReplayPositionWriteAtRef.current = now;
+          writeReplayStateNow({
+            visibleCount: next,
+            orders: nextOrders,
+            chartRange: makeReplayWindowRange(next)
+          });
+        }
+        void refreshBotOverlay(nextCandle);
+        void sendBotTick("replay", nextCandle, undefined, nextOrders);
       }
       return next;
     });
-  }, [allCandles, evaluateOrdersSinceOpened, sendBotTick]);
+  }, [allCandles, evaluateOrdersForCandle, makeReplayWindowRange, refreshBotOverlay, sendBotTick, writeReplayStateNow]);
+
+  useEffect(() => {
+    if (!isPlaying || !isPrimaryInstance) return;
+    if (visibleCountRef.current >= allCandlesLengthRef.current) {
+      setIsPlaying(false);
+      return;
+    }
+
+    let stopped = false;
+    let nextTickAt = window.performance.now() + speedMs;
+    let timer = 0;
+    const runTick = () => {
+      if (stopped) return;
+      if (visibleCountRef.current >= allCandlesLengthRef.current) {
+        setIsPlaying(false);
+        return;
+      }
+      stepForward();
+      nextTickAt += speedMs;
+      timer = window.setTimeout(runTick, Math.max(0, nextTickAt - window.performance.now()));
+    };
+    timer = window.setTimeout(runTick, speedMs);
+    return () => {
+      stopped = true;
+      window.clearTimeout(timer);
+    };
+  }, [isPlaying, isPrimaryInstance, speedMs, stepForward]);
+
+  const toggleReplayPlayback = useCallback(async () => {
+    if (!(await claimPrimaryInstance())) return;
+    const nextIsPlaying = !isPlaying;
+    if (!nextIsPlaying) {
+      botReplayGenerationRef.current += 1;
+      botReplayQueueRef.current = [];
+      lastBotReplayCandleTimeRef.current = null;
+      lastBotReplayCloseRef.current = null;
+    }
+    setIsPlaying(nextIsPlaying);
+    writeReplayStateNow({
+      isPlaying: nextIsPlaying
+    });
+  }, [claimPrimaryInstance, isPlaying, writeReplayStateNow]);
+
+  const changeReplaySpeed = useCallback((nextSpeedMs: number) => {
+    if (!Number.isFinite(nextSpeedMs) || nextSpeedMs <= 0) return;
+    void (async () => {
+      if (!(await claimPrimaryInstance())) return;
+      setSpeedMs(nextSpeedMs);
+      writeReplayStateNow({ speedMs: nextSpeedMs });
+    })();
+  }, [claimPrimaryInstance, writeReplayStateNow]);
+
+  const stepReplayOnce = useCallback(async () => {
+    if (!(await claimPrimaryInstance())) return;
+    stepForward();
+  }, [claimPrimaryInstance, stepForward]);
 
   const jumpReplayToCount = useCallback(
-    (nextCount: number) => {
+    async (nextCount: number) => {
+      if (!(await claimPrimaryInstance())) return;
       const maxCount = Math.max(1, allCandles.length);
       const next = Math.min(Math.max(1, Math.round(nextCount)), maxCount);
       const nextVisibleCandles = allCandles.slice(0, next);
       const nextOrders = evaluateOrdersSinceOpened(ordersRef.current, nextVisibleCandles);
+      botReplayGenerationRef.current += 1;
       botReplayQueueRef.current = [];
+      lastBotReplayCandleTimeRef.current = null;
+      lastBotReplayCloseRef.current = null;
       ordersRef.current = nextOrders;
       setOrders(nextOrders);
       setVisibleCount(next);
+      writeReplayStateNow({
+        visibleCount: next,
+        orders: nextOrders
+      });
     },
-    [allCandles, evaluateOrdersSinceOpened]
+    [allCandles, claimPrimaryInstance, evaluateOrdersSinceOpened, writeReplayStateNow]
   );
 
   const createOrder = (
@@ -3580,6 +5543,11 @@ function TradingApp() {
       quantity?: number;
       takeProfit?: number;
       stopLoss?: number;
+      spotGrid?: boolean;
+      gridBot?: boolean;
+      gridMarketType?: "spot" | "future";
+      mechanic?: "spot_grid" | "grid_bot" | string;
+      gridIndex?: number;
     }
   ) => {
     if (!lastCandle) return;
@@ -3613,7 +5581,12 @@ function TradingApp() {
       stopLoss: Number.isFinite(parsedSl) ? parsedSl : undefined,
       status: options?.status ?? "pending",
       openedAt: lastCandle.time,
-      openedIndex: allCandles.findIndex((candle) => candle.time === lastCandle.time)
+      openedIndex: allCandles.findIndex((candle) => candle.time === lastCandle.time),
+      spotGrid: options?.spotGrid,
+      gridBot: options?.gridBot,
+      gridMarketType: options?.gridMarketType,
+      mechanic: options?.mechanic,
+      gridIndex: options?.gridIndex
     };
 
     setOrders((current) => {
@@ -3721,6 +5694,17 @@ function TradingApp() {
     setBotSettings((current) => ({ ...current, [key]: value }));
   };
 
+  const commitBotGridSettings = useCallback((nextSettings: BotSettings) => {
+    setGridApplyConfirm(null);
+    setAppliedBotSettings(nextSettings);
+    setBotSettings(nextSettings);
+    writeSharedStateNow(botOptionsStorageKey, nextSettings);
+    setChartViewVersion((version) => version + 1);
+    setBotGridApplyState("applied");
+    setMessage(t.botGridApplied);
+    setMessageKind("custom");
+  }, [t.botGridApplied]);
+
   const applyBotGridSettings = () => {
     const priceFrom = numberFrom(botSettings.gridPriceFrom);
     const priceTo = numberFrom(botSettings.gridPriceTo);
@@ -3735,7 +5719,8 @@ function TradingApp() {
       (
         gridCount <= 1 ||
         gridAmountValue === undefined ||
-        gridAmountValue <= 0
+        gridAmountValue <= 0 ||
+        (draftGridBotStopLossRequired && (stopLossPercent === undefined || stopLossPercent <= 0))
       );
     const standardGridInvalid =
       !isPhemexGridBotScript &&
@@ -3772,15 +5757,22 @@ function TradingApp() {
       gridCount: String(gridCount || botSettings.gridCount),
       gridInvestment: String(gridInvestment ?? botSettings.gridInvestment),
       gridLeverage: botSettings.gridLeverage,
+      gridMarketType: draftGridBotMarketType,
+      gridMarginMode: botSettings.gridMarginMode,
+      gridOrderType: botSettings.gridOrderType,
+      gridStopLossEnabled: botSettings.gridStopLossEnabled,
       gridAmountMode: botSettings.gridAmountMode,
       gridAmountValue: String(gridAmountValue ?? botSettings.gridAmountValue)
     };
-    setBotSettings(nextSettings);
-    window.localStorage.setItem(botOptionsStorageKey, JSON.stringify(nextSettings));
-    setChartViewVersion((version) => version + 1);
-    setBotGridApplyState("applied");
-    setMessage(t.botGridApplied);
-    setMessageKind("custom");
+    if (isGridBotScript && nextSettings.mode === "live") {
+      setGridApplyConfirm({
+        settings: nextSettings,
+        title: t.botGridLiveConfirmTitle,
+        message: t.botGridLiveConfirm
+      });
+      return;
+    }
+    commitBotGridSettings(nextSettings);
   };
 
   const refreshBotProcessStatus = useCallback(async () => {
@@ -3804,6 +5796,10 @@ function TradingApp() {
 
   useEffect(() => {
     void refreshBotProcessStatus();
+    const timer = window.setInterval(() => {
+      void refreshBotProcessStatus();
+    }, 1000);
+    return () => window.clearInterval(timer);
   }, [refreshBotProcessStatus]);
 
   const refreshBotScripts = useCallback(async () => {
@@ -3811,9 +5807,15 @@ function TradingApp() {
       const response = await fetch("/api/bot-scripts");
       const result = await response.json();
       if (!response.ok || !result?.ok || !Array.isArray(result.scripts)) return;
-      const scripts = result.scripts.filter((script: unknown) => typeof script === "string");
+      const scripts = result.scripts
+        .filter((script: unknown) => typeof script === "string")
+        .map((script: string) => normalizeBotScriptName(script))
+        .filter((script: string, index: number, list: string[]) => list.indexOf(script) === index);
       setBotScripts(scripts.length ? scripts : ["long_bot.py"]);
-      setBotSettings((current) => scripts.includes(current.script) ? current : { ...current, script: scripts[0] || "long_bot.py" });
+      setBotSettings((current) => {
+        const normalizedScript = normalizeBotScriptName(current.script);
+        return scripts.includes(normalizedScript) ? { ...current, script: normalizedScript } : { ...current, script: scripts[0] || "long_bot.py" };
+      });
     } catch {
       setBotScripts((current) => current.length ? current : ["long_bot.py"]);
     }
@@ -3825,9 +5827,28 @@ function TradingApp() {
 
   const controlBotProcess = async (action: "start" | "stop" | "reload") => {
     if (action === "start" || action === "reload") {
+      gridReorderMonitorInFlightRef.current = false;
+      botRunGenerationRef.current += 1;
+      botReplayGenerationRef.current += 1;
+      botReplayQueueRef.current = [];
+      gridOrderSuppressionUntilRef.current.clear();
+      gridOrderLevelSuppressionRef.current.clear();
+      openGridLevelKeysFromExchangeRef.current = new Set();
+      lastBotReplayCandleTimeRef.current = null;
+      lastBotReplayCloseRef.current = null;
+      clearBotOverlay();
+      if (action === "start" && isGridBotScript && gridDraftDirty) {
+        botEnabledRef.current = false;
+        setBotGridApplyState("error");
+        setMessage("Gridbot blockiert: Bitte erst Grid-Einstellungen übernehmen.");
+        setMessageKind("custom");
+        return;
+      }
       if (action === "start" && botSettings.mode === "live" && !isPhemexGridBotScript && (!Number.isFinite(quantity) || quantity <= 0)) {
         botEnabledRef.current = false;
-        setBotSettings((current) => ({ ...current, enabled: false }));
+        const nextBotSettings = { ...botSettings, enabled: false };
+        setBotSettings(nextBotSettings);
+        writeSharedStateNow(botOptionsStorageKey, withAppliedGridSettings(nextBotSettings));
         showExchangeDebug("Live-Bot", t.botLiveMissingQuantity, {
           groesse: quantityInput,
           ordertyp: liveOrderType,
@@ -3838,11 +5859,25 @@ function TradingApp() {
         return;
       }
       botEnabledRef.current = true;
-      setBotSettings((current) => ({ ...current, enabled: true }));
+      const nextBotSettings = { ...botSettings, enabled: true };
+      setBotSettings(nextBotSettings);
+      writeSharedStateNow(botOptionsStorageKey, withAppliedGridSettings(nextBotSettings));
     }
     if (action === "stop") {
+      gridReorderMonitorInFlightRef.current = false;
+      botRunGenerationRef.current += 1;
+      botReplayGenerationRef.current += 1;
+      botReplayQueueRef.current = [];
+      gridOrderSuppressionUntilRef.current.clear();
+      gridOrderLevelSuppressionRef.current.clear();
+      openGridLevelKeysFromExchangeRef.current = new Set();
+      lastBotReplayCandleTimeRef.current = null;
+      lastBotReplayCloseRef.current = null;
+      clearBotOverlay();
       botEnabledRef.current = false;
-      setBotSettings((current) => ({ ...current, enabled: false }));
+      const nextBotSettings = { ...botSettings, enabled: false };
+      setBotSettings(nextBotSettings);
+      writeSharedStateNow(botOptionsStorageKey, withAppliedGridSettings(nextBotSettings));
       setBotRuntimeInfo((current) => ({ ...current, lastAction: "stopped" }));
     }
     try {
@@ -3863,8 +5898,13 @@ function TradingApp() {
       });
       setMessage(t.botProcessOk(action));
       setMessageKind("custom");
+      void refreshBotOverlay(undefined, true);
       if (result.url || result.script) {
-        setBotSettings((current) => ({ ...current, url: result.url || current.url, script: result.script || current.script }));
+        setBotSettings((current) => {
+          const nextBotSettings = { ...current, url: result.url || current.url, script: result.script || current.script };
+          writeSharedStateNow(botOptionsStorageKey, withAppliedGridSettings(nextBotSettings));
+          return nextBotSettings;
+        });
       }
     } catch (error) {
       const reason = error instanceof Error ? error.message : t.botProcessFailed;
@@ -3873,8 +5913,16 @@ function TradingApp() {
   };
 
   const pauseBotTicks = () => {
+    gridReorderMonitorInFlightRef.current = false;
+    botRunGenerationRef.current += 1;
     botEnabledRef.current = false;
-    setBotSettings((current) => ({ ...current, enabled: false }));
+    gridOrderSuppressionUntilRef.current.clear();
+    gridOrderLevelSuppressionRef.current.clear();
+    openGridLevelKeysFromExchangeRef.current = new Set();
+    clearBotOverlay();
+    const nextBotSettings = { ...botSettings, enabled: false };
+    setBotSettings(nextBotSettings);
+    writeSharedStateNow(botOptionsStorageKey, withAppliedGridSettings(nextBotSettings));
     setBotRuntimeInfo((current) => ({ ...current, lastAction: "paused" }));
     setMessage("Bot-Ticks pausiert.");
     setMessageKind("custom");
@@ -3918,18 +5966,21 @@ function TradingApp() {
             distancePercent: line.distancePercent
           })),
           gridSettings: {
-            priceFrom: numberFrom(botSettings.gridPriceFrom),
-            priceTo: numberFrom(botSettings.gridPriceTo),
-            stepPercent: numberFrom(botSettings.gridStepPercent),
-            takeProfitPercent: numberFrom(botSettings.gridTakeProfitPercent),
-            stopLossPercent: numberFrom(botSettings.gridStopLossPercent),
-            direction: botSettings.gridDirection,
-            gridCount: numberFrom(botSettings.gridCount),
-            investment: numberFrom(botSettings.gridInvestment),
-            amountMode: botSettings.gridAmountMode,
-            amountValue: numberFrom(botSettings.gridAmountValue),
-            quantity,
-            leverage: numberFrom(botSettings.gridLeverage)
+            priceFrom: numberFrom(appliedGridSettings.gridPriceFrom),
+            priceTo: numberFrom(appliedGridSettings.gridPriceTo),
+            stepPercent: numberFrom(appliedGridSettings.gridStepPercent),
+            takeProfitPercent: numberFrom(appliedGridSettings.gridTakeProfitPercent),
+            stopLossPercent: numberFrom(appliedGridSettings.gridStopLossPercent),
+            direction: appliedGridSettings.gridDirection,
+            gridCount: numberFrom(appliedGridSettings.gridCount),
+            investment: numberFrom(appliedGridSettings.gridInvestment),
+            amountMode: appliedGridSettings.gridAmountMode,
+            amountValue: numberFrom(appliedGridSettings.gridAmountValue),
+            marketType: gridBotMarketType,
+            marginMode: appliedGridSettings.gridMarginMode,
+            orderType: appliedGridSettings.gridOrderType,
+            stopLossEnabled: gridBotStopLossRequired,
+            leverage: numberFrom(appliedGridSettings.gridLeverage)
           },
           balance: futuresBalance,
           liveOrdersEnabled: false
@@ -4007,16 +6058,21 @@ function TradingApp() {
 
   const submitOrder = async (
     forcedSide?: Side,
-    forcedOptions?: { entry?: number; takeProfit?: number; stopLoss?: number; quantity?: number; allowMissingProtection?: boolean }
+    forcedOptions?: SubmitOrderOptions
   ) => {
     if (!lastCandle) return;
     const orderSide = forcedSide ?? side;
+    const submitOrderType = forcedOptions?.orderType ?? liveOrderType;
+    const submitMarginMode = forcedOptions?.marginMode ?? activePhemexSettings.marginMode;
+    const submitLeverage = Number.isFinite(forcedOptions?.leverage) && Number(forcedOptions?.leverage) > 0
+      ? Number(forcedOptions?.leverage)
+      : Number(activePhemexSettings.leverage || 1);
     const orderQuantity = Number.isFinite(forcedOptions?.quantity) && Number(forcedOptions?.quantity) > 0
       ? Number(forcedOptions?.quantity)
       : quantity;
     const parsedEntry = Number.isFinite(forcedOptions?.entry) && Number(forcedOptions?.entry) > 0
       ? Number(forcedOptions?.entry)
-      : isLiveRunning && liveOrderType === "market"
+      : submitOrderType === "market"
       ? liveLastPrice ?? lastCandle.close
       : entry ? Number(entry) : lastCandle.close;
     const liveSubmitRange = chartRef.current?.timeScale().getVisibleLogicalRange() ?? null;
@@ -4044,7 +6100,7 @@ function TradingApp() {
         showExchangeDebug("Live-Order blockiert", t.orderNeedsInput, {
           symbol: activePhemexSettings.symbol,
           groesse: forcedOptions?.quantity ?? quantityInput,
-          ordertyp: liveOrderType,
+          ordertyp: submitOrderType,
           entry: entry || formatPrice(parsedEntry),
           takeProfit: takeProfit || "-",
           stopLoss: stopLoss || "-"
@@ -4078,33 +6134,114 @@ function TradingApp() {
         }
         return;
       }
-      if (!activePhemexSettings.liveOrdersEnabled) {
-        const text = t.phemexLiveOrdersDisabled;
-        showExchangeDebug("Live-Order blockiert", text, {
-          liveRunning: isLiveRunning,
-          liveOrdersEnabled: activePhemexSettings.liveOrdersEnabled,
-          symbol: activePhemexSettings.symbol,
-          mode: activePhemexSettings.mode,
-          testnet: activePhemexSettings.testnet
-        });
-        return;
-      }
       liveOrderPlacementRef.current = { locked: true, startedAt: Date.now() };
-      try {
-        await syncPhemexOrderStatusThrottled(activePhemexSettings, true);
-        restoreLiveSubmitRange();
-      } catch (error) {
-        liveOrderPlacementRef.current = null;
-        const reason = error instanceof Error ? error.message : t.syncExchangeFailed;
-        showExchangeDebug("Live-Abgleich", reason, {
-          symbol: activePhemexSettings.symbol,
-          exchange: activePhemexSettings.exchange,
-          testnet: activePhemexSettings.testnet
-        });
-        return;
+      if (!forcedOptions?.fastGridSubmit) {
+        try {
+          await syncPhemexOrderStatusThrottled(activePhemexSettings, true);
+          restoreLiveSubmitRange();
+        } catch (error) {
+          liveOrderPlacementRef.current = null;
+          const reason = error instanceof Error ? error.message : t.syncExchangeFailed;
+          showExchangeDebug("Live-Abgleich", reason, {
+            symbol: activePhemexSettings.symbol,
+            exchange: activePhemexSettings.exchange,
+            testnet: activePhemexSettings.testnet
+          });
+          return;
+        }
       }
     }
-    const existingOpenOrder = ordersRef.current.find((order) => order.status === "pending" || order.status === "active");
+    const isGridSubmit = forcedOptions?.gridBot === true || forcedOptions?.spotGrid === true || forcedOptions?.mechanic === "grid_bot" || forcedOptions?.mechanic === "spot_grid";
+    const isFutureGridSubmit = isGridSubmit && (forcedOptions?.gridMarketType === "future" || gridBotMarketType === "future");
+    if (isFutureGridSubmit && orderSide === "sell") {
+      liveOrderPlacementRef.current = null;
+      setBotRuntimeInfo((current) => ({
+        ...current,
+        lastAction: "blockiert: Future-Grid erlaubt keine Short-Order",
+        lastPayload: {
+          blockedReason: "futureGridShortBlocked",
+          clientOrderId: forcedOptions?.clientOrderId,
+          gridIndex: forcedOptions?.gridIndex,
+          entry: parsedEntry
+        }
+      }));
+      setExchangeRequestState("idle");
+      return;
+    }
+    const gridLevelKey = isGridSubmit
+      ? resolveGridLevelKeyForQuery(orderSide, parsedEntry, forcedOptions?.gridIndex)
+      : undefined;
+    const isOpenOnExchangeGridLevel =
+      Boolean(gridLevelKey && openGridLevelKeysFromExchangeRef.current.has(gridLevelKey)) ||
+      Boolean(forcedOptions?.clientOrderId && openPhemexOrderKeysRef.current.has(forcedOptions.clientOrderId));
+    const isGridLevelAlreadyOpen = isGridSubmit && (
+      isLiveRunning && forcedOptions?.fastGridSubmit
+        ? isOpenOnExchangeGridLevel
+        : hasOpenGridLiveOrder(
+            orderSide,
+            parsedEntry,
+            forcedOptions?.gridIndex,
+            forcedOptions?.clientOrderId,
+            isLiveRunning,
+            true
+          )
+    );
+    if (isGridLevelAlreadyOpen) {
+      liveOrderPlacementRef.current = null;
+      setBotRuntimeInfo((current) => ({
+        ...current,
+        lastAction: "blockiert: Grid-Level offen",
+        lastPayload: {
+          blockedReason: "gridLevelAlreadyOpen",
+          clientOrderId: forcedOptions?.clientOrderId,
+          gridIndex: forcedOptions?.gridIndex,
+          entry: parsedEntry
+        }
+      }));
+      return;
+    }
+    if (isGridSubmit && isGridOrderSuppressed(forcedOptions?.clientOrderId)) {
+      liveOrderPlacementRef.current = null;
+      setBotRuntimeInfo((current) => ({
+        ...current,
+        lastAction: "blockiert: Grid-Level-Sperre aktiv",
+        lastPayload: {
+          blockedReason: "gridOrderSuppressed",
+          clientOrderId: forcedOptions?.clientOrderId,
+          gridIndex: forcedOptions?.gridIndex,
+          entry: parsedEntry
+        }
+      }));
+      return;
+    }
+    if (isGridSubmit && isGridLevelBlocked(activePhemexSettings.symbol, orderSide, parsedEntry, forcedOptions?.gridIndex, isLiveRunning)) {
+      liveOrderPlacementRef.current = null;
+      setBotRuntimeInfo((current) => ({
+        ...current,
+        lastAction: "blockiert: Grid-Level-Sperre aktiv",
+        lastPayload: {
+          blockedReason: "gridLevelSuppressed",
+          clientOrderId: forcedOptions?.clientOrderId,
+          gridIndex: forcedOptions?.gridIndex,
+          entry: parsedEntry
+        }
+      }));
+      return;
+    }
+    if (isGridSubmit && !isGridOrderSuppressed(forcedOptions?.clientOrderId)) {
+      suppressGridOrder(forcedOptions?.clientOrderId, GRID_ORDER_SUBMIT_GUARD_MS);
+      suppressGridLevel(
+        activePhemexSettings.symbol,
+        orderSide,
+        parsedEntry,
+        forcedOptions?.gridIndex,
+        GRID_ORDER_SUBMIT_GUARD_MS,
+        "inflight"
+      );
+    }
+    const existingOpenOrder = isGridSubmit
+      ? undefined
+      : ordersRef.current.find((order) => isOpenTradeOrder(order));
     if (existingOpenOrder) {
       liveOrderPlacementRef.current = null;
       const text = `Für ${activePhemexSettings.symbol} ist bereits eine offene Order vorhanden. Bitte erst Cancel oder Schließen verwenden.`;
@@ -4138,13 +6275,21 @@ function TradingApp() {
             side: orderSide,
             quantity: orderQuantity,
             price: parsedEntry,
-            orderType: liveOrderType,
+            orderType: submitOrderType,
+            marginMode: submitMarginMode,
+            leverage: submitLeverage,
             takeProfit: Number.isFinite(parsedTp) ? parsedTp : undefined,
             stopLoss: Number.isFinite(parsedSl) ? parsedSl : undefined,
             exchange: activePhemexSettings.exchange,
             testnet: activePhemexSettings.testnet,
-            liveOrdersEnabled: activePhemexSettings.liveOrdersEnabled,
-            allowMainnetOrders: activePhemexSettings.allowMainnetOrders
+            liveOrdersEnabled: true,
+            allowMainnetOrders: activePhemexSettings.allowMainnetOrders,
+            clientOrderId: forcedOptions?.clientOrderId,
+            gridBot: forcedOptions?.gridBot,
+            spotGrid: forcedOptions?.spotGrid,
+            gridMarketType: forcedOptions?.gridMarketType,
+            mechanic: forcedOptions?.mechanic,
+            gridIndex: forcedOptions?.gridIndex
           })
         });
         const result = await response.json();
@@ -4159,11 +6304,22 @@ function TradingApp() {
           externalId: result.orderID || result.clOrdID,
           phemexOrderId: result.orderID,
           phemexClOrdId: result.clOrdID,
-          status: liveOrderType === "market" ? "active" : "pending",
+          orderType: submitOrderType,
+          status: submitOrderType === "market" ? "active" : "pending",
           takeProfit: Number.isFinite(parsedTp) ? parsedTp : undefined,
           stopLoss: Number.isFinite(parsedSl) ? parsedSl : undefined,
-          quantity: orderQuantity
+          quantity: orderQuantity,
+          spotGrid: forcedOptions?.spotGrid,
+          gridBot: forcedOptions?.gridBot,
+          gridMarketType: forcedOptions?.gridMarketType,
+          mechanic: forcedOptions?.mechanic,
+          gridIndex: forcedOptions?.gridIndex
         });
+        if (forcedOptions?.fastGridSubmit) {
+          liveOrderPlacementRef.current = null;
+          setExchangeRequestState("idle");
+          return;
+        }
         restoreLiveSubmitRange();
         setMessage(t.phemexOrderPlaced(result.orderID || result.clOrdID || "OK"));
         setMessageKind("custom");
@@ -4205,6 +6361,63 @@ function TradingApp() {
       } catch (error) {
         liveOrderPlacementRef.current = null;
         const reason = error instanceof Error ? error.message : undefined;
+        if (isGridSubmit && forcedOptions?.fastGridSubmit) {
+          const isDuplicate = isGridDuplicateError(reason);
+          const isBusy = isDuplicate || String(reason || "").toLowerCase().includes("rate limit");
+          if (isDuplicate) {
+            suppressGridOrder(forcedOptions?.clientOrderId, GRID_ORDER_RETRY_GUARD_MS);
+            suppressGridLevel(
+              activePhemexSettings.symbol,
+              orderSide,
+              parsedEntry,
+              forcedOptions?.gridIndex,
+              GRID_ORDER_RETRY_GUARD_MS,
+              "duplicate"
+            );
+            await syncPhemexOrderStatusThrottled(activePhemexSettings, true).catch(() => undefined);
+            setBotRuntimeInfo((current) => ({
+              ...current,
+              lastAction: "übersprungen: Grid-Order existiert bereits",
+              lastPayload: {
+                blockedReason: "duplicateClientOrderId",
+                clientOrderId: forcedOptions.clientOrderId,
+                gridIndex: forcedOptions.gridIndex,
+                entry: parsedEntry
+              }
+            }));
+            setExchangeRequestState("idle");
+            return;
+          }
+          if (isBusy) {
+            suppressGridOrder(forcedOptions?.clientOrderId, GRID_ORDER_RETRY_GUARD_MS);
+            suppressGridLevel(
+              activePhemexSettings.symbol,
+              orderSide,
+              parsedEntry,
+              forcedOptions?.gridIndex,
+              GRID_ORDER_RETRY_GUARD_MS,
+              "duplicate"
+            );
+          }
+        }
+        if (isGridSubmit && forcedOptions?.fastGridSubmit) {
+          const lowerReason = String(reason || "").toLowerCase();
+          const shouldSkipPopup = lowerReason.includes("abort") || lowerReason.includes("timeout");
+          if (shouldSkipPopup) {
+            setBotRuntimeInfo((current) => ({
+              ...current,
+              lastAction: "Grid-Order nicht gesetzt (Netzwerkfehler)",
+              lastError: reason,
+              lastPayload: {
+                clientOrderId: forcedOptions?.clientOrderId,
+                gridIndex: forcedOptions?.gridIndex,
+                entry: parsedEntry
+              }
+            }));
+            setExchangeRequestState("error");
+            return;
+          }
+        }
         showExchangeDebug("Phemex Order", t.phemexOrderFailed(reason), {
           reason,
           symbol: activePhemexSettings.symbol,
@@ -4245,6 +6458,7 @@ function TradingApp() {
         [order.id, exchangeOrderId, order.phemexOrderId, order.phemexClOrdId, result.orderID, result.clOrdID]
           .filter(Boolean)
           .forEach((key) => canceledPhemexOrderKeysRef.current.add(String(key)));
+        clearGridSuppressionForOrder(order);
         setOrders((current) => {
           const nextOrders = order.status === "pending"
             ? current.filter((item) => item.id !== orderId)
@@ -4287,6 +6501,7 @@ function TradingApp() {
       ordersRef.current = nextOrders;
       return nextOrders;
     });
+    clearGridSuppressionForOrder(order);
     setMessage(t.orderCanceled(orderId));
   };
 
@@ -4309,7 +6524,8 @@ function TradingApp() {
             side: order.side,
             quantity: order.quantity,
             exchange: activePhemexSettings.exchange,
-            testnet: activePhemexSettings.testnet
+            testnet: activePhemexSettings.testnet,
+            liveOrdersEnabled: true
           })
         });
         const result = await response.json();
@@ -4327,6 +6543,7 @@ function TradingApp() {
               : item
           );
           ordersRef.current = nextOrders;
+          clearGridSuppressionForOrder(order);
           return nextOrders;
         });
         setMessage(`Position geschlossen: ${displayOrderId(order)}.`);
@@ -4365,6 +6582,7 @@ function TradingApp() {
           : item
       );
       ordersRef.current = nextOrders;
+      clearGridSuppressionForOrder(order);
       return nextOrders;
     });
     return true;
@@ -4492,6 +6710,9 @@ function TradingApp() {
       ordersRef.current = nextOrders;
       return nextOrders;
     });
+    if (order) {
+      clearGridSuppressionForOrder(order);
+    }
     setMessage(t.orderDeleted(orderId));
   };
 
@@ -4761,6 +6982,11 @@ function TradingApp() {
   const requestProtectionConfirm = (orderId: string) => {
     const order = ordersRef.current.find((item) => item.id === orderId);
     if (!order) return;
+    if (!isLiveRunning || !hasExchangeOrderReference(order)) {
+      delete protectionEditOriginalsRef.current[orderId];
+      setMessage(t.protectionUpdated(orderId));
+      return;
+    }
     const original = protectionEditOriginalsRef.current[orderId] ?? {
       entry: order.entry,
       takeProfit: order.takeProfit,
@@ -5162,7 +7388,7 @@ function TradingApp() {
       return;
     }
     setPhemexSettings((current) => ({ ...current, [key]: value }));
-    if (isLiveRunning && ["liveOrdersEnabled", "allowMainnetOrders", "testnet", "mode"].includes(String(key))) {
+    if (isLiveRunning && ["allowMainnetOrders", "testnet", "mode"].includes(String(key))) {
       setActivePhemexSettings((current) => ({ ...current, [key]: value }));
     }
   };
@@ -5170,7 +7396,8 @@ function TradingApp() {
   const jumpChartToLatest = useCallback((totalCandles?: number) => {
     const setLatestRange = () => {
       const timeScale = chartRef.current?.timeScale();
-      const lastLogical = Math.max(0, (totalCandles ?? visibleCount) - 1);
+      const renderedCount = Math.min(Math.max(1, totalCandles ?? visibleCandles.length), MAX_CHART_RENDER_CANDLES);
+      const lastLogical = Math.max(0, renderedCount - 1);
       timeScale?.scrollToRealTime();
       timeScale?.setVisibleLogicalRange({
         from: Math.max(0, lastLogical - 60) as Logical,
@@ -5186,7 +7413,7 @@ function TradingApp() {
     window.setTimeout(setLatestRange, 80);
     window.setTimeout(setLatestRange, 180);
     window.setTimeout(setLatestRange, 320);
-  }, [scheduleOverlayRefresh, visibleCount]);
+  }, [scheduleOverlayRefresh, visibleCandles.length]);
 
   const savePhemexSettingsPayload = async (settings: PhemexSettings) => {
     const response = await fetch("/api/phemex-settings", {
@@ -5261,6 +7488,7 @@ function TradingApp() {
     if (!livePosition) {
       let removedCount = 0;
       let closedCount = 0;
+      const removedOpenGridOrders: TradeOrder[] = [];
       const fallbackClosePrice = liveLastPrice ?? lastCandle?.close ?? visibleCandles.at(-1)?.close;
       const fallbackCloseTime = lastCandle?.time ?? visibleCandles.at(-1)?.time;
       setOrders((current) => {
@@ -5275,6 +7503,9 @@ function TradingApp() {
           if (isStillOpen) return [order];
           if (order.status === "pending") {
             removedCount += 1;
+            if (isGridTradeOrder(order)) {
+              removedOpenGridOrders.push(order);
+            }
             return [];
           }
           closedCount += 1;
@@ -5296,13 +7527,16 @@ function TradingApp() {
         ordersRef.current = nextOrders;
         return nextOrders;
       });
-      if (removedCount > 0 || closedCount > 0) {
+        if (removedCount > 0 || closedCount > 0) {
         const parts = [
           removedCount > 0 ? `${removedCount} extern gelöschte Phemex-Order entfernt` : "",
           closedCount > 0 ? `${closedCount} extern geschlossene Position übernommen` : ""
         ].filter(Boolean);
         setMessage(`${parts.join(", ")}.`);
         setMessageKind("custom");
+        for (const order of removedOpenGridOrders) {
+          clearGridSuppressionForOrder(order);
+        }
       }
       return false;
     }
@@ -5376,33 +7610,88 @@ function TradingApp() {
         const keys = [order.id, order.phemexOrderId, order.phemexClOrdId].filter(Boolean) as string[];
         return !keys.some((key) => canceledPhemexOrderKeysRef.current.has(key));
       }) as TradeOrder[];
+    const enrichedImportedOrders = importedOrders.map((order) => enrichGridMetaFromExchangeOrder(order));
+    const openGridLevelKeysFromExchange = new Set<string>();
+    for (const order of enrichedImportedOrders) {
+      if (!isGridTradeOrder(order)) continue;
+      const key = resolveGridLevelKeyForOrder(order);
+      if (key) openGridLevelKeysFromExchange.add(key);
+    }
+    openGridLevelKeysFromExchangeRef.current = openGridLevelKeysFromExchange;
     openPhemexOrderKeysRef.current = new Set(
       (result.rows as PhemexOpenOrderRow[])
         .filter((row) => !isPhemexProtectionOrderRow(row))
         .flatMap((row) => phemexOrderKeysFromRow(row))
     );
-    setOrders((current) => {
-      const openLocal = current.filter((order) => order.status === "pending" || order.status === "active");
-      const closedLocal = current.filter((order) => order.status !== "pending" && order.status !== "active");
-      const findLocalMatch = (imported: TradeOrder) => {
-        const importedKeys = new Set(orderKeys(imported));
-        return openLocal.find((order) => orderKeys(order).some((key) => importedKeys.has(key)));
-      };
-      const mergedImportedOrders = importedOrders.map((order) => mergeExchangeOrderWithLocal(order, findLocalMatch(order)));
-      const importedKeys = new Set(mergedImportedOrders.flatMap(orderKeys));
+      const removedOpenGridOrders: TradeOrder[] = [];
+      setOrders((current) => {
+        const openLocal = current.filter((order) => order.status === "pending" || order.status === "active");
+        const closedLocal = current.filter((order) => order.status !== "pending" && order.status !== "active");
+        const isExchangeTrackedGridOrder = (order: TradeOrder) => {
+          if (!isGridTradeOrder(order)) return true;
+          if (!isLiveRunning) return true;
+          const clientOrderId = makeGridClientOrderId(activePhemexSettings.symbol, order.side, order.entry, order.gridIndex);
+          const exchangeKeys = primaryOrderKeys(order);
+          const isOpenOnExchange = exchangeKeys.some((key) => openPhemexOrderKeysRef.current.has(key));
+          if (isOpenOnExchange) return true;
+          const orderLevelKey = resolveGridLevelKeyForOrder(order);
+          if (orderLevelKey && openGridLevelKeysFromExchange.has(orderLevelKey)) return true;
+          if (order.status === "pending" && isGridOrderSuppressed(clientOrderId)) return true;
+          return false;
+        };
+        const findLocalMatch = (imported: TradeOrder) => {
+          const importedKeys = new Set(orderKeys(imported));
+          const keyMatch = openLocal.find((order) => orderKeys(order).some((key) => importedKeys.has(key)));
+          if (keyMatch) return keyMatch;
+          if (isGridTradeOrder(imported)) {
+            const importedLevelKey = resolveGridLevelKeyForOrder(imported);
+            if (importedLevelKey) {
+              return openLocal.find((order) => resolveGridLevelKeyForOrder(order) === importedLevelKey);
+            }
+          }
+          return undefined;
+        };
+        const mergedImportedOrders = enrichedImportedOrders.map((order) => {
+          const match = findLocalMatch(order);
+          return mergeExchangeOrderWithLocal(order, match);
+        });
+        const importedKeys = new Set(mergedImportedOrders.flatMap(orderKeys));
       const keptLocal = openLocal.filter((order) => {
+        if (!isExchangeTrackedGridOrder(order)) {
+          if (isGridTradeOrder(order) && (order.status === "pending" || order.status === "active")) {
+            removedOpenGridOrders.push(order);
+          }
+          return false;
+        }
+        if (isGridTradeOrder(order)) {
+          const orderLevelKey = resolveGridLevelKeyForOrder(order);
+          if (orderLevelKey && openGridLevelKeysFromExchange.has(orderLevelKey)) return false;
+        }
         return !orderKeys(order).some((key) => importedKeys.has(key));
       });
       const nextOrders = [...mergedImportedOrders, ...keptLocal, ...closedLocal];
       ordersRef.current = nextOrders;
       return nextOrders;
     });
+    if (removedOpenGridOrders.length > 0) {
+      for (const order of removedOpenGridOrders) {
+        clearGridSuppressionForOrder(order);
+      }
+    }
     if (!silent) {
       setMessage(t.phemexOrdersSynced(importedOrders.length));
       setMessageKind("custom");
     }
     return importedOrders.length;
-  }, [activePhemexSettings, lastCandle?.time, t, visibleCandles]);
+  }, [
+    activePhemexSettings,
+    enrichGridMetaFromExchangeOrder,
+    isGridTradeOrder,
+    lastCandle?.time,
+    resolveGridLevelKeyForOrder,
+    t,
+    visibleCandles
+  ]);
 
   const syncPhemexOrderStatusThrottled = useCallback(async (settingsOverride?: PhemexSettings, force = false) => {
     const settings = settingsOverride ?? activePhemexSettings;
@@ -5413,6 +7702,249 @@ function TradingApp() {
     await syncPhemexOpenOrders(settings, true);
     await syncPhemexPositionStatus(settings);
   }, [activePhemexSettings, syncPhemexOpenOrders, syncPhemexPositionStatus]);
+  const runGridOrderReorderAudit = useCallback(async () => {
+    const blocked = (reason: string, payload?: Record<string, unknown>) => {
+      setBotRuntimeInfo((current) => ({
+        ...current,
+        lastAction: `Gridbot-Reorder blockiert: ${reason}`,
+        lastPayload: payload
+      }));
+    };
+    if (!isGridBotScript) {
+      blocked("kein Gridbot-Script");
+      return;
+    }
+    if (botSettings.mode !== "live") {
+      blocked("Bot-Modus ist nicht Live", { botMode: botSettings.mode });
+      return;
+    }
+    if (!isLiveRunning || activePhemexSettings.mode !== "live") {
+      blocked("Phemex Live-Modus laeuft nicht", {
+        isLiveRunning,
+        exchangeMode: activePhemexSettings.mode
+      });
+      return;
+    }
+    if (!botEnabledRef.current) {
+      blocked("Bot-Ticks sind nicht aktiv");
+      return;
+    }
+    if (gridReorderMonitorInFlightRef.current) {
+      blocked("Monitor laeuft bereits");
+      return;
+    }
+    if (liveOrderPlacementRef.current?.locked) {
+      if (Date.now() - liveOrderPlacementRef.current.startedAt < 15_000) return;
+      liveOrderPlacementRef.current = null;
+    }
+    if (!gridTriggerLines.length) {
+      blocked("keine Grid-Level berechnet", {
+        priceFrom: appliedGridSettings.gridPriceFrom,
+        priceTo: appliedGridSettings.gridPriceTo,
+        gridCount: appliedGridSettings.gridCount
+      });
+      return;
+    }
+    const now = Date.now();
+    if (now - lastGridReorderRunAtRef.current < GRID_ORDER_REORDER_INTERVAL_MS) return;
+
+    gridReorderMonitorInFlightRef.current = true;
+    lastGridReorderRunAtRef.current = now;
+    try {
+      const freshLivePrice = await refreshLivePhemexPriceRef.current(activePhemexSettings);
+      const livePrice = freshLivePrice ?? liveLastPrice ?? liveReferencePrice;
+      const normalizedLivePrice = Number(livePrice);
+      if (!Number.isFinite(normalizedLivePrice)) {
+        blocked("kein frischer Live-Preis");
+        return;
+      }
+
+      await syncPhemexOpenOrders(activePhemexSettings, true);
+
+      const requiredGridLines = gridTriggerLines
+        .filter((line) => Number.isFinite(line.price) && line.price > 0)
+        .filter((line) => isGridDirectionAllowed(line.side))
+        .filter((line) =>
+          line.side === "buy"
+            ? line.price < normalizedLivePrice
+            : line.side === "sell"
+              ? line.price > normalizedLivePrice
+              : false
+        )
+        .map((line) => ({
+          line,
+          distance: Math.abs(line.price - normalizedLivePrice)
+        }))
+        .sort((left, right) => left.distance - right.distance)
+        .map((entry) => entry.line);
+
+      if (!requiredGridLines.length) {
+        blocked("keine nachzukaufenden Levels im Preisbereich", {
+          livePrice: normalizedLivePrice,
+          gridLevels: gridTriggerLines.length
+        });
+        return;
+      }
+
+      const openGridLevelKeys = new Set(openGridLevelKeysFromExchangeRef.current);
+      const missingGridLines: typeof requiredGridLines = [];
+      const plannedLevelKeys = new Set<string>();
+
+      for (const line of requiredGridLines) {
+        const lineIndex = numberFrom(line.index);
+        if (lineIndex === undefined || !Number.isFinite(lineIndex)) continue;
+        const levelKey = makeGridLevelKey(line.side, Math.trunc(lineIndex));
+        if (plannedLevelKeys.has(levelKey)) continue;
+
+        if (openGridLevelKeys.has(levelKey)) continue;
+
+        const clientOrderId = makeGridClientOrderId(activePhemexSettings.symbol, line.side, line.price, line.index);
+        if (isGridOrderSuppressed(clientOrderId)) continue;
+        if (isGridLevelBlocked(activePhemexSettings.symbol, line.side, line.price, line.index, true)) continue;
+
+        missingGridLines.push(line);
+        plannedLevelKeys.add(levelKey);
+      }
+
+      const nextMissingLine = missingGridLines[0];
+      if (!nextMissingLine) {
+        blocked("alle benoetigten Levels sind laut Phemex belegt", {
+          required: requiredGridLines.length,
+          openOnExchange: openGridLevelKeys.size
+        });
+        return;
+      }
+
+      const lineIndex = numberFrom(nextMissingLine.index);
+      if (lineIndex === undefined || !Number.isFinite(lineIndex)) {
+        blocked("GridIndex ungueltig", { line: nextMissingLine });
+        return;
+      }
+      const truncatedLineIndex = Math.trunc(lineIndex);
+      const levelKey = makeGridLevelKey(nextMissingLine.side, truncatedLineIndex);
+      const baseClientOrderId = makeGridClientOrderId(activePhemexSettings.symbol, nextMissingLine.side, nextMissingLine.price, nextMissingLine.index);
+      if (isGridOrderSuppressed(baseClientOrderId)) {
+        blocked("ClientOrderId-Sperre aktiv", { clientOrderId: baseClientOrderId, levelKey });
+        return;
+      }
+      if (isGridLevelBlocked(activePhemexSettings.symbol, nextMissingLine.side, nextMissingLine.price, nextMissingLine.index, true)) {
+        blocked("Preislevel-Sperre aktiv", { levelKey, entry: nextMissingLine.price });
+        return;
+      }
+      if (openGridLevelKeys.has(levelKey)) {
+        blocked("Level laut Phemex offen", { levelKey, entry: nextMissingLine.price });
+        return;
+      }
+      if (nextMissingLine.side === "buy" && nextMissingLine.price >= normalizedLivePrice) {
+        blocked("Buy-Level liegt nicht unter aktuellem Preis", {
+          livePrice: normalizedLivePrice,
+          entry: nextMissingLine.price,
+          levelKey
+        });
+        return;
+      }
+
+      const quantity = getGridOrderQuantity(nextMissingLine.price);
+      if (typeof quantity !== "number" || !Number.isFinite(quantity) || quantity <= 0) {
+        blocked("Menge pro Grid ungueltig", {
+          amountMode: appliedGridSettings.gridAmountMode,
+          amountValue: appliedGridSettings.gridAmountValue,
+          entry: nextMissingLine.price
+        });
+        return;
+      }
+
+      const reorderNonce = Date.now().toString(36).slice(-4);
+      const clientOrderId = makeGridClientOrderId(
+        activePhemexSettings.symbol,
+        nextMissingLine.side,
+        nextMissingLine.price,
+        nextMissingLine.index,
+        reorderNonce
+      );
+      const gridProtection = getGridProtectionForOrder(nextMissingLine.side, nextMissingLine.price, nextMissingLine.index);
+      await submitOrderRef.current(nextMissingLine.side, {
+        entry: nextMissingLine.price,
+        quantity,
+        takeProfit: gridProtection.takeProfit,
+        stopLoss: gridProtection.stopLoss,
+        orderType: appliedGridSettings.gridOrderType,
+        marginMode: appliedGridSettings.gridMarginMode,
+        leverage: Math.max(1, numberFrom(appliedGridSettings.gridLeverage) ?? 1),
+        allowMissingProtection: !gridBotStopLossRequired,
+        clientOrderId,
+        fastGridSubmit: true,
+        gridBot: true,
+        spotGrid: gridBotMarketType === "spot",
+        gridMarketType: gridBotMarketType,
+        mechanic: gridBotMarketType === "spot" ? "spot_grid" : "grid_bot",
+        gridIndex: nextMissingLine.index
+      });
+
+      openGridLevelKeys.add(levelKey);
+
+      setBotRuntimeInfo((current) => ({
+        ...current,
+        lastAction: "Gridbot-Reorder: 1 fehlendes Level nachgesetzt",
+        lastPayload: {
+          side: "both",
+          count: 1,
+          lines: [{ side: nextMissingLine.side, gridIndex: nextMissingLine.index, entry: nextMissingLine.price }]
+        }
+      }));
+    } catch (error) {
+      setBotRuntimeInfo((current) => ({
+        ...current,
+        lastAction: "Gridbot-Reorder fehlgeschlagen",
+        lastError: error instanceof Error ? error.message : String(error ?? "")
+      }));
+    } finally {
+      gridReorderMonitorInFlightRef.current = false;
+    }
+  }, [
+    activePhemexSettings,
+    botSettings.mode,
+    getGridOrderQuantity,
+    getGridProtectionForOrder,
+    gridBotMarketType,
+    gridBotStopLossRequired,
+    gridReorderMonitorInFlightRef,
+    gridTriggerLines,
+    isGridBotScript,
+    isGridDirectionAllowed,
+    isGridLevelBlocked,
+    isGridOrderSuppressed,
+    isLiveRunning,
+    liveLastPrice,
+    liveReferencePrice,
+    appliedGridSettings.gridLeverage,
+    appliedGridSettings.gridMarginMode,
+    appliedGridSettings.gridOrderType
+  ]);
+
+  useEffect(() => {
+    if (!botSettings.enabled) {
+      gridReorderMonitorInFlightRef.current = false;
+      return;
+    }
+    if (!isLiveRunning || activePhemexSettings.mode !== "live" || botSettings.mode !== "live" || !isGridBotScript) {
+      return;
+    }
+
+    lastGridReorderRunAtRef.current = 0;
+    void runGridOrderReorderAudit();
+    const timer = window.setInterval(() => {
+      void runGridOrderReorderAudit();
+    }, GRID_ORDER_REORDER_INTERVAL_MS);
+    return () => window.clearInterval(timer);
+  }, [
+    activePhemexSettings.mode,
+    botSettings.enabled,
+    botSettings.mode,
+    isGridBotScript,
+    isLiveRunning,
+    runGridOrderReorderAudit
+  ]);
 
   const syncPhemexExchangeState = useCallback(async (settingsOverride?: PhemexSettings) => {
     const settings = settingsOverride ?? (isLiveRunning ? activePhemexSettings : phemexSettings);
@@ -5559,6 +8091,7 @@ function TradingApp() {
   };
 
   const stopLiveMode = () => {
+    gridReorderMonitorInFlightRef.current = false;
     setIsLiveRunning(false);
     setLiveNextFetchAt(null);
     setLiveCountdownSeconds(null);
@@ -5736,6 +8269,7 @@ function TradingApp() {
       await closeLivePositionOnProtectionHit(price, botCandle?.time);
       await sendBotTick("live", botCandle, price);
       setExchangeRequestState("idle");
+      return price;
     } catch {
       const status = typeof failureDetails === "object" && failureDetails && "status" in failureDetails ? Number((failureDetails as { status?: unknown }).status) : undefined;
       const isBlocked = status === 403 || status === 429;
@@ -5751,6 +8285,7 @@ function TradingApp() {
         setMessageKind("custom");
       }
       setExchangeRequestState("error");
+      return undefined;
     }
   }, [
     activePhemexSettings,
@@ -5781,6 +8316,13 @@ function TradingApp() {
   }, [activePhemexSettings, isLiveRunning, liveSettingsVersion]);
 
   useEffect(() => {
+    const timer = window.setInterval(() => {
+      cleanupGridLevelLocks();
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [cleanupGridLevelLocks]);
+
+  useEffect(() => {
     if (!liveNextFetchAt || !showLiveStatus) {
       setLiveCountdownSeconds(null);
       return;
@@ -5806,18 +8348,42 @@ function TradingApp() {
     setMessage(t.themeReset);
   };
 
-  const handleCsv = (file?: File | null) => {
+  const handleCsv = async (file?: File | null) => {
     if (!file) return;
+    if (!(await claimPrimaryInstance())) return;
     parseCsvCandles(
       file,
       (candles) => {
+        const nextVisibleCount = Math.min(60, candles.length);
         setAllCandles(candles);
-        setVisibleCount(Math.min(60, candles.length));
+        setVisibleCount(nextVisibleCount);
         shouldFitContentRef.current = true;
         shouldFitPriceRef.current = true;
+        botReplayGenerationRef.current += 1;
+        botReplayQueueRef.current = [];
+        lastBotReplayCandleTimeRef.current = null;
+        lastBotReplayCloseRef.current = null;
+        clearBotOverlay();
         ordersRef.current = [];
         setOrders([]);
         setIsPlaying(false);
+        writeSharedStateNow(pendingOrdersStorageKey, []);
+        scheduleStorageWrite(replaySessionStorageKey, {
+          visibleCount: nextVisibleCount,
+          isPlaying: false,
+          speedMs,
+          savedAt: Date.now()
+        });
+        writeReplayStateNow({
+          allCandles: candles,
+          visibleCount: nextVisibleCount,
+          isPlaying: false,
+          speedMs,
+          orders: [],
+          chartRange: makeReplayWindowRange(nextVisibleCount),
+          message: t.candlesLoaded(candles.length),
+          messageKind: "custom"
+        });
         setMessage(t.candlesLoaded(candles.length));
       },
       () => setMessage(t.csvInvalid)
@@ -5874,13 +8440,48 @@ function TradingApp() {
     }
   };
 
-  const resetReplay = () => {
-    setVisibleCount(Math.min(4, allCandles.length));
+  const resetReplay = async () => {
+    if (!(await claimPrimaryInstance())) return;
+    const nextVisibleCount = Math.min(4, allCandles.length);
+    botReplayGenerationRef.current += 1;
+    botReplayQueueRef.current = [];
+    lastBotReplayCandleTimeRef.current = null;
+    lastBotReplayCloseRef.current = null;
+    clearBotOverlay();
+    setVisibleCount(nextVisibleCount);
     shouldFitContentRef.current = true;
     shouldFitPriceRef.current = true;
     setIsPlaying(false);
     ordersRef.current = [];
     setOrders([]);
+    writeSharedStateNow(pendingOrdersStorageKey, []);
+    scheduleStorageWrite(replaySessionStorageKey, {
+      visibleCount: nextVisibleCount,
+      isPlaying: false,
+      speedMs,
+      savedAt: Date.now()
+    });
+    writeReplayStateNow({
+      allCandles,
+      visibleCount: nextVisibleCount,
+      isPlaying: false,
+      speedMs,
+      orders: [],
+      chartRange: makeReplayWindowRange(nextVisibleCount),
+      message: t.replayReset,
+      messageKind: "custom"
+    });
+    window.requestAnimationFrame(() => {
+      const range = chartRef.current?.timeScale().getVisibleLogicalRange();
+      if (!range) return;
+      scheduleStorageWrite(chartViewStorageKey, {
+        range: {
+          from: Number(range.from),
+          to: Number(range.to)
+        },
+        savedAt: Date.now()
+      });
+    });
     setMessage(t.replayReset);
   };
 
@@ -5949,7 +8550,7 @@ function TradingApp() {
               <label className="file-button">
                 <FileUp size={18} />
                 {t.csvLoad}
-                <input type="file" accept=".csv,text/csv" onChange={(event) => handleCsv(event.target.files?.[0])} />
+                <input type="file" accept=".csv,text/csv" onChange={(event) => { void handleCsv(event.target.files?.[0]); }} />
               </label>
             </>
           )}
@@ -5979,6 +8580,23 @@ function TradingApp() {
             <div className="confirm-actions">
               <button className="small" onClick={() => setOrderbookConfirm(null)}>Abbrechen</button>
               <button className="small danger" onClick={confirmClearOrderbook}>Orderbook leeren</button>
+            </div>
+          </div>
+        </div>
+      )}
+      {gridApplyConfirm && (
+        <div className="exchange-debug-backdrop" onClick={() => setGridApplyConfirm(null)}>
+          <div className="exchange-debug-popup" onClick={(event) => event.stopPropagation()}>
+            <div className="exchange-debug-title">
+              <strong>{gridApplyConfirm.title}</strong>
+              <button className="small" onClick={() => setGridApplyConfirm(null)}>×</button>
+            </div>
+            <p>{gridApplyConfirm.message}</p>
+            <div className="confirm-actions">
+              <button className="small" onClick={() => setGridApplyConfirm(null)}>Abbrechen</button>
+              <button className="small danger" onClick={() => commitBotGridSettings(gridApplyConfirm.settings)}>
+                {t.botGridLiveConfirmAction}
+              </button>
             </div>
           </div>
         </div>
@@ -6433,12 +9051,12 @@ function TradingApp() {
               </div>
               </React.Fragment>
             ))}
-            {orderLineLabels.map(({ order, field, y, price, x }) => (
-              <React.Fragment key={`${order.id}-${field}`}>
+            {orderLineLabels.map(({ id, field, label, y, price, x, locked }) => (
+              <React.Fragment key={`${id}-${field}`}>
                 {x === undefined && <div className={`order-label-connector ${field}`} style={{ top: y }} />}
-                <div className={`order-line-label ${field}`} style={{ top: y, left: x, right: x === undefined ? undefined : "auto" }}>
+                <div className={`order-line-label ${field} ${locked ? "locked" : ""}`} style={{ top: y, left: x, right: x === undefined ? undefined : "auto" }}>
                   <span>
-                    {field === "entry" ? "ENTRY" : field === "takeProfit" ? "TP" : "SL"}
+                    {label}
                   </span>
                   <strong>{formatPrice(price)}</strong>
                 </div>
@@ -6608,17 +9226,6 @@ function TradingApp() {
                         <small>{botSettings.mode === "live" ? t.botModeLive : botSettings.mode === "paper" ? t.botModePaper : t.botModeSignals}</small>
                       </span>
                     </label>
-                    <label className={phemexSettings.liveOrdersEnabled ? "checkbox-row warning" : "checkbox-row"}>
-                      <input
-                        type="checkbox"
-                        checked={phemexSettings.liveOrdersEnabled}
-                        onChange={(event) => updatePhemexSetting("liveOrdersEnabled", event.target.checked)}
-                      />
-                      <span>
-                        <strong>{t.liveOrders}</strong>
-                        <small>{t.liveOrdersHint}</small>
-                      </span>
-                    </label>
                     <div className="api-settings-grid">
                       <label>
                         {t.botUrl}
@@ -6634,7 +9241,6 @@ function TradingApp() {
                           value={botSettings.mode}
                           onChange={(event) => updateBotSetting("mode", event.target.value as BotSettings["mode"])}
                         >
-                          <option value="signals">{t.botModeSignals}</option>
                           <option value="paper">{t.botModePaper}</option>
                           <option value="live">{t.botModeLive}</option>
                         </select>
@@ -6646,7 +9252,7 @@ function TradingApp() {
                           onChange={(event) => updateBotSetting("script", event.target.value)}
                         >
                           {botScripts.map((script) => (
-                            <option key={script} value={script}>{script}</option>
+                            <option key={script} value={script}>{botScriptLabel(script)}</option>
                           ))}
                         </select>
                       </label>
@@ -6666,37 +9272,46 @@ function TradingApp() {
                           </span>
                         </label>
                         <div className="api-settings-grid">
-                          {!isPhemexGridBotScript && (
+                          <label>
+                            {t.botGridMarketType}
+                            <select
+                              value={botSettings.gridMarketType}
+                              onChange={(event) => updateBotSetting("gridMarketType", event.target.value as BotSettings["gridMarketType"])}
+                            >
+                              <option value="spot">{t.botGridMarketSpot}</option>
+                              <option value="future">{t.botGridMarketFuture}</option>
+                            </select>
+                          </label>
+                          {botSettings.gridMarketType === "future" && (
                             <label>
-                              {t.botGridDirection}
+                              {t.botGridMarginMode}
                               <select
-                                value={botSettings.gridDirection}
-                                onChange={(event) => updateBotSetting("gridDirection", event.target.value as BotSettings["gridDirection"])}
+                                value={botSettings.gridMarginMode}
+                                onChange={(event) => updateBotSetting("gridMarginMode", event.target.value as BotSettings["gridMarginMode"])}
                               >
-                                <option value="long">{t.botGridDirectionLong}</option>
-                                <option value="short">{t.botGridDirectionShort}</option>
-                                <option value="neutral">{t.botGridDirectionNeutral}</option>
+                                <option value="cross">{t.cross}</option>
+                                <option value="isolated">{t.isolated}</option>
                               </select>
                             </label>
                           )}
-                          {isPhemexGridBotScript ? (
+                          <label>
+                            {t.botGridOrderType}
+                            <select
+                              value={botSettings.gridOrderType}
+                              onChange={(event) => updateBotSetting("gridOrderType", event.target.value as BotSettings["gridOrderType"])}
+                            >
+                              <option value="limit">{t.limitOrder}</option>
+                              <option value="market">{t.marketOrder}</option>
+                            </select>
+                          </label>
+                          {isPhemexGridBotScript && botSettings.gridMarketType === "future" && (
                             <label>
-                              {t.botGridCount}
-                              <input
-                                inputMode="numeric"
-                                value={botSettings.gridCount}
-                                onChange={(event) => updateBotSetting("gridCount", event.target.value.replace(",", "."))}
-                                placeholder="500"
-                              />
-                            </label>
-                          ) : (
-                            <label>
-                              {t.botGridStepPercent}
+                              {t.botGridLeverage}
                               <input
                                 inputMode="decimal"
-                                value={botSettings.gridStepPercent}
-                                onChange={(event) => updateBotSetting("gridStepPercent", event.target.value.replace(",", "."))}
-                                placeholder="1"
+                                value={botSettings.gridLeverage}
+                                onChange={(event) => updateBotSetting("gridLeverage", event.target.value.replace(",", "."))}
+                                placeholder="10"
                               />
                             </label>
                           )}
@@ -6719,6 +9334,38 @@ function TradingApp() {
                             />
                           </label>
                           {isPhemexGridBotScript ? (
+                            <label>
+                              {t.botGridCount}
+                              <input
+                                inputMode="numeric"
+                                value={botSettings.gridCount}
+                                onChange={(event) => updateBotSetting("gridCount", event.target.value.replace(",", "."))}
+                                placeholder="500"
+                              />
+                            </label>
+                          ) : (
+                            <label>
+                              {t.botGridStepPercent}
+                              <input
+                                inputMode="decimal"
+                                value={botSettings.gridStepPercent}
+                                onChange={(event) => updateBotSetting("gridStepPercent", event.target.value.replace(",", "."))}
+                                placeholder="1"
+                              />
+                            </label>
+                          )}
+                          {isPhemexGridBotScript && (
+                            <label>
+                              {t.botGridAmountValue}
+                              <input
+                                inputMode="decimal"
+                                value={botSettings.gridAmountValue}
+                                onChange={(event) => updateBotSetting("gridAmountValue", event.target.value.replace(",", "."))}
+                                placeholder={botSettings.gridAmountMode === "asset" ? "0.1" : "10"}
+                              />
+                            </label>
+                          )}
+                          {isPhemexGridBotScript ? (
                             <>
                               <label>
                                 {t.botGridAmountMode}
@@ -6730,15 +9377,31 @@ function TradingApp() {
                                   <option value="usdt">{t.botGridAmountModeUsdt}</option>
                                 </select>
                               </label>
-                              <label>
-                                {t.botGridAmountValue}
-                                <input
-                                  inputMode="decimal"
-                                  value={botSettings.gridAmountValue}
-                                  onChange={(event) => updateBotSetting("gridAmountValue", event.target.value.replace(",", "."))}
-                                  placeholder={botSettings.gridAmountMode === "asset" ? "0.1" : "10"}
-                                />
-                              </label>
+                              {botSettings.gridMarketType === "future" && (
+                                <>
+                                  <label>
+                                    {t.botGridStopLossConfig}
+                                    <select
+                                      value={botSettings.gridStopLossEnabled ? "enabled" : "disabled"}
+                                      onChange={(event) => updateBotSetting("gridStopLossEnabled", event.target.value === "enabled")}
+                                    >
+                                      <option value="disabled">{t.botGridNoStopLoss}</option>
+                                      <option value="enabled">{t.botGridStopLossEnabled}</option>
+                                    </select>
+                                  </label>
+                                  {botSettings.gridStopLossEnabled && (
+                                    <label>
+                                      {t.botGridStopLossPercent}
+                                      <input
+                                        inputMode="decimal"
+                                        value={botSettings.gridStopLossPercent}
+                                        onChange={(event) => updateBotSetting("gridStopLossPercent", event.target.value.replace(",", "."))}
+                                        placeholder="0.98"
+                                      />
+                                    </label>
+                                  )}
+                                </>
+                              )}
                             </>
                           ) : (
                             <div className="bot-grid-risk-row">
@@ -6772,6 +9435,18 @@ function TradingApp() {
                             <div>
                               <span>{t.botGridAmountPerGrid}</span>
                               <strong>{phemexGridPreview.amountPerGrid}</strong>
+                            </div>
+                            <div>
+                              <span>{t.botGridTotalAmount}</span>
+                              <strong>{phemexGridPreview.totalAmount}</strong>
+                            </div>
+                            <div>
+                              <span>{t.botGridPositionValue}</span>
+                              <strong>{phemexGridPreview.positionValue}</strong>
+                            </div>
+                            <div>
+                              <span>{t.botGridRequiredCapital}</span>
+                              <strong>{phemexGridPreview.requiredCapital}</strong>
                             </div>
                             <div>
                               <span>{t.botGridEstimatedLiquidation}</span>
@@ -6813,7 +9488,7 @@ function TradingApp() {
                     </div>
                     <div className="bot-path-box">
                       <span>{t.botFolderPath}</span>
-                      <code>C:\Users\TV\Documents\MCM_TradingView\bot_bridge</code>
+                      <code>C:\Users\TV\Documents\CHART_REPLAY_TOOL\bot_bridge</code>
                     </div>
                   </div>
                 )}
@@ -7071,11 +9746,11 @@ function TradingApp() {
           </div>
           {!showLiveStatus && (
             <div className="replay-controls">
-              <button type="button" onClick={() => setIsPlaying((value) => !value)}>
+              <button type="button" onClick={toggleReplayPlayback}>
                 {isPlaying ? <Pause size={18} /> : <Play size={18} />}
                 {isPlaying ? t.pause : t.play}
               </button>
-              <button type="button" onClick={stepForward} disabled={visibleCount >= allCandles.length}>
+              <button type="button" onClick={stepReplayOnce} disabled={visibleCount >= allCandles.length}>
                 <SkipForward size={18} />
                 {t.step}
               </button>
@@ -7087,20 +9762,25 @@ function TradingApp() {
                   max={Math.max(1, allCandles.length)}
                   step="1"
                   value={Math.min(visibleCount, Math.max(1, allCandles.length))}
-                  onChange={(event) => jumpReplayToCount(Number(event.target.value))}
+                  onChange={(event) => { void jumpReplayToCount(Number(event.target.value)); }}
                 />
               </label>
               <label className="replay-speed">
                 {t.replayDelay}
-                <select value={speedMs} onChange={(event) => setSpeedMs(Number(event.target.value))}>
+                <select
+                  value={String(speedMs)}
+                  onChange={(event) => {
+                    changeReplaySpeed(Number(event.currentTarget.value));
+                  }}
+                >
                   {[10, 50, 100, 200].map((value) => (
-                    <option key={value} value={value}>
+                    <option key={value} value={String(value)}>
                       {value} ms
                     </option>
                   ))}
                 </select>
               </label>
-              <button type="button" onClick={resetReplay}>
+              <button type="button" onClick={() => { void resetReplay(); }}>
                 <RotateCcw size={18} />
                 {t.reset}
               </button>
@@ -7136,8 +9816,7 @@ function TradingApp() {
         </div>
 
         <aside className="side-panel">
-          {showLiveStatus ? (
-            <div className="panel-block live-order-panel">
+          <div className="panel-block live-order-panel">
               <div className="live-order-top">
                 <div className="live-order-switch">
                   <button
@@ -7302,38 +9981,6 @@ function TradingApp() {
                 </button>
               </div>
             </div>
-          ) : (
-            <div className="panel-block">
-              <div className="panel-title">
-                <Send size={18} />
-                {t.order}
-              </div>
-              <div className="segmented">
-                <button type="button" className={side === "buy" ? "active buy" : ""} onClick={() => setSide("buy")}>Buy</button>
-                <button type="button" className={side === "sell" ? "active sell" : ""} onClick={() => setSide("sell")}>Sell</button>
-              </div>
-              <label>
-                {t.quantity}
-                <input type="text" inputMode="decimal" value={quantityInput} onChange={(event) => updateLiveQuantity(event.target.value)} />
-              </label>
-              <label>
-                Entry
-                <input type="number" placeholder={`${t.marketOrder} ${formatPrice(lastCandle?.close)}`} value={entry} onChange={(event) => setEntry(event.target.value)} />
-              </label>
-              <label>
-                {t.takeProfit}
-                <input type="number" value={takeProfit} onChange={(event) => setTakeProfit(event.target.value)} />
-              </label>
-              <label>
-                {t.stopLoss}
-                <input type="number" value={stopLoss} onChange={(event) => setStopLoss(event.target.value)} />
-              </label>
-              <button type="button" className="submit" onClick={() => submitOrder()}>
-                <Send size={18} />
-                {t.submitOrder}
-              </button>
-            </div>
-          )}
 
           <div className="panel-block orderbook">
             <div className="panel-title">
@@ -7344,27 +9991,29 @@ function TradingApp() {
               </button>
             </div>
             <div className="book-list">
-              {openOrders.length === 0 && <span className="empty">{t.noOpenOrders}</span>}
-              {openOrders.map((order) => (
-                <div className={`book-row ${order.status}-order`} key={order.id}>
+              {!latestOpenOrder && <span className="empty">{t.noOpenOrders}</span>}
+              {latestOpenOrder && (
+                <div className={`book-row ${latestOpenOrder.status}-order`} key={latestOpenOrder.id}>
                   <div className="book-row-top">
-                    <span className={`book-side ${order.side}`}>{order.side.toUpperCase()}</span>
-                    <span className="book-meta">{orderExchangeLabel(order)}</span>
-                    <span className="book-meta">{orderTypeLabel(order)}</span>
-                    <strong className="book-price">{formatPrice(order.entry)}</strong>
+                    <span className={`book-side ${latestOpenOrder.side}`}>{latestOpenOrder.side.toUpperCase()}</span>
+                    <span className="book-meta">{orderExchangeLabel(latestOpenOrder)}</span>
+                    <span className="book-meta">{orderTypeLabel(latestOpenOrder)}</span>
+                    <strong className="book-price">{formatPrice(latestOpenOrder.entry)}</strong>
                   </div>
-                  <strong className="book-order-id" title={displayOrderId(order)}>{displayOrderId(order)}</strong>
+                  <strong className="book-order-id" title={displayOrderId(latestOpenOrder)}>{displayOrderId(latestOpenOrder)}</strong>
                   <div className="book-row-bottom">
-                    <span className={`status-badge ${order.status}`}>
-                      {order.status === "active" ? t.active : t.pending}
+                    <span className={`status-badge ${latestOpenOrder.status}`}>
+                      {latestOpenOrder.status === "active" ? t.active : t.pending}
                     </span>
-                    <span className="book-protection">
-                      <span className="table-price-tp">TP {formatPrice(order.takeProfit)}</span>
-                      <span className="table-price-sl">SL {formatPrice(order.stopLoss)}</span>
-                    </span>
+                    {latestOpenOrder.status === "active" && (
+                      <span className="book-protection">
+                        <span className="table-price-tp">TP {formatPrice(latestOpenOrder.takeProfit)}</span>
+                        <span className="table-price-sl">SL {formatPrice(latestOpenOrder.stopLoss)}</span>
+                      </span>
+                    )}
                   </div>
                 </div>
-              ))}
+              )}
             </div>
           </div>
         </aside>
@@ -7567,8 +10216,8 @@ function TradingApp() {
                 <em>{t.grossPnl} {realizedPnl.toFixed(4)} | {t.brokerFees} {realizedFees.toFixed(4)} USDT</em>
               </div>
               <div className="overview-card">
-                <span>{t.orderCount}</span>
-                <strong>{trackedOrders.length}</strong>
+                <span>Geschlossene Trades</span>
+                <strong>{closedOrders.length}</strong>
                 <em>TP {tpOrderCount} | SL {slOrderCount}</em>
               </div>
             </div>
@@ -7597,5 +10246,8 @@ function TradingApp() {
   );
 }
 
-createRoot(document.getElementById("root")!).render(<TradingApp />);
+const rootElement = document.getElementById("root")!;
+const rootStore = window as typeof window & { __chartReplayRoot?: ReturnType<typeof createRoot> };
+rootStore.__chartReplayRoot ??= createRoot(rootElement);
+rootStore.__chartReplayRoot.render(<TradingApp />);
 

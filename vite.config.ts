@@ -10,9 +10,15 @@ const phemexChartDir = resolve(process.cwd(), "chart_data", "phemex_chart");
 const binanceChartDir = resolve(process.cwd(), "chart_data", "binance_chart");
 const coinListPath = resolve(process.cwd(), "coin_liste.txt");
 const botBridgeDir = resolve(process.cwd(), "bot_bridge");
+const sharedStatePath = resolve(process.cwd(), "files", "shared_state.json");
+const replayStatePath = resolve(process.cwd(), "files", "replay_state.json");
 const defaultBotScript = "long_bot.py";
+const allowedBotScripts = ["long_bot.py", "short_bot.py", "spot_grid_bot.py"];
+const replayServerSyncEnabled = false;
 let selectedBotScript = defaultBotScript;
 let managedBotProcess: ChildProcessWithoutNullStreams | null = null;
+let activeBrowserInstance: { clientId: string; updatedAt: number } | null = null;
+const replayEventClients = new Set<{ write: (payload: string) => void }>();
 
 const timeframeFromResolution = (resolution: number) => {
   if (resolution % 86400 === 0) return `${resolution / 86400}d`;
@@ -32,10 +38,10 @@ type LiveOrderGuard = {
 };
 const liveOrderGuardWindowMs = 20_000;
 const liveOrderGuards = new Map<string, LiveOrderGuard>();
-const liveOrderGuardKey = (exchange: "phemex" | "binance", symbol: string, testnet: boolean) =>
-  `${exchange}:${testnet ? "testnet" : "mainnet"}:${symbol}`;
-const lockLiveOrderGuard = (exchange: "phemex" | "binance", symbol: string, testnet: boolean) => {
-  const key = liveOrderGuardKey(exchange, symbol, testnet);
+const liveOrderGuardKey = (exchange: "phemex" | "binance", symbol: string, testnet: boolean, scope = "symbol") =>
+  `${exchange}:${testnet ? "testnet" : "mainnet"}:${symbol}:${scope}`;
+const lockLiveOrderGuard = (exchange: "phemex" | "binance", symbol: string, testnet: boolean, scope?: string) => {
+  const key = liveOrderGuardKey(exchange, symbol, testnet, scope);
   const now = Date.now();
   const current = liveOrderGuards.get(key);
   if (current?.inFlight || (current && now - current.lastSentAt < liveOrderGuardWindowMs)) {
@@ -59,6 +65,10 @@ const markLiveOrderGuardSent = (key: string, orderID?: unknown, clOrdID?: unknow
 };
 const releaseLiveOrderGuard = (key?: string) => {
   if (key) liveOrderGuards.delete(key);
+};
+const clientOrderIdFromBody = (value: unknown) => {
+  const normalized = String(value || "").trim().replace(/[^a-zA-Z0-9_-]/g, "");
+  return normalized ? normalized.slice(0, 40) : undefined;
 };
 const binanceHost = (testnet: boolean) => testnet ? "https://testnet.binancefuture.com" : "https://fapi.binance.com";
 const binanceIntervalFromResolution = (resolution: number) => {
@@ -125,10 +135,82 @@ const parseBody = (request: import("node:http").IncomingMessage) =>
     });
   });
 
+const loadSharedState = async () => {
+  try {
+    const content = await readFile(sharedStatePath, "utf-8");
+    const parsed = JSON.parse(content);
+    return parsed && typeof parsed === "object" ? parsed as Record<string, unknown> : {};
+  } catch {
+    return {};
+  }
+};
+
+const instanceLockTtlMs = 5000;
+
+const saveSharedState = async (state: Record<string, unknown>) => {
+  await mkdir(resolve(process.cwd(), "files"), { recursive: true });
+  await writeFile(sharedStatePath, JSON.stringify(state, null, 2), "utf-8");
+};
+
+const loadReplayState = async () => {
+  try {
+    const content = await readFile(replayStatePath, "utf-8");
+    const parsed = JSON.parse(content);
+    return parsed && typeof parsed === "object" ? parsed as Record<string, unknown> : {};
+  } catch {
+    return {};
+  }
+};
+
+const loadDefaultReplayCandles = async () => {
+  try {
+    const content = await readFile(resolve(phemexChartDir, "SOLUSDT_5m_500.csv"), "utf-8");
+    const [headerLine, ...rows] = content.trim().split(/\r?\n/);
+    const headers = headerLine.split(",").map((header) => header.trim());
+    return rows
+      .map((row) => {
+        const values = row.split(",");
+        const item = Object.fromEntries(headers.map((header, index) => [header, values[index]]));
+        const time = Math.floor(Number(item.timestamp_ms) / 1000);
+        const open = Number(item.open);
+        const high = Number(item.high);
+        const low = Number(item.low);
+        const close = Number(item.close);
+        const volume = Number(item.volume);
+        return { time, open, high, low, close, volume };
+      })
+      .filter((candle) =>
+        Number.isFinite(candle.time) &&
+        Number.isFinite(candle.open) &&
+        Number.isFinite(candle.high) &&
+        Number.isFinite(candle.low) &&
+        Number.isFinite(candle.close)
+      );
+  } catch {
+    return [];
+  }
+};
+
+const saveReplayState = async (state: Record<string, unknown>) => {
+  await mkdir(resolve(process.cwd(), "files"), { recursive: true });
+  await writeFile(replayStatePath, JSON.stringify(state, null, 2), "utf-8");
+};
+
+const broadcastReplayState = (state: Record<string, unknown>) => {
+  const payload = `event: replay-state\ndata: ${JSON.stringify({ ok: true, state })}\n\n`;
+  replayEventClients.forEach((client) => {
+    try {
+      client.write(payload);
+    } catch {
+      replayEventClients.delete(client);
+    }
+  });
+};
+
 const normalizeBotScriptName = (value?: unknown) => {
   const script = basename(String(value || defaultBotScript).trim());
   if (script === "grid_bot.py" || script === "phemex_grid_bot.py") return "spot_grid_bot.py";
-  return /^[a-zA-Z0-9_.-]+\.py$/.test(script) ? script : defaultBotScript;
+  return allowedBotScripts.includes(script) ? script : defaultBotScript;
 };
 
 const botScriptPath = (script?: unknown) => resolve(botBridgeDir, normalizeBotScriptName(script));
@@ -138,11 +220,11 @@ const botHealthUrl = "http://127.0.0.1:8790/health";
 const listBotScripts = async () => {
   await mkdir(botBridgeDir, { recursive: true });
   const entries = await readdir(botBridgeDir, { withFileTypes: true });
-  const scripts = entries
-    .filter((entry) => entry.isFile() && /^[a-zA-Z0-9_.-]+\.py$/.test(entry.name))
+  const availableScripts = entries
+    .filter((entry) => entry.isFile() && allowedBotScripts.includes(entry.name))
     .map((entry) => entry.name)
-    .sort((left, right) => left.localeCompare(right));
-  return scripts.includes(defaultBotScript) ? scripts : [defaultBotScript, ...scripts];
+    .sort((left, right) => allowedBotScripts.indexOf(left) - allowedBotScripts.indexOf(right));
+  return allowedBotScripts.filter((script) => availableScripts.includes(script));
 };
 
 const isBotHealthy = async () => {
@@ -195,7 +277,7 @@ const listProjectBotProcesses = () =>
       "-ExecutionPolicy",
       "Bypass",
       "-Command",
-      `$target = '${escapedDir}'; Get-CimInstance Win32_Process -Filter "name = 'python.exe'" | Where-Object { $_.CommandLine -like '*bot_bridge*' -and $_.CommandLine -like '*.py*' -and ($_.CommandLine -like '*MCM_TradingView*' -or $_.CommandLine -like "*$target*") } | Select-Object -ExpandProperty ProcessId`
+      `$target = '${escapedDir}'; Get-CimInstance Win32_Process -Filter "name = 'python.exe'" | Where-Object { $_.CommandLine -like '*bot_bridge*' -and $_.CommandLine -like '*.py*' -and $_.CommandLine -like "*$target*" } | Select-Object -ExpandProperty ProcessId`
     ], {
       windowsHide: true
     });
@@ -242,7 +324,7 @@ const cleanupProjectBotProcesses = () =>
       "-ExecutionPolicy",
       "Bypass",
       "-Command",
-      `$target = '${escapedDir}'; Get-CimInstance Win32_Process -Filter "name = 'python.exe'" | Where-Object { $_.CommandLine -like '*bot_bridge*' -and $_.CommandLine -like '*.py*' -and ($_.CommandLine -like '*MCM_TradingView*' -or $_.CommandLine -like "*$target*") } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`
+      `$target = '${escapedDir}'; Get-CimInstance Win32_Process -Filter "name = 'python.exe'" | Where-Object { $_.CommandLine -like '*bot_bridge*' -and $_.CommandLine -like '*.py*' -and $_.CommandLine -like "*$target*" } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`
     ], {
       stdio: "ignore",
       windowsHide: true
@@ -560,6 +642,212 @@ const phemexSettingsPlugin = () => ({
       }
     });
 
+    server.middlewares.use("/api/shared-state", async (request, response) => {
+      try {
+        if (request.method === "GET") {
+          response.setHeader("Content-Type", "application/json");
+          response.end(JSON.stringify({ ok: true, state: await loadSharedState() }));
+          return;
+        }
+
+        if (request.method !== "POST") {
+          response.statusCode = 405;
+          response.end("Method not allowed");
+          return;
+        }
+
+        const body = await parseBody(request);
+        const items = body.items && typeof body.items === "object" ? body.items as Record<string, unknown> : {};
+        const current = await loadSharedState();
+        const next = { ...current };
+
+        Object.entries(items).forEach(([key, value]) => {
+          const incoming = value && typeof value === "object" ? value as Record<string, unknown> : undefined;
+          const currentItem = next[key] && typeof next[key] === "object" ? next[key] as Record<string, unknown> : undefined;
+          const incomingUpdatedAt = Number(incoming?.updatedAt || 0);
+          const currentUpdatedAt = Number(currentItem?.updatedAt || 0);
+          if (incoming && incomingUpdatedAt >= currentUpdatedAt) {
+            next[key] = incoming;
+          }
+        });
+
+        await saveSharedState(next);
+        response.setHeader("Content-Type", "application/json");
+        response.end(JSON.stringify({ ok: true, state: next }));
+      } catch (error) {
+        response.statusCode = 500;
+        response.setHeader("Content-Type", "application/json");
+        response.end(JSON.stringify({
+          ok: false,
+          message: error instanceof Error ? error.message : "Shared state failed"
+        }));
+      }
+    });
+
+    server.middlewares.use("/api/replay-events", async (request, response) => {
+      if (request.method !== "GET") {
+        response.statusCode = 405;
+        response.end("Method not allowed");
+        return;
+      }
+
+      response.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache, no-transform",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no"
+      });
+      response.write(": connected\n\n");
+
+      const client = { write: (payload: string) => response.write(payload) };
+      replayEventClients.add(client);
+      const heartbeat = setInterval(() => {
+        try {
+          response.write(": heartbeat\n\n");
+        } catch {
+          clearInterval(heartbeat);
+          replayEventClients.delete(client);
+        }
+      }, 15000);
+
+      request.on("close", () => {
+        clearInterval(heartbeat);
+        replayEventClients.delete(client);
+      });
+    });
+
+    server.middlewares.use("/api/replay-state", async (request, response) => {
+      try {
+        if (request.method === "GET") {
+          response.setHeader("Content-Type", "application/json");
+          response.end(JSON.stringify({ ok: true, state: await loadReplayState() }));
+          return;
+        }
+
+        if (request.method !== "POST") {
+          response.statusCode = 405;
+          response.end("Method not allowed");
+          return;
+        }
+
+        if (!replayServerSyncEnabled) {
+          response.setHeader("Content-Type", "application/json");
+          response.end(JSON.stringify({ ok: true, state: await loadReplayState(), disabled: true }));
+          return;
+        }
+
+        const body = await parseBody(request);
+        const clientId = cleanEnvValue(body.clientId);
+        const now = Date.now();
+        const activeLockExpired = !activeBrowserInstance || now - activeBrowserInstance.updatedAt > instanceLockTtlMs;
+        const incomingUpdatedAt = Number(body.updatedAt || 0);
+        const current = await loadReplayState();
+        const currentUpdatedAt = Number(current.updatedAt || 0);
+
+        if (!activeLockExpired && activeBrowserInstance?.clientId !== clientId) {
+          response.setHeader("Content-Type", "application/json");
+          response.end(JSON.stringify({
+            ok: true,
+            state: current,
+            inactive: true,
+            activeClientId: activeBrowserInstance?.clientId || null
+          }));
+          return;
+        }
+
+        if (incomingUpdatedAt >= currentUpdatedAt) {
+          let incomingCandles = Array.isArray(body.allCandles) && body.allCandles.length > 0
+            ? body.allCandles
+            : current.allCandles || [];
+          if (!Array.isArray(incomingCandles) || !incomingCandles.length) {
+            incomingCandles = await loadDefaultReplayCandles();
+          }
+          const requestedVisibleCount = Number.isFinite(Number(body.visibleCount)) ? Number(body.visibleCount) : Number(current.visibleCount || 1);
+          const nextVisibleCount = incomingCandles.length
+            ? Math.min(Math.max(1, requestedVisibleCount), incomingCandles.length)
+            : Math.max(1, requestedVisibleCount);
+          const next = {
+            allCandles: incomingCandles,
+            visibleCount: nextVisibleCount,
+            isPlaying: body.isPlaying === true && (!incomingCandles.length || nextVisibleCount < incomingCandles.length),
+            speedMs: Number.isFinite(Number(body.speedMs)) ? Number(body.speedMs) : current.speedMs || 100,
+            orders: Array.isArray(body.orders) ? body.orders : current.orders || [],
+            chartRange: body.chartRange && typeof body.chartRange === "object" ? body.chartRange : current.chartRange || null,
+            messageKind: typeof body.messageKind === "string" ? body.messageKind : current.messageKind || "chartCsv",
+            message: typeof body.message === "string" ? body.message : current.message || "",
+            updatedAt: incomingUpdatedAt || now,
+            clientId
+          };
+          await saveReplayState(next);
+          broadcastReplayState(next);
+          response.setHeader("Content-Type", "application/json");
+          response.end(JSON.stringify({ ok: true, state: next }));
+          return;
+        }
+
+        response.setHeader("Content-Type", "application/json");
+        response.end(JSON.stringify({ ok: true, state: current, stale: true }));
+      } catch (error) {
+        response.statusCode = 500;
+        response.setHeader("Content-Type", "application/json");
+        response.end(JSON.stringify({
+          ok: false,
+          message: error instanceof Error ? error.message : "Replay state failed"
+        }));
+      }
+    });
+
+    server.middlewares.use("/api/instance-lock", async (request, response) => {
+      try {
+        if (request.method !== "POST") {
+          response.statusCode = 405;
+          response.end("Method not allowed");
+          return;
+        }
+
+        const body = await parseBody(request);
+        const clientId = cleanEnvValue(body.clientId);
+        const release = body.release === true;
+        const takeover = body.takeover === true;
+        const now = Date.now();
+
+        if (!clientId) {
+          response.statusCode = 400;
+          response.setHeader("Content-Type", "application/json");
+          response.end(JSON.stringify({ ok: false, message: "clientId missing" }));
+          return;
+        }
+
+        if (release && activeBrowserInstance?.clientId === clientId) {
+          activeBrowserInstance = null;
+        } else if (takeover) {
+          activeBrowserInstance = { clientId, updatedAt: now };
+        } else if (
+          !activeBrowserInstance ||
+          activeBrowserInstance.clientId === clientId ||
+          now - activeBrowserInstance.updatedAt > instanceLockTtlMs
+        ) {
+          activeBrowserInstance = { clientId, updatedAt: now };
+        }
+
+        response.setHeader("Content-Type", "application/json");
+        response.end(JSON.stringify({
+          ok: true,
+          active: activeBrowserInstance?.clientId === clientId,
+          activeClientId: activeBrowserInstance?.clientId || null,
+          updatedAt: activeBrowserInstance?.updatedAt || null,
+          ttlMs: instanceLockTtlMs
+        }));
+      } catch (error) {
+        response.statusCode = 500;
+        response.setHeader("Content-Type", "application/json");
+        response.end(JSON.stringify({
+          ok: false,
+          message: error instanceof Error ? error.message : "Instance lock failed"
+        }));
+      }
+    });
+
     server.middlewares.use("/api/bot-tick", async (request, response) => {
       try {
         if (request.method !== "POST") {
@@ -583,7 +871,9 @@ const phemexSettingsPlugin = () => ({
           symbol: body.symbol || "SOLUSDT",
           timeframe: body.timeframe || "5m",
           livePrice: body.livePrice,
+          overlayOnly: body.overlayOnly === true,
           candle: body.candle,
+          history: Array.isArray(body.history) ? body.history : undefined,
           openOrders: body.openOrders || [],
           gridTriggers: body.gridTriggers || [],
           gridSettings: body.gridSettings || {},
@@ -758,7 +1048,7 @@ const phemexSettingsPlugin = () => ({
             [`${prefix}_RESOLUTION`]: body.resolution || "300",
             [`${prefix}_LIMIT`]: body.limit || "500",
             [`${prefix}_MODE`]: body.mode === "live" ? "live" : "replay",
-            [`${prefix}_LIVE_ORDERS_ENABLED`]: String(body.liveOrdersEnabled === true),
+            [`${prefix}_LIVE_ORDERS_ENABLED`]: String(body.mode === "live"),
             [`${prefix}_ALLOW_MAINNET_ORDERS`]: String(body.allowMainnetOrders === true)
           };
           await writeFile(envPath, serializeEnv(next), "utf-8");
@@ -1011,6 +1301,13 @@ const phemexSettingsPlugin = () => ({
         const quantity = Number(body.quantity);
         const price = Number(body.price);
         const orderType = String(body.orderType || "limit").toLowerCase() === "market" ? "market" : "limit";
+        const clientOrderId = clientOrderIdFromBody(body.clientOrderId || body.clOrdID);
+        const isGridBotOrder =
+          body.gridBot === true ||
+          body.spotGrid === true ||
+          String(body.mechanic || "").toLowerCase() === "grid_bot" ||
+          String(body.mechanic || "").toLowerCase() === "spot_grid" ||
+          Boolean(clientOrderId?.startsWith("crt-grid-"));
         if (exchange === "binance") {
           const allowMainnetOrders = typeof body.allowMainnetOrders === "boolean"
             ? body.allowMainnetOrders
@@ -1026,7 +1323,7 @@ const phemexSettingsPlugin = () => ({
             response.end(JSON.stringify({ ok: false, message: orderType === "limit" ? "Order needs valid quantity and price" : "Market order needs valid quantity" }));
             return;
           }
-          const guardLock = lockLiveOrderGuard(exchange, symbol, testnet);
+        const guardLock = lockLiveOrderGuard(exchange, symbol, testnet, isGridBotOrder && clientOrderId ? `grid:${clientOrderId}` : undefined);
           if (!guardLock.ok) {
             response.statusCode = 409;
             response.setHeader("Content-Type", "application/json");
@@ -1047,25 +1344,27 @@ const phemexSettingsPlugin = () => ({
             return;
           }
           orderGuardKey = guardLock.key;
-          const exposure = await assertNoExchangeExposure(exchange, symbol, testnet, apiKey, apiSecret);
-          if (exposure.hasExposure) {
-            releaseLiveOrderGuard(orderGuardKey);
-            orderGuardKey = undefined;
-            response.statusCode = 409;
-            response.setHeader("Content-Type", "application/json");
-            response.end(JSON.stringify({
-              ok: false,
-              message: "Live-Order blockiert: Auf der Boerse ist fuer dieses Symbol bereits eine offene Order oder Position vorhanden.",
-              exposure
-            }));
-            return;
+          if (!isGridBotOrder) {
+            const exposure = await assertNoExchangeExposure(exchange, symbol, testnet, apiKey, apiSecret);
+            if (exposure.hasExposure) {
+              releaseLiveOrderGuard(orderGuardKey);
+              orderGuardKey = undefined;
+              response.statusCode = 409;
+              response.setHeader("Content-Type", "application/json");
+              response.end(JSON.stringify({
+                ok: false,
+                message: "Live-Order blockiert: Auf der Boerse ist fuer dieses Symbol bereits eine offene Order oder Position vorhanden.",
+                exposure
+              }));
+              return;
+            }
           }
           const binanceOrderParams: Record<string, string | number> = {
             symbol,
             side,
             type: orderType === "market" ? "MARKET" : "LIMIT",
             quantity,
-            newClientOrderId: `crt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+            newClientOrderId: clientOrderId || `crt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
           };
           if (orderType === "limit") {
             binanceOrderParams.timeInForce = "GTC";
@@ -1107,7 +1406,7 @@ const phemexSettingsPlugin = () => ({
           response.end(JSON.stringify({ ok: false, message: orderType === "limit" ? "Order needs valid quantity and price" : "Market order needs valid quantity" }));
           return;
         }
-        const guardLock = lockLiveOrderGuard(exchange, symbol, testnet);
+          const guardLock = lockLiveOrderGuard(exchange, symbol, testnet, isGridBotOrder && clientOrderId ? `grid:${clientOrderId}` : undefined);
         if (!guardLock.ok) {
           response.statusCode = 409;
           response.setHeader("Content-Type", "application/json");
@@ -1128,18 +1427,20 @@ const phemexSettingsPlugin = () => ({
           return;
         }
         orderGuardKey = guardLock.key;
-        const exposure = await assertNoExchangeExposure(exchange, symbol, testnet, apiKey, apiSecret);
-        if (exposure.hasExposure) {
-          releaseLiveOrderGuard(orderGuardKey);
-          orderGuardKey = undefined;
-          response.statusCode = 409;
-          response.setHeader("Content-Type", "application/json");
-          response.end(JSON.stringify({
-            ok: false,
-            message: "Live-Order blockiert: Auf der Boerse ist fuer dieses Symbol bereits eine offene Order oder Position vorhanden.",
-            exposure
-          }));
-          return;
+        if (!isGridBotOrder) {
+          const exposure = await assertNoExchangeExposure(exchange, symbol, testnet, apiKey, apiSecret);
+          if (exposure.hasExposure) {
+            releaseLiveOrderGuard(orderGuardKey);
+            orderGuardKey = undefined;
+            response.statusCode = 409;
+            response.setHeader("Content-Type", "application/json");
+            response.end(JSON.stringify({
+              ok: false,
+              message: "Live-Order blockiert: Auf der Boerse ist fuer dieses Symbol bereits eine offene Order oder Position vorhanden.",
+              exposure
+            }));
+            return;
+          }
         }
 
         const path = "/g-orders";
@@ -1151,7 +1452,7 @@ const phemexSettingsPlugin = () => ({
           ordType: orderType === "market" ? "Market" : "Limit",
           timeInForce: orderType === "market" ? "ImmediateOrCancel" : "GoodTillCancel",
           orderQtyRq: String(quantity),
-          clOrdID: `crt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          clOrdID: clientOrderId || `crt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
           text: "Chart_Replay_Tool"
         };
         if (orderType === "limit") {
@@ -1203,7 +1504,7 @@ const phemexSettingsPlugin = () => ({
         response.end(JSON.stringify({
           ok: true,
           orderID: payload.data?.orderID,
-          clOrdID: payload.data?.clOrdID,
+          clOrdID: payload.data?.clOrdID || clientOrderId,
           payload
         }));
       } catch (error) {
@@ -1717,7 +2018,11 @@ const phemexSettingsPlugin = () => ({
         }
 
         const testnet = body.testnet !== false;
-        const liveOrdersEnabled = exchange === "binance" ? values.BINANCE_LIVE_ORDERS_ENABLED === "true" : values.PHEMEX_LIVE_ORDERS_ENABLED === "true";
+        const liveOrdersEnabled = typeof body.liveOrdersEnabled === "boolean"
+          ? body.liveOrdersEnabled
+          : exchange === "binance"
+            ? values.BINANCE_LIVE_ORDERS_ENABLED === "true"
+            : values.PHEMEX_LIVE_ORDERS_ENABLED === "true";
         if (!liveOrdersEnabled) {
           response.statusCode = 403;
           response.end(JSON.stringify({ ok: false, message: `${exchange === "binance" ? "Binance" : "Phemex"} live orders are disabled in Exchange settings.` }));
